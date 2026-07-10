@@ -33,30 +33,39 @@ max_file_lines = 800
 max_coupling = "B"
 
 # ── Layers ────────────────────────────────────────────────────────────────────
-# Lower `order` = more foundational. A higher layer may depend on lower layers,
-# never the reverse. lib.rs (the crate root that also holds the embedded model
-# bytes) is intentionally left unlayered: as the root it both declares every
-# module and is referenced by the foundational classifier for MODEL_BYTES, which
-# does not fit a strict linear order.
-
-[[layers]]
-name = "classifier"
-paths = ["src/classifier.rs"]
-order = 0
-
-[[layers]]
-name = "config"
-paths = ["src/config.rs"]
-order = 1
-
-[[layers]]
-name = "proxy"
-paths = ["src/proxy.rs"]
-order = 2
+# Imports must flow from lower `order` to higher `order`: order 0 is the entry
+# point (top of the call stack) and the highest order is the most foundational
+# leaf. A file may only import files at a HIGHER order.
+#
+# NOTE: this is the direction the installed sentrux (v0.5.x) actually enforces,
+# which is inverted from the phrasing in the public docs at sentrux.dev
+# ("lower order = more foundational"). The ordering below is chosen to match the
+# tool's real behaviour so every genuine dependency
+# (main -> proxy -> config -> classifier) flows low -> high and validates.
+#
+# lib.rs (the crate root that also holds the embedded model bytes) is
+# intentionally left unlayered: as the root it both declares every module and is
+# referenced by the foundational classifier for MODEL_BYTES, which does not fit
+# a strict linear order.
 
 [[layers]]
 name = "app"
 paths = ["src/main.rs"]
+order = 0
+
+[[layers]]
+name = "proxy"
+paths = ["src/proxy.rs"]
+order = 1
+
+[[layers]]
+name = "config"
+paths = ["src/config.rs"]
+order = 2
+
+[[layers]]
+name = "classifier"
+paths = ["src/classifier.rs"]
 order = 3
 
 # ── Boundaries ────────────────────────────────────────────────────────────────
