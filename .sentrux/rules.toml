@@ -1,0 +1,94 @@
+# Architectural constraints for hyper-mcp-router, enforced by `sentrux check .`
+# (and surfaced to the agent via the `check_rules` MCP tool).
+#
+# The crate is a strict, acyclic layering:
+#
+#     main            (binary entry point: CLI, logging, startup, axum bind)
+#       └─ proxy      (HTTP surface, routing, forwarding, SSE passthrough)
+#            └─ config      (TOML load, model catalogue, select_model)
+#                 └─ classifier  (NLI types + inference + pure helpers)
+#
+#   cli.rs and logging.rs are cross-cutting infrastructure leaves: used only by
+#   main, and depending on nothing else in the crate.
+#
+# Dependencies must always flow downward. These rules make that non-negotiable.
+
+[constraints]
+# The layering is acyclic by design; keep it that way.
+max_cycles = 0
+
+# Cap per-function cyclomatic complexity. The most branch-heavy function is the
+# `chat_completions` handler; keep routing/inference logic decomposed.
+max_cc = 30
+
+# Cap file length. Ceiling sits above the largest file (classifier.rs, ~740
+# lines) to leave room for its inline `#[cfg(test)]` module while still flagging
+# runaway growth. `no_god_files` is intentionally NOT enabled: its hard-coded
+# 500-line threshold would false-positive on files that are large only because
+# their unit tests live inline (the idiomatic Rust layout).
+max_file_lines = 800
+
+# Overall inter-module coupling grade ceiling. A four-module linear chain should
+# stay well within this.
+max_coupling = "B"
+
+# ── Layers ────────────────────────────────────────────────────────────────────
+# Lower `order` = more foundational. A higher layer may depend on lower layers,
+# never the reverse. lib.rs (the crate root that also holds the embedded model
+# bytes) is intentionally left unlayered: as the root it both declares every
+# module and is referenced by the foundational classifier for MODEL_BYTES, which
+# does not fit a strict linear order.
+
+[[layers]]
+name = "classifier"
+paths = ["src/classifier.rs"]
+order = 0
+
+[[layers]]
+name = "config"
+paths = ["src/config.rs"]
+order = 1
+
+[[layers]]
+name = "proxy"
+paths = ["src/proxy.rs"]
+order = 2
+
+[[layers]]
+name = "app"
+paths = ["src/main.rs"]
+order = 3
+
+# ── Boundaries ────────────────────────────────────────────────────────────────
+# Sharp, explicit invariants — including for the unlayered infrastructure leaves
+# (cli.rs, logging.rs), which layer ordering alone does not constrain.
+
+[[boundaries]]
+from = "src/cli.rs"
+to = "src/classifier.rs"
+reason = "CLI parsing must stay declarative — no domain/inference logic."
+
+[[boundaries]]
+from = "src/cli.rs"
+to = "src/proxy.rs"
+reason = "CLI parsing must not depend on request handling."
+
+[[boundaries]]
+from = "src/logging.rs"
+to = "src/classifier.rs"
+reason = "Logging is cross-cutting infrastructure; it must not depend on the classifier."
+
+[[boundaries]]
+from = "src/logging.rs"
+to = "src/proxy.rs"
+reason = "Logging must not depend on request handling."
+
+[[boundaries]]
+from = "src/config.rs"
+to = "src/proxy.rs"
+reason = "Config sits below the proxy; it must not reach up into request handling."
+
+[[boundaries]]
+from = "src/classifier.rs"
+to = "src/config.rs"
+reason = "The classifier is the foundation; it must not depend on configuration."

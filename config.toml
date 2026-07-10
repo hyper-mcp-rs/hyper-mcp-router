@@ -1,0 +1,64 @@
+# Example / default configuration for hyper-mcp-router.
+#
+# This file is NOT embedded in the binary. Copy it to a well-known location
+# (e.g. ~/Library/Application Support/hyper-mcp-router/config.toml on macOS, or
+# $XDG_CONFIG_HOME/hyper-mcp-router/config.toml on Linux) or pass it explicitly
+# with `--config <path>`.
+#
+# Every backend must be OpenAI Chat Completions v1 compatible and expose
+# `POST {base_url}/chat/completions`.
+
+[server]
+host = "0.0.0.0"
+port = 8080
+# GET /v1/models always advertises the single virtual model "hyper-mcp-router";
+# the configured backends are never exposed.
+# Upstream timeouts (seconds). No retries are ever performed.
+connect_timeout_secs = 10
+request_timeout_secs = 600
+
+# Optional. Tunes the image-generation modality decision (absolute
+# P(entailment) floor; default 0.5).
+[classifier]
+image_generation_threshold = 0.5
+
+# 1. Plaintext key directly in the file.
+[[models]]
+name       = "gpt-4.1-mini"
+base_url   = "https://api.openai.com/v1"
+api_key    = "sk-plaintext-key"
+type       = "fast"
+modalities = ["text"]
+
+# 2. Environment variable, expanded during config parsing. Use ${VAR:-default}
+#    for a fallback, or $${VAR} for a literal.
+[[models]]
+name       = "gpt-4.1"
+base_url   = "https://api.openai.com/v1"
+api_key    = "${OPENAI_API_KEY}"
+type       = "balanced"
+modalities = ["text"]
+
+# 3. OS keyring lookup.
+[[models]]
+name       = "o3"
+base_url   = "https://api.openai.com/v1"
+api_key    = { source = "keyring", service = "hyper-mcp-router", user = "openai-frontier" }
+type       = "frontier"
+modalities = ["text"]
+
+# A single multimodal model can cover several modalities at once.
+[[models]]
+name       = "gpt-4o"
+base_url   = "https://api.openai.com/v1"
+api_key    = "${OPENAI_API_KEY}"
+type       = "balanced"
+modalities = ["text", "image-input", "file-input", "image-output"]
+
+# A dedicated voice model: audio in and audio out (plus text).
+[[models]]
+name       = "gpt-audio"
+base_url   = "https://api.openai.com/v1"
+api_key    = "${OPENAI_API_KEY}"
+type       = "balanced"
+modalities = ["text", "audio-input", "audio-output"]

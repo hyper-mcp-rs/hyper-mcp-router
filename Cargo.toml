@@ -1,0 +1,40 @@
+[package]
+name = "hyper-mcp-router"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+description = "An adaptive OpenAI-compatible LLM router that classifies prompts and forwards them to an appropriate backend model tier."
+license = "Apache-2.0"
+publish = false
+
+# `lib.rs` holds the router logic (classifier, proxy, config) so it is reachable
+# from the crate's unit tests; `main.rs` is a thin binary wrapper over it.
+[lib]
+name = "hyper_mcp_router"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hyper-mcp-router"
+path = "src/main.rs"
+
+[dependencies]
+ort        = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
+tokenizers = "0.21"
+ndarray    = "0.17"   # must match the ndarray version `ort` re-exports
+axum       = "0.8"
+reqwest    = { version = "0.12", features = ["stream", "json"] }
+tokio      = { version = "1", features = ["full"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+config     = "0.14"
+clap       = { version = "4", features = ["derive"] }
+directories = "5"
+keyring    = "4.1"
+regex      = "1"
+anyhow     = "1"
+tracing    = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+[build-dependencies]
+ureq = "2"

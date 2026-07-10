@@ -1,0 +1,709 @@
+//! Configuration: TOML deserialization, the model catalogue, API-key
+//! resolution (plaintext / env / keyring), model selection, and startup
+//! coverage validation.
+//!
+//! Requests and responses elsewhere are handled as raw JSON; this module is the
+//! only place typed structs are used, and only for the operator's config file.
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+use directories::ProjectDirs;
+use regex::Regex;
+use serde::de::{self, Deserializer, MapAccess, Visitor};
+use serde::Deserialize;
+
+use crate::classifier::{Modality, ModalitySet, ModelTier, DEFAULT_IMAGE_GEN_THRESHOLD};
+
+/// Application identifier used for OS config/log directory discovery.
+const APP_NAME: &str = "hyper-mcp-router";
+
+// ───────────────────────────────────────────────────────────────────────────
+// Config structs
+// ───────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouterConfig {
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub classifier: ClassifierConfig,
+    pub models: Vec<ModelConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_host")]
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    /// Upstream connect timeout, seconds.
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    /// Upstream total request timeout, seconds.
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout_secs: u64,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            host: default_host(),
+            port: default_port(),
+            connect_timeout_secs: default_connect_timeout(),
+            request_timeout_secs: default_request_timeout(),
+        }
+    }
+}
+
+fn default_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_port() -> u16 {
+    8080
+}
+
+fn default_connect_timeout() -> u64 {
+    10
+}
+fn default_request_timeout() -> u64 {
+    600
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClassifierConfig {
+    /// Absolute P(entailment) floor for the image-generation axis.
+    #[serde(default = "default_image_gen_threshold")]
+    pub image_generation_threshold: f32,
+}
+
+impl Default for ClassifierConfig {
+    fn default() -> Self {
+        ClassifierConfig {
+            image_generation_threshold: default_image_gen_threshold(),
+        }
+    }
+}
+
+fn default_image_gen_threshold() -> f32 {
+    DEFAULT_IMAGE_GEN_THRESHOLD
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelConfig {
+    /// Model string sent upstream as `body["model"]`.
+    pub name: String,
+    pub base_url: String,
+    /// Resolved secret (from plaintext / env / keyring). Never logged.
+    #[serde(deserialize_with = "resolve_api_key")]
+    pub api_key: String,
+    /// Deserialised from `type` (a Rust reserved word).
+    #[serde(rename = "type")]
+    pub tier: ModelTier,
+    /// Non-empty; matched as a set for superset checks.
+    pub modalities: Vec<Modality>,
+}
+
+impl ModelConfig {
+    /// The declared modalities as a set, for superset matching.
+    pub fn modality_set(&self) -> ModalitySet {
+        self.modalities.iter().copied().collect()
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// API key resolution
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Custom deserializer for a model's `api_key`. A TOML string yields the
+/// plaintext/env-expanded key verbatim; an inline table
+/// `{ source = "keyring", service = "...", user = "..." }` triggers an OS
+/// keyring lookup at load time. Only the resolved secret is retained.
+fn resolve_api_key<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ApiKeyVisitor;
+
+    impl<'de> Visitor<'de> for ApiKeyVisitor {
+        type Value = String;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a plaintext API key string or a keyring lookup table")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_owned())
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<String, E> {
+            Ok(v)
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<String, A::Error> {
+            let mut source: Option<String> = None;
+            let mut service: Option<String> = None;
+            let mut user: Option<String> = None;
+
+            while let Some(key) = map.next_key::<String>()? {
+                match key.as_str() {
+                    "source" => source = Some(map.next_value()?),
+                    "service" => service = Some(map.next_value()?),
+                    "user" => user = Some(map.next_value()?),
+                    other => {
+                        return Err(de::Error::custom(format!(
+                            "unknown api_key table field `{other}`"
+                        )))
+                    }
+                }
+            }
+
+            let source = source.ok_or_else(|| de::Error::missing_field("source"))?;
+            if source != "keyring" {
+                return Err(de::Error::custom(format!(
+                    "unsupported api_key source `{source}`; expected `keyring`"
+                )));
+            }
+            let service = service.ok_or_else(|| de::Error::missing_field("service"))?;
+            let user = user.ok_or_else(|| de::Error::missing_field("user"))?;
+
+            let entry = keyring::Entry::new(&service, &user).map_err(|e| {
+                de::Error::custom(format!(
+                    "keyring entry (service={service}, user={user}) unavailable: {e}"
+                ))
+            })?;
+            entry.get_password().map_err(|e| {
+                de::Error::custom(format!(
+                    "keyring lookup failed (service={service}, user={user}): {e}"
+                ))
+            })
+        }
+    }
+
+    deserializer.deserialize_any(ApiKeyVisitor)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Environment-variable expansion
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Expand `${VAR}` / `${VAR:-default}` references in the raw config text before
+/// TOML parsing. `$${VAR}` is an escape hatch for a literal `${VAR}`, and bare
+/// `$VAR` is left untouched. All missing (no-default) variables are collected
+/// and reported together in a single error.
+pub fn expand_env(input: &str) -> anyhow::Result<String> {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\$(\$?)\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?\}")
+            .expect("valid env-expansion regex")
+    });
+
+    let mut out = String::with_capacity(input.len());
+    let mut last = 0;
+    let mut missing: Vec<String> = Vec::new();
+
+    for caps in RE.captures_iter(input) {
+        let m = caps.get(0).unwrap();
+        out.push_str(&input[last..m.start()]);
+        last = m.end();
+
+        let escaped = caps.get(1).is_some_and(|g| !g.as_str().is_empty());
+        let var = &caps[2];
+        let default = caps.get(4).map(|g| g.as_str());
+
+        if escaped {
+            // `$${VAR[:-default]}` → literal `${VAR[:-default]}`.
+            out.push_str("${");
+            out.push_str(var);
+            if let Some(d) = default {
+                out.push_str(":-");
+                out.push_str(d);
+            }
+            out.push('}');
+            continue;
+        }
+
+        match std::env::var(var) {
+            Ok(v) if !v.is_empty() => out.push_str(&v),
+            _ => match default {
+                Some(d) => out.push_str(d),
+                None => missing.push(var.to_string()),
+            },
+        }
+    }
+    out.push_str(&input[last..]);
+
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "unset environment variable(s) with no default: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(out)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Loading, path resolution, validation
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Resolve the config path: an explicit `--config` is used verbatim (a missing
+/// or unparseable file is then fatal — no fallback); otherwise the first
+/// existing well-known OS location is used. Returns an error listing every path
+/// searched when none exists.
+pub fn resolve_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+
+    let candidates = well_known_config_paths();
+    for path in &candidates {
+        if path.exists() {
+            return Ok(path.clone());
+        }
+    }
+
+    let searched = candidates
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    anyhow::bail!(
+        "no config file found. Pass --config <path> or create one at a well-known location. Searched:\n  {searched}"
+    );
+}
+
+/// Platform-appropriate config locations, user-scoped before system-wide.
+fn well_known_config_paths() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dirs) = ProjectDirs::from("", "", APP_NAME) {
+        candidates.push(dirs.config_dir().join("config.toml"));
+    }
+    #[cfg(unix)]
+    candidates.push(PathBuf::from(format!("/etc/{APP_NAME}/config.toml")));
+    candidates
+}
+
+/// Load, env-expand, parse, and validate the config at `path`.
+pub fn load(path: &Path) -> anyhow::Result<RouterConfig> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read config `{}`: {e}", path.display()))?;
+    let cfg = parse(&raw)?;
+    cfg.validate()?;
+    Ok(cfg)
+}
+
+/// Env-expand then TOML-parse config text. Split out for unit testing.
+pub fn parse(raw: &str) -> anyhow::Result<RouterConfig> {
+    let expanded = expand_env(raw)?;
+    let cfg: RouterConfig = config::Config::builder()
+        .add_source(config::File::from_str(&expanded, config::FileFormat::Toml))
+        .build()?
+        .try_deserialize()
+        .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
+    Ok(cfg)
+}
+
+impl RouterConfig {
+    /// Field-level and startup coverage validation. Fails fast with a clear
+    /// message on any incomplete configuration.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.models.is_empty() {
+            anyhow::bail!("no [[models]] configured");
+        }
+        for m in &self.models {
+            if m.modalities.is_empty() {
+                anyhow::bail!("model `{}` declares no modalities", m.name);
+            }
+            if m.api_key.is_empty() {
+                anyhow::bail!("model `{}` resolved to an empty API key", m.name);
+            }
+        }
+        self.validate_coverage()
+    }
+
+    /// Startup coverage validation (see the spec's "Startup Coverage
+    /// Validation"): every complexity type must have a `text` model, and every
+    /// other servable modality must be declared by at least one model.
+    pub fn validate_coverage(&self) -> anyhow::Result<()> {
+        for tier in [ModelTier::Fast, ModelTier::Balanced, ModelTier::Frontier] {
+            let covered = self
+                .models
+                .iter()
+                .any(|m| m.tier == tier && m.modality_set().contains(Modality::Text));
+            if !covered {
+                anyhow::bail!(
+                    "no model of type `{}` declares the `text` modality; complexity routing requires all three types to be text-capable",
+                    tier_name(tier)
+                );
+            }
+        }
+
+        for modality in [
+            Modality::ImageInput,
+            Modality::AudioInput,
+            Modality::FileInput,
+            Modality::AudioOutput,
+            Modality::ImageOutput,
+        ] {
+            let covered = self
+                .models
+                .iter()
+                .any(|m| m.modality_set().contains(modality));
+            if !covered {
+                anyhow::bail!(
+                    "no model declares the `{}` modality; single-modality requests for it could never resolve",
+                    modality.as_str()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Pick the model whose declared modalities are a **superset** of
+    /// `required`, preferring `complexity`. Returns `None` when no single model
+    /// covers the whole set (the proxy then returns 415).
+    ///
+    /// Ranking among survivors: exact type match → nearest higher type
+    /// (escalation) → highest lower type. Ties break toward the first-declared
+    /// model in config.
+    pub fn select_model(
+        &self,
+        required: &ModalitySet,
+        complexity: ModelTier,
+    ) -> Option<&ModelConfig> {
+        // 1. Filter by capability (superset), preserving config order.
+        // 2 & 3–6. Rank survivors; `min_by_key` returns the first minimum, so a
+        //          tie resolves toward the earlier-declared model.
+        self.models
+            .iter()
+            .filter(|m| m.modality_set().is_superset(required))
+            .min_by_key(|m| tier_rank(m.tier, complexity))
+    }
+}
+
+/// Distance ranking for model selection. Lower is better:
+/// exact type (0) < escalation (nearest higher) < fallback (highest lower).
+fn tier_rank(tier: ModelTier, want: ModelTier) -> i32 {
+    let t = tier as i32;
+    let w = want as i32;
+    if t == w {
+        0
+    } else if t > w {
+        10 + (t - w) // escalate: prefer the nearest higher type
+    } else {
+        100 + (w - t) // fallback: prefer the highest lower type
+    }
+}
+
+fn tier_name(tier: ModelTier) -> &'static str {
+    match tier {
+        ModelTier::Fast => "fast",
+        ModelTier::Balanced => "balanced",
+        ModelTier::Frontier => "frontier",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── env expansion ───────────────────────────────────────────────────────
+    #[test]
+    fn expand_simple_var() {
+        std::env::set_var("ROUTER_TEST_A", "value-a");
+        assert_eq!(expand_env("x=${ROUTER_TEST_A}").unwrap(), "x=value-a");
+    }
+
+    #[test]
+    fn expand_default_used_when_unset() {
+        std::env::remove_var("ROUTER_TEST_UNSET_1");
+        assert_eq!(
+            expand_env("x=${ROUTER_TEST_UNSET_1:-fallback}").unwrap(),
+            "x=fallback"
+        );
+    }
+
+    #[test]
+    fn expand_default_ignored_when_set() {
+        std::env::set_var("ROUTER_TEST_B", "real");
+        assert_eq!(
+            expand_env("x=${ROUTER_TEST_B:-fallback}").unwrap(),
+            "x=real"
+        );
+    }
+
+    #[test]
+    fn expand_escape_hatch_literal() {
+        assert_eq!(expand_env("x=$${VAR}").unwrap(), "x=${VAR}");
+    }
+
+    #[test]
+    fn expand_bare_var_passthrough() {
+        assert_eq!(expand_env("x=$VAR").unwrap(), "x=$VAR");
+    }
+
+    #[test]
+    fn expand_collects_all_missing() {
+        std::env::remove_var("ROUTER_TEST_MISS_1");
+        std::env::remove_var("ROUTER_TEST_MISS_2");
+        let err = expand_env("${ROUTER_TEST_MISS_1} ${ROUTER_TEST_MISS_2}").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ROUTER_TEST_MISS_1"));
+        assert!(msg.contains("ROUTER_TEST_MISS_2"));
+    }
+
+    // ── ApiKey resolution ─────────────────────────────────────────────────────
+    fn parse_single_model(toml: &str) -> RouterConfig {
+        parse(toml).expect("config should parse")
+    }
+
+    const BASE: &str = r#"
+[server]
+host = "0.0.0.0"
+port = 8080
+"#;
+
+    #[test]
+    fn api_key_plaintext() {
+        let cfg = parse_single_model(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"u\"\napi_key=\"sk-plain\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+        ));
+        assert_eq!(cfg.models[0].api_key, "sk-plain");
+    }
+
+    #[test]
+    fn api_key_env_expanded() {
+        std::env::set_var("ROUTER_TEST_KEY", "sk-from-env");
+        let cfg = parse_single_model(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"u\"\napi_key=\"${{ROUTER_TEST_KEY}}\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+        ));
+        assert_eq!(cfg.models[0].api_key, "sk-from-env");
+    }
+
+    #[test]
+    fn api_key_keyring_when_store_available() {
+        // Gate on store availability, as hyper-mcp does.
+        let service = "hyper-mcp-router-test";
+        let user = "keyring-probe";
+        let probe = keyring::Entry::new(service, user)
+            .and_then(|e| e.set_password("sk-keyring-secret").map(|_| e));
+        let Ok(entry) = probe else {
+            eprintln!("keyring store unavailable; skipping");
+            return;
+        };
+        let cfg = parse_single_model(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"u\"\napi_key={{ source = \"keyring\", service = \"{service}\", user = \"{user}\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+        ));
+        assert_eq!(cfg.models[0].api_key, "sk-keyring-secret");
+        let _ = entry.delete_credential();
+    }
+
+    // ── select_model ──────────────────────────────────────────────────────────
+    fn model(name: &str, tier: ModelTier, mods: &[Modality]) -> ModelConfig {
+        ModelConfig {
+            name: name.to_string(),
+            base_url: "http://x".to_string(),
+            api_key: "k".to_string(),
+            tier,
+            modalities: mods.to_vec(),
+        }
+    }
+
+    fn catalogue(models: Vec<ModelConfig>) -> RouterConfig {
+        RouterConfig {
+            server: ServerConfig::default(),
+            classifier: ClassifierConfig::default(),
+            models,
+        }
+    }
+
+    fn req(mods: &[Modality]) -> ModalitySet {
+        mods.iter().copied().collect()
+    }
+
+    #[test]
+    fn select_superset_excludes_missing_modality() {
+        let cfg = catalogue(vec![
+            model("text-only", ModelTier::Balanced, &[Modality::Text]),
+            model(
+                "vision",
+                ModelTier::Balanced,
+                &[Modality::Text, Modality::ImageInput],
+            ),
+        ]);
+        let chosen = cfg
+            .select_model(
+                &req(&[Modality::Text, Modality::ImageInput]),
+                ModelTier::Balanced,
+            )
+            .unwrap();
+        assert_eq!(chosen.name, "vision");
+    }
+
+    #[test]
+    fn select_exact_type_wins() {
+        let cfg = catalogue(vec![
+            model("fast", ModelTier::Fast, &[Modality::Text]),
+            model("balanced", ModelTier::Balanced, &[Modality::Text]),
+            model("frontier", ModelTier::Frontier, &[Modality::Text]),
+        ]);
+        let chosen = cfg
+            .select_model(&req(&[Modality::Text]), ModelTier::Balanced)
+            .unwrap();
+        assert_eq!(chosen.name, "balanced");
+    }
+
+    #[test]
+    fn select_escalates_to_nearest_higher() {
+        let cfg = catalogue(vec![
+            model("fast", ModelTier::Fast, &[Modality::Text]),
+            model("frontier", ModelTier::Frontier, &[Modality::Text]),
+        ]);
+        // want Balanced, none exact => nearest higher is Frontier.
+        let chosen = cfg
+            .select_model(&req(&[Modality::Text]), ModelTier::Balanced)
+            .unwrap();
+        assert_eq!(chosen.name, "frontier");
+    }
+
+    #[test]
+    fn select_falls_back_to_highest_lower() {
+        let cfg = catalogue(vec![
+            model("fast", ModelTier::Fast, &[Modality::Text]),
+            model("balanced", ModelTier::Balanced, &[Modality::Text]),
+        ]);
+        // want Frontier, nothing at/above => highest lower is Balanced.
+        let chosen = cfg
+            .select_model(&req(&[Modality::Text]), ModelTier::Frontier)
+            .unwrap();
+        assert_eq!(chosen.name, "balanced");
+    }
+
+    #[test]
+    fn select_first_declared_wins_on_tie() {
+        let cfg = catalogue(vec![
+            model("first", ModelTier::Balanced, &[Modality::Text]),
+            model("second", ModelTier::Balanced, &[Modality::Text]),
+        ]);
+        let chosen = cfg
+            .select_model(&req(&[Modality::Text]), ModelTier::Balanced)
+            .unwrap();
+        assert_eq!(chosen.name, "first");
+    }
+
+    #[test]
+    fn select_covers_combination() {
+        let cfg = catalogue(vec![model(
+            "voice",
+            ModelTier::Balanced,
+            &[Modality::Text, Modality::AudioInput, Modality::AudioOutput],
+        )]);
+        let chosen = cfg
+            .select_model(
+                &req(&[Modality::AudioInput, Modality::AudioOutput]),
+                ModelTier::Balanced,
+            )
+            .unwrap();
+        assert_eq!(chosen.name, "voice");
+    }
+
+    #[test]
+    fn select_uncovered_combination_returns_none() {
+        let cfg = catalogue(vec![
+            model(
+                "audio-in",
+                ModelTier::Balanced,
+                &[Modality::Text, Modality::AudioInput],
+            ),
+            model(
+                "audio-out",
+                ModelTier::Balanced,
+                &[Modality::Text, Modality::AudioOutput],
+            ),
+        ]);
+        // No single model covers both directions.
+        assert!(cfg
+            .select_model(
+                &req(&[Modality::AudioInput, Modality::AudioOutput]),
+                ModelTier::Balanced
+            )
+            .is_none());
+    }
+
+    // ── coverage validation ─────────────────────────────────────────────────
+    fn full_catalogue() -> RouterConfig {
+        catalogue(vec![
+            model("fast", ModelTier::Fast, &[Modality::Text]),
+            model(
+                "balanced",
+                ModelTier::Balanced,
+                &[
+                    Modality::Text,
+                    Modality::ImageInput,
+                    Modality::FileInput,
+                    Modality::ImageOutput,
+                ],
+            ),
+            model("frontier", ModelTier::Frontier, &[Modality::Text]),
+            model(
+                "voice",
+                ModelTier::Balanced,
+                &[Modality::Text, Modality::AudioInput, Modality::AudioOutput],
+            ),
+        ])
+    }
+
+    #[test]
+    fn coverage_passes_for_full_catalogue() {
+        assert!(full_catalogue().validate_coverage().is_ok());
+    }
+
+    #[test]
+    fn coverage_fails_missing_text_tier() {
+        let cfg = catalogue(vec![
+            model("fast", ModelTier::Fast, &[Modality::Text]),
+            model("balanced", ModelTier::Balanced, &[Modality::Text]),
+            // no frontier text model
+            model(
+                "img",
+                ModelTier::Balanced,
+                &[
+                    Modality::Text,
+                    Modality::ImageInput,
+                    Modality::AudioInput,
+                    Modality::FileInput,
+                    Modality::AudioOutput,
+                    Modality::ImageOutput,
+                ],
+            ),
+        ]);
+        // Remove frontier: rebuild without it.
+        let cfg = catalogue(
+            cfg.models
+                .into_iter()
+                .filter(|m| m.tier != ModelTier::Frontier)
+                .collect(),
+        );
+        assert!(cfg.validate_coverage().is_err());
+    }
+
+    #[test]
+    fn coverage_fails_missing_modality() {
+        // Full text tiers but no audio-output model anywhere.
+        let cfg = catalogue(vec![
+            model("fast", ModelTier::Fast, &[Modality::Text]),
+            model(
+                "balanced",
+                ModelTier::Balanced,
+                &[
+                    Modality::Text,
+                    Modality::ImageInput,
+                    Modality::AudioInput,
+                    Modality::FileInput,
+                    Modality::ImageOutput,
+                ],
+            ),
+            model("frontier", ModelTier::Frontier, &[Modality::Text]),
+        ]);
+        assert!(cfg.validate_coverage().is_err());
+    }
+}
