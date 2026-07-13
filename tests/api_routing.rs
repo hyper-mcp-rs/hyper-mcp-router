@@ -259,6 +259,27 @@ modalities = ["text", "image-input", "audio-input", "file-input", "audio-output"
     )
 }
 
+/// A single model covering every modality. Every request then has exactly one
+/// candidate, so the router always skips classification (see
+/// `single_model_deployment_routes_everything`).
+fn single_model_config_toml(addr: SocketAddr) -> String {
+    let base = format!("http://{addr}");
+    format!(
+        r#"
+[server]
+host = "127.0.0.1"
+port = 0
+
+[[models]]
+name = "only"
+base_url = "{base}"
+api_key = "test-key"
+type = "balanced"
+modalities = ["text", "image-input", "audio-input", "file-input", "audio-output", "image-output", "tools"]
+"#
+    )
+}
+
 /// A full-coverage catalogue. Every backend points at the same mock server, so
 /// the recorded `model` field alone identifies the routing decision. Names
 /// encode (tier, modality) for legible assertions.
@@ -650,6 +671,23 @@ async fn tools_request_routes_to_tool_capable_backend() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     // Only `agent` declares the `tools` modality in the mock catalogue.
     assert_eq!(h.last_call()["model"], "agent");
+}
+
+/// With a single model covering every modality, every request has exactly one
+/// candidate, so classification is skipped and everything routes to it —
+/// regardless of complexity or (lexical) image-generation intent.
+#[tokio::test]
+async fn single_model_deployment_routes_everything() {
+    let h = Harness::start_with(CLASSIFIER.clone(), single_model_config_toml).await;
+    for prompt in [
+        "hi",
+        "Derive and rigorously prove a hard theorem with a formal amortized analysis.",
+        "draw a picture of a cat",
+    ] {
+        let resp = h.chat(&text_request(prompt)).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "prompt {prompt:?}");
+        assert_eq!(h.last_call()["model"], "only", "prompt {prompt:?}");
+    }
 }
 
 /// A request whose combined modalities no single backend covers must yield 415

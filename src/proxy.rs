@@ -100,29 +100,61 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
         _ => return bad_request("request body must be a JSON object"),
     };
 
-    // 2. Resolve the required modality set + complexity, then select a backend.
-    let classification = classify_or_default(&state.classifier, &body).await;
-
+    // 2. Resolve the required modality set deterministically — no model needed.
+    //    `image-output` is the only inferred modality; its cheap lexical signal
+    //    is applied here so the full required set is known before we decide
+    //    whether classification is even necessary.
     let mut required = detect_required_modalities(&body);
-    if classification.image_generation {
+    let current_turn = extract_prompt(&body)
+        .map(|p| truncate_prompt(&p))
+        .unwrap_or_default();
+    let lexical_image = looks_like_image_generation(&current_turn);
+    if lexical_image {
         required.insert(Modality::ImageOutput);
     }
 
-    // Complexity comes entirely from the windowed classification (recent
-    // substantive user turns); there is no separate history heuristic.
-    let complexity = classification.complexity;
-
-    let prompt_len = extract_prompt(&body)
-        .map(|p| p.chars().count())
-        .unwrap_or(0);
+    let prompt_len = current_turn.chars().count();
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+
+    // 3. Classify complexity ONLY when it can affect the choice. With <= 1 model
+    //    able to serve the required set there is nothing to rank, so skip the
+    //    (serialized) NLI pass entirely and route directly — single-model or
+    //    single-candidate deployments then run zero inference. When >= 2
+    //    candidates exist we classify, and the NLI image-generation signal may
+    //    further constrain the set.
+    // `None` records that classification was skipped (logged honestly rather
+    // than as a fabricated tier).
+    let classified: Option<ModelTier>;
+    let image_source;
+    if state.config.candidate_count(&required) <= 1 {
+        classified = None;
+        image_source = if lexical_image { Some("lexical") } else { None };
+    } else {
+        let classification = classify_or_default(&state.classifier, &body).await;
+        if classification.image_generation {
+            required.insert(Modality::ImageOutput);
+        }
+        classified = Some(classification.complexity);
+        image_source = if classification.image_generation {
+            if lexical_image {
+                Some("lexical")
+            } else {
+                Some("nli-threshold")
+            }
+        } else {
+            None
+        };
+    }
+    // The tier only ranks among >= 2 candidates; when skipped, any value selects
+    // the sole (or zero) candidate.
+    let complexity = classified.unwrap_or(ModelTier::Balanced);
 
     let backend = match state.config.select_model(&required, complexity) {
         Some(m) => m,
         None => {
             tracing::info!(
                 modalities = ?required.to_kebab_vec(),
-                complexity = ?complexity,
+                complexity = ?classified,
                 status = 415u16,
                 streaming,
                 prompt_chars = prompt_len,
@@ -139,20 +171,10 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
     sanitise(&mut body);
 
     // Metadata-only routing log (no user content).
-    let image_source = if classification.image_generation {
-        if looks_like_image_generation(&truncate_prompt(&extract_prompt(&body).unwrap_or_default()))
-        {
-            Some("lexical")
-        } else {
-            Some("nli-threshold")
-        }
-    } else {
-        None
-    };
     tracing::info!(
         modalities = ?required.to_kebab_vec(),
         image_output_source = image_source,
-        complexity = ?complexity,
+        complexity = ?classified,
         model = %backend.name,
         streaming,
         prompt_chars = prompt_len,

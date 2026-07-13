@@ -392,6 +392,16 @@ impl RouterConfig {
             .filter(|m| m.modality_set().is_superset(required))
             .min_by_key(|m| tier_rank(m.tier, complexity))
     }
+
+    /// How many models can serve `required` (declare a superset of it). When this
+    /// is `<= 1` the complexity tier is irrelevant — there is nothing to rank —
+    /// so the proxy can skip classification entirely and route directly.
+    pub fn candidate_count(&self, required: &ModalitySet) -> usize {
+        self.models
+            .iter()
+            .filter(|m| m.modality_set().is_superset(required))
+            .count()
+    }
 }
 
 /// Distance ranking for model selection. Lower is better:
@@ -788,6 +798,28 @@ port = 8080
         ]);
         let err = cfg.validate_coverage().unwrap_err();
         assert!(err.to_string().contains("text"), "got: {err}");
+    }
+
+    #[test]
+    fn candidate_count_reflects_superset_matches() {
+        let cfg = catalogue(vec![
+            model("a", ModelTier::Fast, &[Modality::Text]),
+            model("b", ModelTier::Balanced, &[Modality::Text]),
+            model(
+                "vision",
+                ModelTier::Balanced,
+                &[Modality::Text, Modality::ImageInput],
+            ),
+        ]);
+        // Three text models can serve plain text.
+        assert_eq!(cfg.candidate_count(&req(&[Modality::Text])), 3);
+        // Only the vision model can serve image input.
+        assert_eq!(
+            cfg.candidate_count(&req(&[Modality::Text, Modality::ImageInput])),
+            1
+        );
+        // Nothing serves audio output.
+        assert_eq!(cfg.candidate_count(&req(&[Modality::AudioOutput])), 0);
     }
 
     #[test]

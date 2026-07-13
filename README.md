@@ -110,6 +110,11 @@ The router selects the configured model whose declared modalities are a
 (exact → nearest higher → highest lower). If no single model covers the required
 set it returns `415`.
 
+Complexity is only used to *rank among* candidates, so when at most one model can
+serve the required modality set (e.g. a single-model deployment, or a request
+for a modality only one backend provides) the router **skips classification
+entirely** and routes directly — zero inference.
+
 ## Performance & tuning
 
 Complexity classification runs a single batched forward pass through the
