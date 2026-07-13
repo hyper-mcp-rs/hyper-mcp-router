@@ -39,8 +39,10 @@ use hyper_mcp_router::proxy::{build_router, AppState, ADVERTISED_MODEL};
 // ───────────────────────────────────────────────────────────────────────────
 
 static CLASSIFIER: LazyLock<Arc<Classifier>> = LazyLock::new(|| {
+    // Pool of 2 (default ORT intra-op threads) so the pooling path is exercised
+    // by the correctness suite without a heavy N-session startup cost.
     Arc::new(
-        Classifier::new(DEFAULT_IMAGE_GEN_THRESHOLD, DEFAULT_TRIVIAL_MAX_WORDS)
+        Classifier::new(DEFAULT_IMAGE_GEN_THRESHOLD, DEFAULT_TRIVIAL_MAX_WORDS, 2, 0)
             .expect("load embedded classifier"),
     )
 });
@@ -126,6 +128,10 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Harness {
+        Harness::start_with_classifier(CLASSIFIER.clone()).await
+    }
+
+    async fn start_with_classifier(classifier: Arc<Classifier>) -> Harness {
         let (mock_addr, calls) = spawn_mock_backend().await;
 
         // Build the config through the real parse + validate path so coverage
@@ -133,7 +139,7 @@ impl Harness {
         let cfg = config::parse(&mock_config_toml(mock_addr)).expect("parse config");
         cfg.validate().expect("validate config");
 
-        let state = AppState::new(CLASSIFIER.clone(), Arc::new(cfg)).expect("build app state");
+        let state = AppState::new(classifier, Arc::new(cfg)).expect("build app state");
         let app = build_router(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1179,7 +1185,31 @@ async fn load_test_progressive_concurrency() {
     // unset measures the full NLI model path with unique prompts.
     let fixed_prompt = Arc::new(std::env::var("LOAD_PROMPT").ok());
 
-    let h = Harness::start().await;
+    // `LOAD_POOL_SIZE=N` (optionally `LOAD_INTRA_OP=T`) builds a dedicated
+    // classifier with that pool size to sweep inference concurrency; unset uses
+    // the shared 2-session classifier.
+    let pool_override = std::env::var("LOAD_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let h = if let Some(pool) = pool_override {
+        let intra_op = std::env::var("LOAD_INTRA_OP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        println!("(dedicated classifier: pool_size={pool}, intra_op_threads={intra_op})");
+        let clf = Arc::new(
+            Classifier::new(
+                DEFAULT_IMAGE_GEN_THRESHOLD,
+                DEFAULT_TRIVIAL_MAX_WORDS,
+                pool,
+                intra_op,
+            )
+            .expect("build classifier"),
+        );
+        Harness::start_with_classifier(clf).await
+    } else {
+        Harness::start().await
+    };
 
     // Warm up: force the shared classifier's lazy init and the ORT session's
     // first pass so it doesn't skew the first measured level.

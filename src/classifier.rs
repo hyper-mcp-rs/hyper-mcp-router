@@ -6,7 +6,7 @@
 //! `type_vocab_size = 0` — no `token_type_ids`). These facts are load-bearing
 //! for the inference code below.
 
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex};
 
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use regex::Regex;
@@ -176,6 +176,112 @@ pub enum HypothesisKind {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Inference parallelism planning
+// ───────────────────────────────────────────────────────────────────────────
+
+/// How to split the host's available cores between concurrent inference
+/// sessions (`pool_size`) and intra-op threads per session (`intra_op_threads`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InferencePlan {
+    /// Number of independent [`Session`]s (max concurrent inferences).
+    pub pool_size: usize,
+    /// ORT intra-op threads per session (0 = let the runtime decide).
+    pub intra_op_threads: usize,
+}
+
+/// Derive an [`InferencePlan`] from the number of available cores. The embedded
+/// NLI model is small and scales poorly per-inference, so we favor concurrency:
+/// cap intra-op parallelism at 2 and give each session ~2 cores. Always yields
+/// at least one (single-threaded) session, and never budgets more threads than
+/// cores (`pool_size * intra_op_threads <= cores`).
+pub fn plan_inference(available_cores: usize) -> InferencePlan {
+    let cores = available_cores.max(1);
+    let intra_op_threads = if cores >= 2 { 2 } else { 1 };
+    let pool_size = (cores / intra_op_threads).max(1);
+    InferencePlan {
+        pool_size,
+        intra_op_threads,
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Session pool
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A fixed pool of ORT sessions. `ort 2.0.0-rc.12`'s `Session::run` takes
+/// `&mut self`, so concurrent inference is impossible on a single shared
+/// session; the pool holds N independent sessions and hands out exclusive
+/// access, allowing up to N inferences to run at once.
+///
+/// Checkout is **blocking** by design: inference already runs inside
+/// `spawn_blocking`, so parking that blocking-pool thread until a session frees
+/// up is correct and needs no async machinery.
+struct SessionPool {
+    idle: Mutex<Vec<Session>>,
+    available: Condvar,
+}
+
+impl SessionPool {
+    fn new(sessions: Vec<Session>) -> Self {
+        SessionPool {
+            idle: Mutex::new(sessions),
+            available: Condvar::new(),
+        }
+    }
+
+    /// Block until a session is free, returning an RAII guard that returns it to
+    /// the pool on drop (including on panic/early-return).
+    fn acquire(&self) -> anyhow::Result<PooledSession<'_>> {
+        let mut idle = self
+            .idle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session pool mutex poisoned"))?;
+        while idle.is_empty() {
+            idle = self
+                .available
+                .wait(idle)
+                .map_err(|_| anyhow::anyhow!("session pool mutex poisoned"))?;
+        }
+        let session = idle.pop().expect("pool non-empty after wait");
+        Ok(PooledSession {
+            pool: self,
+            session: Some(session),
+        })
+    }
+}
+
+/// Exclusive lease on a pooled [`Session`]; derefs to the session and returns it
+/// to the pool when dropped.
+struct PooledSession<'a> {
+    pool: &'a SessionPool,
+    session: Option<Session>,
+}
+
+impl Drop for PooledSession<'_> {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            if let Ok(mut idle) = self.pool.idle.lock() {
+                idle.push(session);
+                self.pool.available.notify_one();
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for PooledSession<'_> {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        self.session.as_ref().expect("session present until drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledSession<'_> {
+    fn deref_mut(&mut self) -> &mut Session {
+        self.session.as_mut().expect("session present until drop")
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Classifier
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -189,13 +295,13 @@ pub enum HypothesisKind {
 ///
 /// NOTE (deviation from the spec): the spec assumes `ort::Session::run` takes
 /// `&self` (lock-free concurrent runs). In the pinned `ort = 2.0.0-rc.12`,
-/// `run` takes `&mut self`, so a shared `&Session` cannot run inference; the
-/// session is held behind a `Mutex` for interior mutability. Because each
-/// request now takes exactly **one** batched pass, the lock is acquired once
-/// per request rather than once per hypothesis. Request forwarding and SSE
-/// streaming are outside this lock and remain fully concurrent.
+/// `run` takes `&mut self`, so a shared `&Session` cannot run inference. To
+/// still run inferences concurrently, the classifier holds a [`SessionPool`] of
+/// independent sessions and checks one out per request; only the batched `run`
+/// is inside the lease. Tokenisation, request forwarding, and SSE streaming are
+/// all outside it and remain fully concurrent.
 pub struct Classifier {
-    session: Mutex<Session>,
+    pool: SessionPool,
     tokenizer: Tokenizer,
     hypotheses: Vec<(HypothesisKind, String)>,
     /// Absolute P(entailment) floor for the image-generation axis.
@@ -207,18 +313,37 @@ pub struct Classifier {
 impl Classifier {
     /// Load the embedded model and tokenizer and build the hypothesis list.
     ///
-    /// Intra-op threading is left at the ORT default so the single batched pass
-    /// can use the available cores; there is no longer a many-concurrent-passes
-    /// design that would oversubscribe the thread pool.
-    pub fn new(image_gen_threshold: f32, trivial_max_words: usize) -> anyhow::Result<Self> {
+    /// `pool_size` independent sessions are created so up to that many inferences
+    /// can run concurrently (see [`SessionPool`]); it is clamped to at least 1.
+    /// `intra_op_threads` sets ORT intra-op parallelism per session (0 = runtime
+    /// default). Size the two together so `pool_size * intra_op_threads` stays
+    /// near the core count (see [`plan_inference`]); otherwise sessions
+    /// oversubscribe the CPU.
+    pub fn new(
+        image_gen_threshold: f32,
+        trivial_max_words: usize,
+        pool_size: usize,
+        intra_op_threads: usize,
+    ) -> anyhow::Result<Self> {
         // `ort::Error` is not `Send + Sync` for every generic parameter, so it
         // cannot flow through `?` into `anyhow::Error`; map each to a string.
-        let session = Session::builder()
-            .map_err(|e| anyhow::anyhow!("ort session builder: {e}"))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow::anyhow!("ort optimization level: {e}"))?
-            .commit_from_memory(MODEL_BYTES)
-            .map_err(|e| anyhow::anyhow!("ort commit_from_memory: {e}"))?;
+        let pool_size = pool_size.max(1);
+        let mut sessions = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let mut builder = Session::builder()
+                .map_err(|e| anyhow::anyhow!("ort session builder: {e}"))?
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .map_err(|e| anyhow::anyhow!("ort optimization level: {e}"))?;
+            if intra_op_threads > 0 {
+                builder = builder
+                    .with_intra_threads(intra_op_threads)
+                    .map_err(|e| anyhow::anyhow!("ort intra threads: {e}"))?;
+            }
+            let session = builder
+                .commit_from_memory(MODEL_BYTES)
+                .map_err(|e| anyhow::anyhow!("ort commit_from_memory: {e}"))?;
+            sessions.push(session);
+        }
 
         let mut tokenizer = Tokenizer::from_bytes(TOKENIZER_BYTES)
             .map_err(|e| anyhow::anyhow!("tokenizer error: {e}"))?;
@@ -257,7 +382,7 @@ impl Classifier {
         ];
 
         Ok(Self {
-            session: Mutex::new(session),
+            pool: SessionPool::new(sessions),
             tokenizer,
             hypotheses,
             image_gen_threshold,
@@ -295,8 +420,8 @@ impl Classifier {
     /// model consumes no `token_type_ids`). The pairs are tokenised together
     /// and padded to the longest, forming a `[N, seq]` batch fed through a
     /// single `run`; row `i` yields the entailment probability for hypothesis
-    /// `i`. `Session::run` requires `&mut self`, so the pass is taken under the
-    /// session `Mutex` — once per request.
+    /// `i`. `Session::run` requires `&mut self`, so a session is leased from the
+    /// pool for the pass; up to `pool_size` passes run concurrently.
     fn score_hypotheses(&self, prompt: &str) -> anyhow::Result<Vec<(HypothesisKind, f32)>> {
         let pairs: Vec<(&str, &str)> = self
             .hypotheses
@@ -329,10 +454,7 @@ impl Classifier {
         let attn_mask = ort::value::TensorRef::from_array_view(&attn_mask)
             .map_err(|e| anyhow::anyhow!("ort attention_mask tensor: {e}"))?;
 
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| anyhow::anyhow!("classifier session mutex poisoned"))?;
+        let mut session = self.pool.acquire()?;
         let outputs = session
             .run(ort::inputs![
                 "input_ids"      => input_ids,
@@ -697,7 +819,39 @@ mod tests {
         }
     }
 
-    // ── looks_trivial / fast_path_classification ────────────────────────────
+    // ── plan_inference ──────────────────────────────────────────────────────
+    #[test]
+    fn inference_plan_stays_within_core_budget() {
+        for cores in [1usize, 2, 3, 4, 8, 16, 18, 32, 64] {
+            let p = plan_inference(cores);
+            assert!(p.pool_size >= 1, "pool_size >= 1 for {cores}");
+            assert!(p.intra_op_threads >= 1, "intra_op >= 1 for {cores}");
+            assert!(
+                p.pool_size * p.intra_op_threads <= cores.max(1),
+                "budget exceeded for {cores}: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inference_plan_degenerate_cores() {
+        // Zero/one core collapses to a single single-threaded session.
+        let one = InferencePlan {
+            pool_size: 1,
+            intra_op_threads: 1,
+        };
+        assert_eq!(plan_inference(0), one);
+        assert_eq!(plan_inference(1), one);
+    }
+
+    #[test]
+    fn inference_plan_pool_grows_with_cores() {
+        assert!(plan_inference(4).pool_size <= plan_inference(8).pool_size);
+        assert!(plan_inference(8).pool_size <= plan_inference(18).pool_size);
+        assert_eq!(plan_inference(18).pool_size, 9);
+    }
+
+    // ── looks_trivial / fast_path_classification ─────────────────────────────
     #[test]
     fn trivial_positives_match() {
         for p in [
@@ -908,7 +1062,8 @@ mod tests {
     #[test]
     #[ignore = "loads the embedded ONNX model"]
     fn routing_directionality_guard() {
-        let clf = Classifier::new(DEFAULT_IMAGE_GEN_THRESHOLD, DEFAULT_TRIVIAL_MAX_WORDS).unwrap();
+        let clf =
+            Classifier::new(DEFAULT_IMAGE_GEN_THRESHOLD, DEFAULT_TRIVIAL_MAX_WORDS, 1, 1).unwrap();
         let simple = clf.classify("hi").unwrap();
         let complex = clf
             .classify(

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 
-use hyper_mcp_router::classifier::Classifier;
+use hyper_mcp_router::classifier::{plan_inference, Classifier};
 use hyper_mcp_router::cli::{Cli, Command, ServeArgs};
 use hyper_mcp_router::config;
 use hyper_mcp_router::logging;
@@ -31,12 +31,28 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     // (config::load runs field + startup coverage validation internally.)
 
-    // 4. Initialise the classifier from the embedded model bytes.
+    // 4. Initialise the classifier from the embedded model bytes. Size the
+    //    inference pool + intra-op threads from the detected core count
+    //    (container-aware since Rust 1.64), overridable via CLI flags.
+    let detected_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let plan = plan_inference(detected_cores);
+    let pool_size = args.inference_pool_size.unwrap_or(plan.pool_size);
+    let intra_op_threads = args.intra_op_threads.unwrap_or(plan.intra_op_threads);
     let classifier = Classifier::new(
         cfg.classifier.image_generation_threshold,
         args.trivial_max_words,
+        pool_size,
+        intra_op_threads,
     )
     .context("initialising classifier")?;
+    tracing::info!(
+        detected_cores,
+        pool_size,
+        intra_op_threads,
+        "inference parallelism configured"
+    );
 
     // 5. Log the resolved configuration — names, types, modalities, base URLs.
     //    Never API keys.
