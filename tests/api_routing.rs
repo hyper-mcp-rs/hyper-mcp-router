@@ -65,8 +65,16 @@ const TEXT_BACKENDS: [&str; 3] = ["fast-text", "balanced-text", "frontier-text"]
 // Mock backend: records every forwarded request, returns a trivial completion.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Thread-safe log of every request body the router forwarded upstream.
-type Calls = Arc<Mutex<Vec<Value>>>;
+/// A single recorded upstream call: the forwarded body plus the `Authorization`
+/// header value the router sent (if any).
+#[derive(Clone)]
+struct Recorded {
+    body: Value,
+    authorization: Option<String>,
+}
+
+/// Thread-safe log of every request the router forwarded upstream.
+type Calls = Arc<Mutex<Vec<Recorded>>>;
 
 async fn spawn_mock_backend() -> (SocketAddr, Calls) {
     let calls: Calls = Arc::new(Mutex::new(Vec::new()));
@@ -86,13 +94,24 @@ async fn spawn_mock_backend() -> (SocketAddr, Calls) {
     (addr, calls)
 }
 
-async fn mock_chat(State(calls): State<Calls>, body: Bytes) -> Response {
+async fn mock_chat(
+    State(calls): State<Calls>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
     let forwarded: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let authorization = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let streaming = forwarded
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    calls.lock().unwrap().push(forwarded);
+    calls.lock().unwrap().push(Recorded {
+        body: forwarded,
+        authorization,
+    });
 
     if streaming {
         Response::builder()
@@ -132,11 +151,18 @@ impl Harness {
     }
 
     async fn start_with_classifier(classifier: Arc<Classifier>) -> Harness {
+        Harness::start_with(classifier, mock_config_toml).await
+    }
+
+    async fn start_with(
+        classifier: Arc<Classifier>,
+        config_of: impl Fn(SocketAddr) -> String,
+    ) -> Harness {
         let (mock_addr, calls) = spawn_mock_backend().await;
 
         // Build the config through the real parse + validate path so coverage
         // validation is exercised too.
-        let cfg = config::parse(&mock_config_toml(mock_addr)).expect("parse config");
+        let cfg = config::parse(&config_of(mock_addr)).expect("parse config");
         cfg.validate().expect("validate config");
 
         let state = AppState::new(classifier, Arc::new(cfg)).expect("build app state");
@@ -183,9 +209,53 @@ impl Harness {
             .lock()
             .unwrap()
             .last()
-            .cloned()
+            .map(|r| r.body.clone())
             .expect("at least one recorded upstream call")
     }
+
+    /// The `Authorization` header the router sent on the last forwarded call, if
+    /// any. `None` means no header was sent (keyless backend).
+    fn last_authorization(&self) -> Option<String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .last()
+            .expect("at least one recorded upstream call")
+            .authorization
+            .clone()
+    }
+}
+
+/// A minimal keyless catalogue (no `api_key` on any model) that still satisfies
+/// startup coverage validation: text for every tier, all extra modalities on
+/// the frontier model. Used to verify that keyless backends get no auth header.
+fn keyless_config_toml(addr: SocketAddr) -> String {
+    let base = format!("http://{addr}");
+    format!(
+        r#"
+[server]
+host = "127.0.0.1"
+port = 0
+
+[[models]]
+name = "fast-text"
+base_url = "{base}"
+type = "fast"
+modalities = ["text"]
+
+[[models]]
+name = "balanced-text"
+base_url = "{base}"
+type = "balanced"
+modalities = ["text"]
+
+[[models]]
+name = "frontier-all"
+base_url = "{base}"
+type = "frontier"
+modalities = ["text", "image-input", "audio-input", "file-input", "audio-output", "image-output"]
+"#
+    )
 }
 
 /// A full-coverage catalogue. Every backend points at the same mock server, so
@@ -604,6 +674,30 @@ async fn request_fields_pass_through_except_n_and_model() {
     assert_eq!(forwarded["temperature"], 0.7);
     assert_eq!(forwarded["top_logprobs"], 5);
     assert_eq!(forwarded["custom_unknown_key"]["nested"][2], 3);
+}
+
+/// A configured `api_key` is forwarded upstream as a bearer token.
+#[tokio::test]
+async fn configured_api_key_is_forwarded_as_bearer() {
+    let h = Harness::start().await;
+    let resp = h.chat(&text_request("Say hello.")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    // The mock catalogue sets api_key = "test-key" on every model.
+    assert_eq!(h.last_authorization().as_deref(), Some("Bearer test-key"));
+}
+
+/// A keyless backend (no `api_key`) receives no `Authorization` header.
+#[tokio::test]
+async fn keyless_backend_sends_no_authorization_header() {
+    let h = Harness::start_with(CLASSIFIER.clone(), keyless_config_toml).await;
+    let resp = h.chat(&text_request("Say hello.")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(h.call_count(), 1);
+    assert_eq!(
+        h.last_authorization(),
+        None,
+        "keyless backend must get no auth header"
+    );
 }
 
 /// Streaming requests get a text/event-stream passthrough of the upstream SSE.

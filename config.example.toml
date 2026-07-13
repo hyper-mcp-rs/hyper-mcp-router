@@ -1,12 +1,14 @@
 # Example / default configuration for hyper-mcp-router.
 #
-# This file is NOT embedded in the binary. Copy it to a well-known location
+# This file is an example template — it is NOT embedded in the binary and is NOT
+# read from the repository. Copy it to a well-known location *as* `config.toml`
 # (e.g. ~/Library/Application Support/hyper-mcp-router/config.toml on macOS, or
 # $XDG_CONFIG_HOME/hyper-mcp-router/config.toml on Linux) or pass it explicitly
-# with `--config <path>`.
+# with `--config <path>` (any filename works with `--config`).
 #
 # Every backend must be OpenAI Chat Completions v1 compatible and expose
-# `POST {base_url}/chat/completions`.
+# `POST {base_url}/chat/completions`. `base_url` must be a valid http/https URL
+# (validated at startup; a malformed or non-HTTP URL is a fatal config error).
 
 [server]
 host = "0.0.0.0"
@@ -22,11 +24,23 @@ request_timeout_secs = 600
 [classifier]
 image_generation_threshold = 0.5
 
+# `api_key` resolves three ways (below), or may be omitted entirely for a
+# keyless backend (e.g. a local Ollama / vLLM / LM Studio server, or a gateway
+# that injects auth). An omitted field or an empty string "" both mean "no
+# auth" — no Authorization header is sent.
+
 # 1. Plaintext key directly in the file.
 [[models]]
 name       = "gpt-4.1-mini"
 base_url   = "https://api.openai.com/v1"
 api_key    = "sk-plaintext-key"
+type       = "fast"
+modalities = ["text"]
+
+# 1b. Keyless backend: omit api_key (or set it to "").
+[[models]]
+name       = "llama3"
+base_url   = "http://localhost:11434/v1"
 type       = "fast"
 modalities = ["text"]
 

@@ -13,6 +13,7 @@ use directories::ProjectDirs;
 use regex::Regex;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
+use url::Url;
 
 use crate::classifier::{Modality, ModalitySet, ModelTier, DEFAULT_IMAGE_GEN_THRESHOLD};
 
@@ -93,10 +94,17 @@ fn default_image_gen_threshold() -> f32 {
 pub struct ModelConfig {
     /// Model string sent upstream as `body["model"]`.
     pub name: String,
-    pub base_url: String,
-    /// Resolved secret (from plaintext / env / keyring). Never logged.
-    #[serde(deserialize_with = "resolve_api_key")]
-    pub api_key: String,
+    /// Backend base URL. Parsed and constrained to `http`/`https` at config
+    /// load, so a malformed or non-HTTP URL is a startup error rather than a
+    /// per-request failure. `{base_url}/chat/completions` is the forward target.
+    #[serde(deserialize_with = "deserialize_http_url")]
+    pub base_url: Url,
+    /// Resolved secret (from plaintext / env / keyring), or `None` for a keyless
+    /// backend. An omitted field, an empty string, or a keyring value that
+    /// resolves empty all mean "no auth": no `Authorization` header is sent.
+    /// Never logged.
+    #[serde(default, deserialize_with = "resolve_api_key")]
+    pub api_key: Option<String>,
     /// Deserialised from `type` (a Rust reserved word).
     #[serde(rename = "type")]
     pub tier: ModelTier,
@@ -111,6 +119,25 @@ impl ModelConfig {
     }
 }
 
+/// Deserialize a `base_url` string into a [`Url`], rejecting anything that is
+/// not a well-formed `http`/`https` URL. Deserializing via `String` first keeps
+/// this robust across the `config` crate's value model; the scheme check makes
+/// `file://`, `ftp://`, missing-scheme, and other footguns fatal at load.
+fn deserialize_http_url<'de, D>(deserializer: D) -> Result<Url, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    let url = Url::parse(&raw)
+        .map_err(|e| de::Error::custom(format!("invalid base_url `{raw}`: {e}")))?;
+    match url.scheme() {
+        "http" | "https" => Ok(url),
+        other => Err(de::Error::custom(format!(
+            "base_url `{raw}` must be an http or https URL, got scheme `{other}`"
+        ))),
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // API key resolution
 // ───────────────────────────────────────────────────────────────────────────
@@ -118,29 +145,36 @@ impl ModelConfig {
 /// Custom deserializer for a model's `api_key`. A TOML string yields the
 /// plaintext/env-expanded key verbatim; an inline table
 /// `{ source = "keyring", service = "...", user = "..." }` triggers an OS
-/// keyring lookup at load time. Only the resolved secret is retained.
-fn resolve_api_key<'de, D>(deserializer: D) -> Result<String, D::Error>
+/// keyring lookup at load time. Only the resolved secret is retained. An empty
+/// resolved value becomes `None` (keyless backend), so `""` is treated the same
+/// as omitting the field.
+fn resolve_api_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
+    /// Empty string => no auth.
+    fn non_empty(s: String) -> Option<String> {
+        (!s.is_empty()).then_some(s)
+    }
+
     struct ApiKeyVisitor;
 
     impl<'de> Visitor<'de> for ApiKeyVisitor {
-        type Value = String;
+        type Value = Option<String>;
 
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
             f.write_str("a plaintext API key string or a keyring lookup table")
         }
 
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
-            Ok(v.to_owned())
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Option<String>, E> {
+            Ok(non_empty(v.to_owned()))
         }
 
-        fn visit_string<E: de::Error>(self, v: String) -> Result<String, E> {
-            Ok(v)
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Option<String>, E> {
+            Ok(non_empty(v))
         }
 
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<String, A::Error> {
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Option<String>, A::Error> {
             let mut source: Option<String> = None;
             let mut service: Option<String> = None;
             let mut user: Option<String> = None;
@@ -172,11 +206,12 @@ where
                     "keyring entry (service={service}, user={user}) unavailable: {e}"
                 ))
             })?;
-            entry.get_password().map_err(|e| {
+            let password = entry.get_password().map_err(|e| {
                 de::Error::custom(format!(
                     "keyring lookup failed (service={service}, user={user}): {e}"
                 ))
-            })
+            })?;
+            Ok(non_empty(password))
         }
     }
 
@@ -313,9 +348,8 @@ impl RouterConfig {
             if m.modalities.is_empty() {
                 anyhow::bail!("model `{}` declares no modalities", m.name);
             }
-            if m.api_key.is_empty() {
-                anyhow::bail!("model `{}` resolved to an empty API key", m.name);
-            }
+            // `api_key` is optional: an omitted/empty value means a keyless
+            // backend (no `Authorization` header sent).
         }
         self.validate_coverage()
     }
@@ -465,18 +499,46 @@ port = 8080
     #[test]
     fn api_key_plaintext() {
         let cfg = parse_single_model(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"u\"\napi_key=\"sk-plain\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key=\"sk-plain\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
         ));
-        assert_eq!(cfg.models[0].api_key, "sk-plain");
+        assert_eq!(cfg.models[0].api_key.as_deref(), Some("sk-plain"));
+    }
+
+    #[test]
+    fn api_key_absent_is_none() {
+        // Field omitted entirely: keyless backend.
+        let cfg = parse_single_model(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+        ));
+        assert_eq!(cfg.models[0].api_key, None);
+    }
+
+    #[test]
+    fn api_key_empty_string_is_none() {
+        // Explicit empty string is treated the same as omitting the field.
+        let cfg = parse_single_model(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key=\"\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+        ));
+        assert_eq!(cfg.models[0].api_key, None);
+    }
+
+    #[test]
+    fn keyless_model_passes_validation() {
+        // A keyless single-tier catalogue must still validate (coverage aside).
+        let cfg = parse_single_model(&format!(
+            "{BASE}\n[[models]]\nname=\"fast\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n[[models]]\nname=\"bal\"\nbase_url=\"http://u\"\ntype=\"balanced\"\nmodalities=[\"text\"]\n[[models]]\nname=\"front\"\nbase_url=\"http://u\"\ntype=\"frontier\"\nmodalities=[\"text\", \"image-input\", \"audio-input\", \"file-input\", \"audio-output\", \"image-output\"]\n"
+        ));
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.models.iter().all(|m| m.api_key.is_none()));
     }
 
     #[test]
     fn api_key_env_expanded() {
         std::env::set_var("ROUTER_TEST_KEY", "sk-from-env");
         let cfg = parse_single_model(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"u\"\napi_key=\"${{ROUTER_TEST_KEY}}\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key=\"${{ROUTER_TEST_KEY}}\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
         ));
-        assert_eq!(cfg.models[0].api_key, "sk-from-env");
+        assert_eq!(cfg.models[0].api_key.as_deref(), Some("sk-from-env"));
     }
 
     #[test]
@@ -491,18 +553,82 @@ port = 8080
             return;
         };
         let cfg = parse_single_model(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"u\"\napi_key={{ source = \"keyring\", service = \"{service}\", user = \"{user}\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"keyring\", service = \"{service}\", user = \"{user}\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\n"
         ));
-        assert_eq!(cfg.models[0].api_key, "sk-keyring-secret");
+        assert_eq!(cfg.models[0].api_key.as_deref(), Some("sk-keyring-secret"));
         let _ = entry.delete_credential();
+    }
+
+    #[test]
+    fn base_url_parses_and_is_retained() {
+        let cfg = parse_single_model(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"https://api.example.com/v1\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+        ));
+        assert_eq!(
+            cfg.models[0].base_url.as_str(),
+            "https://api.example.com/v1"
+        );
+    }
+
+    #[test]
+    fn base_url_rejects_malformed() {
+        let err = parse(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"not a url\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("base_url"), "got: {err}");
+    }
+
+    #[test]
+    fn base_url_rejects_non_http_scheme() {
+        let err = parse(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"ftp://files.example.com\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("http or https"), "got: {err}");
+    }
+
+    // ── shipped example config (drift guard) ──────────────────────────────────
+    #[test]
+    fn example_config_matches_current_schema() {
+        // The checked-in example is documentation only (nothing parses it at
+        // build or run time), so it can silently drift out of sync with the
+        // schema. This guards that it still parses and passes startup
+        // validation. Secret *resolution* (env vars, OS keyring) is covered by
+        // dedicated tests, so neutralize those two constructs to a plaintext key
+        // here rather than depend on external state.
+        let raw = include_str!("../config.example.toml");
+        let neutralized = raw
+            .replace(
+                "{ source = \"keyring\", service = \"hyper-mcp-router\", user = \"openai-frontier\" }",
+                "\"sk-example\"",
+            )
+            .replace("${OPENAI_API_KEY}", "sk-example");
+
+        let cfg =
+            parse(&neutralized).expect("config.example.toml must parse under the current schema");
+        cfg.validate()
+            .expect("config.example.toml must pass startup validation");
+
+        // Sanity: the example still demonstrates its documented features.
+        assert!(
+            cfg.models.iter().any(|m| m.api_key.is_none()),
+            "example should include a keyless backend"
+        );
+        assert!(
+            cfg.models
+                .iter()
+                .any(|m| m.modality_set().contains(Modality::AudioOutput)),
+            "example should cover audio-output"
+        );
     }
 
     // ── select_model ──────────────────────────────────────────────────────────
     fn model(name: &str, tier: ModelTier, mods: &[Modality]) -> ModelConfig {
         ModelConfig {
             name: name.to_string(),
-            base_url: "http://x".to_string(),
-            api_key: "k".to_string(),
+            base_url: Url::parse("http://x").unwrap(),
+            api_key: Some("k".to_string()),
             tier,
             modalities: mods.to_vec(),
         }

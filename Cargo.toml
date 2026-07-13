@@ -31,6 +31,7 @@ clap       = { version = "4", features = ["derive"] }
 directories = "5"
 keyring    = "4.1"
 regex      = "1"
+url        = "2"
 anyhow     = "1"
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

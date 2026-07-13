@@ -161,15 +161,14 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
     // 5. Forward to `{base_url}/chat/completions`.
     let url = format!(
         "{}/chat/completions",
-        backend.base_url.trim_end_matches('/')
+        backend.base_url.as_str().trim_end_matches('/')
     );
-    let upstream = state
-        .http
-        .post(&url)
-        .bearer_auth(&backend.api_key)
-        .json(&body)
-        .send()
-        .await;
+    // Keyless backends (no configured `api_key`) get no `Authorization` header.
+    let mut request = state.http.post(&url).json(&body);
+    if let Some(api_key) = &backend.api_key {
+        request = request.bearer_auth(api_key);
+    }
+    let upstream = request.send().await;
 
     let resp = match upstream {
         Ok(r) => r,

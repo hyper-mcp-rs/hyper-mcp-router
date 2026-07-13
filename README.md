@@ -74,8 +74,9 @@ Without `--config`, the first existing file is used:
 | macOS | `~/Library/Application Support/hyper-mcp-router/config.toml`, then `/etc/hyper-mcp-router/config.toml` |
 | Windows | `%APPDATA%\hyper-mcp-router\config.toml` |
 
-A missing config is a fatal error. See [`config.toml`](./config.toml) for a
-fully-annotated example, including plaintext / environment-variable / OS-keyring
+A missing config is a fatal error. See
+[`config.example.toml`](./config.example.toml) for a fully-annotated example,
+including plaintext / environment-variable / OS-keyring
 API keys.
 
 ## Endpoints
