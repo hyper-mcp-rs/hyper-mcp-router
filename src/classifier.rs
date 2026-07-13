@@ -18,6 +18,12 @@ use crate::{MODEL_BYTES, TOKENIZER_BYTES};
 /// Prompt-length guard, in **characters** (never bytes — see [`truncate_prompt`]).
 const PROMPT_CHAR_LIMIT: usize = 400;
 
+/// Default upper word count for the trivial fast-path (see [`looks_trivial`]).
+/// Overridable via the `--trivial-max-words` CLI flag. Keeps the short-circuit
+/// to genuinely terse turns; longer text always reaches the model. A value of 0
+/// disables the fast path entirely.
+pub const DEFAULT_TRIVIAL_MAX_WORDS: usize = 6;
+
 /// Default absolute P(entailment) floor above which the image-generation
 /// hypothesis alone is enough to route to the image modality.
 pub const DEFAULT_IMAGE_GEN_THRESHOLD: f32 = 0.5;
@@ -194,6 +200,8 @@ pub struct Classifier {
     hypotheses: Vec<(HypothesisKind, String)>,
     /// Absolute P(entailment) floor for the image-generation axis.
     image_gen_threshold: f32,
+    /// Word ceiling for the trivial fast-path (see [`looks_trivial`]).
+    trivial_max_words: usize,
 }
 
 impl Classifier {
@@ -202,7 +210,7 @@ impl Classifier {
     /// Intra-op threading is left at the ORT default so the single batched pass
     /// can use the available cores; there is no longer a many-concurrent-passes
     /// design that would oversubscribe the thread pool.
-    pub fn new(image_gen_threshold: f32) -> anyhow::Result<Self> {
+    pub fn new(image_gen_threshold: f32, trivial_max_words: usize) -> anyhow::Result<Self> {
         // `ort::Error` is not `Send + Sync` for every generic parameter, so it
         // cannot flow through `?` into `anyhow::Error`; map each to a string.
         let session = Session::builder()
@@ -253,7 +261,16 @@ impl Classifier {
             tokenizer,
             hypotheses,
             image_gen_threshold,
+            trivial_max_words,
         })
+    }
+
+    /// Model-free fast-path classification using this classifier's configured
+    /// [`trivial_max_words`](Self::trivial_max_words) ceiling. Returns `Some`
+    /// only for turns that can be routed without the NLI pass; see
+    /// [`fast_path_classification`].
+    pub fn fast_path(&self, prompt: &str) -> Option<Classification> {
+        fast_path_classification(prompt, self.trivial_max_words)
     }
 
     /// Categorise the prompt in a single batched forward pass, then combine the
@@ -399,6 +416,85 @@ pub fn looks_like_image_generation(prompt: &str) -> bool {
     });
 
     RE.is_match(prompt)
+}
+
+/// Cheap lexical/length guard for *trivially simple* turns — greetings and
+/// acknowledgements like "hi", "ok", "thanks", "please continue". A match means
+/// the turn can skip the (serialized, ~12 ms) NLI pass and route as [`ModelTier::Fast`].
+///
+/// Deliberately conservative on three axes, all of which must hold:
+/// 1. **Short** — at most `max_words` words ("short ≠ simple", so a length cap
+///    alone is unsafe; a terse "prove X" must not slip through). `max_words == 0`
+///    disables the fast path (nothing is ever trivial).
+/// 2. **No reasoning cues** — none of the complexity markers below (guards
+///    against "ok, now derive the formula").
+/// 3. **Looks like filler** — matches the acknowledgement/greeting set.
+///
+/// It only ever routes *down* to Fast; history escalation still applies on top,
+/// so a terse turn on a deep/agentic thread is unaffected.
+pub fn looks_trivial(prompt: &str, max_words: usize) -> bool {
+    /// Reasoning cues that veto the fast path even on a short, filler-looking turn.
+    static COMPLEXITY_MARKERS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?ix)\b(
+                 prove|proof|derive|derivation|analy[sz]e|analysis|evaluate|assess|
+                 design|architect|optimi[sz]e|integrate|differentiate|refactor|debug|
+                 implement|algorithm|complexity|theorem|rigorous|synthesi[sz]e|critique|
+                 compare|contrast|explain|summari[sz]e|translate|calculate|solve
+               )\b",
+        )
+        .expect("valid complexity-marker regex")
+    });
+
+    /// Acknowledgement / greeting / short-confirmation phrases, anchored at the
+    /// start of the (trimmed) prompt.
+    static ACK_PHRASES: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?ix)^\s*(?:
+                 hi|hey|hello|yo|sup
+               | ok(?:ay)?|k
+               | ye(?:s|ah|p)|yup
+               | no|nope|nah
+               | thanks|thank\s+you|thx|ty|ta
+               | sure|cool|great|nice|awesome|perfect|excellent
+               | got\s+it|gotcha|understood|makes\s+sense|sounds\s+good|will\s+do
+               | continue|go\s+on|carry\s+on|keep\s+going|proceed
+               | please\s+continue
+               | good\s+(?:morning|afternoon|evening|night)
+               | bye|goodbye|see\s+you|cheers
+               | no\s+problem|np
+               | how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|whats\s+up
+             )\b",
+        )
+        .expect("valid acknowledgement regex")
+    });
+
+    let trimmed = prompt.trim();
+    let words = trimmed.split_whitespace().count();
+    (1..=max_words).contains(&words)
+        && !COMPLEXITY_MARKERS.is_match(trimmed)
+        && ACK_PHRASES.is_match(trimmed)
+}
+
+/// Model-free routing decision for the cheap cases, returning `Some` only when a
+/// classification can be made without the NLI pass:
+/// - image-creation intent (lexical) is left to the full path (returns `None`),
+///   so the NLI image-gen threshold still applies;
+/// - otherwise a [`looks_trivial`] turn resolves to [`ModelTier::Fast`].
+///
+/// Callers that get `None` must run the classifier as usual. `max_words` bounds
+/// the trivial-turn length (see [`looks_trivial`]); pass 0 to disable.
+pub fn fast_path_classification(prompt: &str, max_words: usize) -> Option<Classification> {
+    if looks_like_image_generation(prompt) {
+        return None;
+    }
+    if looks_trivial(prompt, max_words) {
+        return Some(Classification {
+            complexity: ModelTier::Fast,
+            image_generation: false,
+        });
+    }
+    None
 }
 
 /// Numerically stable two-class softmax, returning P(entailment).
@@ -601,6 +697,112 @@ mod tests {
         }
     }
 
+    // ── looks_trivial / fast_path_classification ────────────────────────────
+    #[test]
+    fn trivial_positives_match() {
+        for p in [
+            "hi",
+            "hello there",
+            "ok",
+            "okay",
+            "yes",
+            "no",
+            "thanks",
+            "thank you",
+            "thanks!",
+            "sure",
+            "cool, got it",
+            "got it",
+            "understood",
+            "continue",
+            "please continue",
+            "go on",
+            "good morning",
+            "how are you?",
+            "what's up",
+            "sounds good",
+            "bye",
+        ] {
+            assert!(
+                looks_trivial(p, DEFAULT_TRIVIAL_MAX_WORDS),
+                "should be trivial: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trivial_negatives_do_not_match() {
+        for p in [
+            // not filler at all
+            "What is the capital of France?",
+            "Tell me more about that.",
+            // filler-prefixed but carries a reasoning cue (marker veto)
+            "ok, now prove the theorem",
+            "sure, please derive the formula",
+            "yes, analyze these results",
+            // too long
+            "thanks so much for the detailed and very thorough breakdown you gave",
+            // short but technical (short != simple)
+            "Integrate sin(x).",
+            "Solve for x.",
+            "Prove P != NP.",
+        ] {
+            assert!(
+                !looks_trivial(p, DEFAULT_TRIVIAL_MAX_WORDS),
+                "should NOT be trivial: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trivial_max_words_zero_disables_fast_path() {
+        // A ceiling of 0 makes nothing trivial, disabling the short-circuit.
+        assert!(!looks_trivial("ok", 0));
+        assert!(fast_path_classification("ok thanks", 0).is_none());
+    }
+
+    #[test]
+    fn trivial_respects_word_ceiling() {
+        // "ok sure thanks" is 3 words: trivial at ceiling 3, not at ceiling 2.
+        assert!(looks_trivial("ok sure thanks", 3));
+        assert!(!looks_trivial("ok sure thanks", 2));
+    }
+
+    #[test]
+    fn fast_path_returns_fast_for_trivial() {
+        let c = fast_path_classification("ok thanks", DEFAULT_TRIVIAL_MAX_WORDS)
+            .expect("trivial => Some");
+        assert_eq!(c.complexity, ModelTier::Fast);
+        assert!(!c.image_generation);
+    }
+
+    #[test]
+    fn fast_path_defers_image_generation_to_model() {
+        // Short and image-y, but image intent must take the full (NLI) path.
+        assert!(
+            fast_path_classification("draw a picture of a cat", DEFAULT_TRIVIAL_MAX_WORDS)
+                .is_none()
+        );
+        assert!(
+            fast_path_classification("generate an image of a dog", DEFAULT_TRIVIAL_MAX_WORDS)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fast_path_defers_non_trivial_to_model() {
+        assert!(fast_path_classification(
+            "Explain how TLS handshakes work.",
+            DEFAULT_TRIVIAL_MAX_WORDS
+        )
+        .is_none());
+        assert!(fast_path_classification(
+            "Prove that sqrt 2 is irrational.",
+            DEFAULT_TRIVIAL_MAX_WORDS
+        )
+        .is_none());
+    }
+
     // ── detect_required_modalities ──────────────────────────────────────────
     #[test]
     fn modality_text_always_present() {
@@ -706,7 +908,7 @@ mod tests {
     #[test]
     #[ignore = "loads the embedded ONNX model"]
     fn routing_directionality_guard() {
-        let clf = Classifier::new(DEFAULT_IMAGE_GEN_THRESHOLD).unwrap();
+        let clf = Classifier::new(DEFAULT_IMAGE_GEN_THRESHOLD, DEFAULT_TRIVIAL_MAX_WORDS).unwrap();
         let simple = clf.classify("hi").unwrap();
         let complex = clf
             .classify(

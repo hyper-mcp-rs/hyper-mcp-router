@@ -210,6 +210,13 @@ async fn classify_or_default(classifier: &Arc<Classifier>, body: &Value) -> Clas
         return Classification::balanced_default();
     };
     let prompt = truncate_prompt(&prompt);
+    // Cheap lexical/length short-circuit: trivial turns (greetings,
+    // acknowledgements) skip the serialized NLI pass entirely and route as Fast.
+    // The word ceiling is configured via `--trivial-max-words`. History
+    // escalation is still applied by the caller via `max`.
+    if let Some(fast) = classifier.fast_path(&prompt) {
+        return fast;
+    }
     // Inference is CPU-bound (one batched forward pass): run it on the blocking
     // pool so it never stalls an async worker.
     let classifier = Arc::clone(classifier);

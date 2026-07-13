@@ -32,8 +32,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // (config::load runs field + startup coverage validation internally.)
 
     // 4. Initialise the classifier from the embedded model bytes.
-    let classifier = Classifier::new(cfg.classifier.image_generation_threshold)
-        .context("initialising classifier")?;
+    let classifier = Classifier::new(
+        cfg.classifier.image_generation_threshold,
+        args.trivial_max_words,
+    )
+    .context("initialising classifier")?;
 
     // 5. Log the resolved configuration — names, types, modalities, base URLs.
     //    Never API keys.
@@ -42,6 +45,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         advertised_model = hyper_mcp_router::proxy::ADVERTISED_MODEL,
         model_count = cfg.models.len(),
         image_generation_threshold = cfg.classifier.image_generation_threshold,
+        trivial_max_words = args.trivial_max_words,
         "configuration loaded"
     );
     for m in &cfg.models {
