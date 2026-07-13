@@ -33,13 +33,14 @@ fn main() {
             continue;
         }
 
-        let response = ureq::get(url)
+        let mut response = ureq::get(url)
             .call()
             .unwrap_or_else(|e| panic!("failed to download {name} from {url}: {e}"));
 
         let mut bytes = Vec::new();
         response
-            .into_reader()
+            .body_mut()
+            .as_reader()
             .read_to_end(&mut bytes)
             .unwrap_or_else(|e| panic!("failed to read {name} response body: {e}"));
 
