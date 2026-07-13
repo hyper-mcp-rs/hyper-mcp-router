@@ -377,6 +377,7 @@ impl RouterConfig {
             Modality::FileInput,
             Modality::AudioOutput,
             Modality::ImageOutput,
+            Modality::Tools,
         ] {
             let covered = self
                 .models
@@ -526,7 +527,7 @@ port = 8080
     fn keyless_model_passes_validation() {
         // A keyless single-tier catalogue must still validate (coverage aside).
         let cfg = parse_single_model(&format!(
-            "{BASE}\n[[models]]\nname=\"fast\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n[[models]]\nname=\"bal\"\nbase_url=\"http://u\"\ntype=\"balanced\"\nmodalities=[\"text\"]\n[[models]]\nname=\"front\"\nbase_url=\"http://u\"\ntype=\"frontier\"\nmodalities=[\"text\", \"image-input\", \"audio-input\", \"file-input\", \"audio-output\", \"image-output\"]\n"
+            "{BASE}\n[[models]]\nname=\"fast\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n[[models]]\nname=\"bal\"\nbase_url=\"http://u\"\ntype=\"balanced\"\nmodalities=[\"text\"]\n[[models]]\nname=\"front\"\nbase_url=\"http://u\"\ntype=\"frontier\"\nmodalities=[\"text\", \"image-input\", \"audio-input\", \"file-input\", \"audio-output\", \"image-output\", \"tools\"]\n"
         ));
         assert!(cfg.validate().is_ok());
         assert!(cfg.models.iter().all(|m| m.api_key.is_none()));
@@ -775,6 +776,11 @@ port = 8080
                 ModelTier::Balanced,
                 &[Modality::Text, Modality::AudioInput, Modality::AudioOutput],
             ),
+            model(
+                "agent",
+                ModelTier::Balanced,
+                &[Modality::Text, Modality::Tools],
+            ),
         ])
     }
 
@@ -831,5 +837,54 @@ port = 8080
             model("frontier", ModelTier::Frontier, &[Modality::Text]),
         ]);
         assert!(cfg.validate_coverage().is_err());
+    }
+
+    #[test]
+    fn coverage_fails_missing_tools() {
+        // Full modality coverage except tool calling.
+        let cfg = catalogue(vec![
+            model("fast", ModelTier::Fast, &[Modality::Text]),
+            model(
+                "balanced",
+                ModelTier::Balanced,
+                &[
+                    Modality::Text,
+                    Modality::ImageInput,
+                    Modality::AudioInput,
+                    Modality::FileInput,
+                    Modality::AudioOutput,
+                    Modality::ImageOutput,
+                ],
+            ),
+            model("frontier", ModelTier::Frontier, &[Modality::Text]),
+        ]);
+        let err = cfg.validate_coverage().unwrap_err();
+        assert!(err.to_string().contains("tools"), "got: {err}");
+    }
+
+    #[test]
+    fn select_tools_requires_tool_capable_model() {
+        let cfg = catalogue(vec![
+            model("plain", ModelTier::Balanced, &[Modality::Text]),
+            model(
+                "agent",
+                ModelTier::Frontier,
+                &[Modality::Text, Modality::Tools],
+            ),
+        ]);
+        // A tools request skips the non-tool model even though `plain` is the
+        // closer tier match; capability is a hard constraint.
+        let chosen = cfg
+            .select_model(
+                &req(&[Modality::Text, Modality::Tools]),
+                ModelTier::Balanced,
+            )
+            .unwrap();
+        assert_eq!(chosen.name, "agent");
+        // Without the tools requirement, tier preference picks `plain`.
+        let chosen = cfg
+            .select_model(&req(&[Modality::Text]), ModelTier::Balanced)
+            .unwrap();
+        assert_eq!(chosen.name, "plain");
     }
 }

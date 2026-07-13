@@ -4,7 +4,8 @@ An adaptive, OpenAI Chat Completions compatible LLM router. It presents a single
 virtual model to any client, classifies each incoming prompt with an **embedded**
 zero-shot NLI model, and transparently forwards the request to the appropriate
 backend model tier — with **modality-aware** routing across the full Chat
-Completions v1 surface (text, image/audio/file input, audio/image output).
+Completions v1 surface (text, image/audio/file input, audio/image output, and
+tool calling).
 
 No external state, no database, no runtime model downloads.
 
@@ -18,7 +19,8 @@ No external state, no database, no runtime model downloads.
 - **Client-agnostic** — any OpenAI Chat Completions client works unmodified.
 - **Correct SSE streaming** — raw byte passthrough, no buffering or re-parsing.
 - **Modality-aware routing** — each request is sent to a backend that supports
-  every modality it requires, independent of complexity.
+  every modality it requires (including tool calling), independent of
+  complexity.
 - **Trivial-prompt fast path** — greetings and acknowledgements skip the model
   entirely and route to the Fast tier in microseconds (see
   [Performance & tuning](#performance--tuning)).
@@ -92,8 +94,10 @@ API keys.
 Each request resolves two axes:
 
 - **Modality set** (hard constraint) — read deterministically from the request
-  JSON (content-part types and the `modalities` field). `image-output` is the
-  only inferred modality, via a hardened lexical-OR-NLI-threshold signal.
+  JSON: content-part types (image/audio/file input), the `modalities` field
+  (audio output), and the `tools`/`functions` fields (tool calling).
+  `image-output` is the only inferred modality, via a hardened
+  lexical-OR-NLI-threshold signal.
 - **Complexity type** (preference) — the argmax of three complexity hypotheses,
   escalated by cheap message-history heuristics. Trivial turns skip the model
   via a fast path (see [Performance & tuning](#performance--tuning)).

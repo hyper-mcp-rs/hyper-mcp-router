@@ -29,13 +29,18 @@ image_generation_threshold = 0.5
 # that injects auth). An omitted field or an empty string "" both mean "no
 # auth" — no Authorization header is sent.
 
+# `modalities` is a set; one model may declare several. `tools` marks a model as
+# tool/function-calling capable — requests that offer `tools` route only to such
+# models (it does not affect the complexity tier). At least one model must
+# declare each modality, or startup validation fails.
+
 # 1. Plaintext key directly in the file.
 [[models]]
 name       = "gpt-4.1-mini"
 base_url   = "https://api.openai.com/v1"
 api_key    = "sk-plaintext-key"
 type       = "fast"
-modalities = ["text"]
+modalities = ["text", "tools"]
 
 # 1b. Keyless backend: omit api_key (or set it to "").
 [[models]]
@@ -51,7 +56,7 @@ name       = "gpt-4.1"
 base_url   = "https://api.openai.com/v1"
 api_key    = "${OPENAI_API_KEY}"
 type       = "balanced"
-modalities = ["text"]
+modalities = ["text", "tools"]
 
 # 3. OS keyring lookup.
 [[models]]
@@ -59,7 +64,7 @@ name       = "o3"
 base_url   = "https://api.openai.com/v1"
 api_key    = { source = "keyring", service = "hyper-mcp-router", user = "openai-frontier" }
 type       = "frontier"
-modalities = ["text"]
+modalities = ["text", "tools"]
 
 # A single multimodal model can cover several modalities at once.
 [[models]]
@@ -67,7 +72,7 @@ name       = "gpt-4o"
 base_url   = "https://api.openai.com/v1"
 api_key    = "${OPENAI_API_KEY}"
 type       = "balanced"
-modalities = ["text", "image-input", "file-input", "image-output"]
+modalities = ["text", "image-input", "file-input", "image-output", "tools"]
 
 # A dedicated voice model: audio in and audio out (plus text).
 [[models]]

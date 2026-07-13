@@ -48,7 +48,7 @@ static CLASSIFIER: LazyLock<Arc<Classifier>> = LazyLock::new(|| {
 });
 
 /// Every backend name declared by [`mock_config_toml`].
-const BACKENDS: [&str; 7] = [
+const BACKENDS: [&str; 8] = [
     "fast-text",
     "balanced-text",
     "frontier-text",
@@ -56,6 +56,7 @@ const BACKENDS: [&str; 7] = [
     "audio",
     "files",
     "image-gen",
+    "agent",
 ];
 
 /// The text-only tier backends, one per complexity type.
@@ -253,7 +254,7 @@ modalities = ["text"]
 name = "frontier-all"
 base_url = "{base}"
 type = "frontier"
-modalities = ["text", "image-input", "audio-input", "file-input", "audio-output", "image-output"]
+modalities = ["text", "image-input", "audio-input", "file-input", "audio-output", "image-output", "tools"]
 "#
     )
 }
@@ -317,6 +318,13 @@ base_url = "{base}"
 api_key = "test-key"
 type = "balanced"
 modalities = ["text", "image-output"]
+
+[[models]]
+name = "agent"
+base_url = "{base}"
+api_key = "test-key"
+type = "balanced"
+modalities = ["text", "tools"]
 "#
     )
 }
@@ -622,6 +630,26 @@ async fn image_generation_routes_to_image_gen_backend() {
         .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     assert_eq!(h.last_call()["model"], "image-gen");
+}
+
+/// A request that offers `tools` must route to a tool-capable backend, whatever
+/// the complexity tier resolves to.
+#[tokio::test]
+async fn tools_request_routes_to_tool_capable_backend() {
+    let h = Harness::start().await;
+    let body = json!({
+        "model": ADVERTISED_MODEL,
+        "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+        "tools": [{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }],
+    });
+
+    let resp = h.chat(&body).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    // Only `agent` declares the `tools` modality in the mock catalogue.
+    assert_eq!(h.last_call()["model"], "agent");
 }
 
 /// A request whose combined modalities no single backend covers must yield 415

@@ -62,6 +62,10 @@ pub enum Modality {
     AudioOutput,
     /// Image generation / creation (inferred; no native protocol field).
     ImageOutput,
+    /// Tool / function calling: the request offers `tools`, so it must route to
+    /// a model that can emit tool calls. A capability constraint only — it never
+    /// affects the complexity tier.
+    Tools,
 }
 
 impl Modality {
@@ -74,6 +78,7 @@ impl Modality {
             Modality::FileInput => "file-input",
             Modality::AudioOutput => "audio-output",
             Modality::ImageOutput => "image-output",
+            Modality::Tools => "tools",
         }
     }
 
@@ -86,17 +91,19 @@ impl Modality {
             Modality::FileInput => 1 << 3,
             Modality::AudioOutput => 1 << 4,
             Modality::ImageOutput => 1 << 5,
+            Modality::Tools => 1 << 6,
         }
     }
 
     /// All modalities, in a stable order for iteration/logging.
-    const ALL: [Modality; 6] = [
+    const ALL: [Modality; 7] = [
         Modality::Text,
         Modality::ImageInput,
         Modality::AudioInput,
         Modality::FileInput,
         Modality::AudioOutput,
         Modality::ImageOutput,
+        Modality::Tools,
     ];
 }
 
@@ -666,8 +673,9 @@ pub fn truncate_prompt(prompt: &str) -> String {
 }
 
 /// Deterministic modalities required by a request, from content-part types
-/// (input) and the `modalities` request field (output). `ImageOutput` is **not**
-/// decided here — it has no protocol field and is inferred by the classifier.
+/// (input), the `modalities` request field (output), and the `tools`/`functions`
+/// fields (tool calling). `ImageOutput` is **not** decided here — it has no
+/// protocol field and is inferred by the classifier.
 ///
 /// This function must not call the classifier: it is metadata-only.
 pub fn detect_required_modalities(body: &serde_json::Value) -> ModalitySet {
@@ -698,6 +706,18 @@ pub fn detect_required_modalities(body: &serde_json::Value) -> ModalitySet {
         if mods.iter().any(|m| m.as_str() == Some("audio")) {
             set.insert(Modality::AudioOutput);
         }
+    }
+
+    // --- Tool calling: a request offering tools must route to a tool-capable
+    // model. Both the current `tools` array and the deprecated `functions`
+    // array count; an empty array does not.
+    let offers = |field: &str| {
+        body.get(field)
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+    };
+    if offers("tools") || offers("functions") {
+        set.insert(Modality::Tools);
     }
 
     set
@@ -1012,6 +1032,39 @@ mod tests {
         let body = json!({"messages": [{"role": "user", "content": "just text"}]});
         let set = detect_required_modalities(&body);
         assert_eq!(set.to_kebab_vec(), vec!["text"]);
+    }
+
+    #[test]
+    fn modality_tools_kebab_name() {
+        assert_eq!(Modality::Tools.as_str(), "tools");
+    }
+
+    #[test]
+    fn modality_tools_detected_from_tools_array() {
+        let body = json!({
+            "messages": [{"role": "user", "content": "what's the weather?"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        });
+        assert!(detect_required_modalities(&body).contains(Modality::Tools));
+    }
+
+    #[test]
+    fn modality_tools_detected_from_legacy_functions_array() {
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "functions": [{"name": "get_weather"}],
+        });
+        assert!(detect_required_modalities(&body).contains(Modality::Tools));
+    }
+
+    #[test]
+    fn modality_tools_absent_or_empty_not_detected() {
+        // No tools field at all.
+        let none = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(!detect_required_modalities(&none).contains(Modality::Tools));
+        // Empty tools array does not require the capability.
+        let empty = json!({"messages": [{"role": "user", "content": "hi"}], "tools": []});
+        assert!(!detect_required_modalities(&empty).contains(Modality::Tools));
     }
 
     // ── extract_prompt ──────────────────────────────────────────────────────
