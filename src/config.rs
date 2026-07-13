@@ -354,41 +354,20 @@ impl RouterConfig {
         self.validate_coverage()
     }
 
-    /// Startup coverage validation (see the spec's "Startup Coverage
-    /// Validation"): every complexity type must have a `text` model, and every
-    /// other servable modality must be declared by at least one model.
+    /// Startup coverage validation. Text is the fallback baseline: a request
+    /// with no special modality is plain text, so the **only** requirement is
+    /// that at least one model (in any tier) is text-capable. Every other
+    /// modality is best-effort — a request that requires an uncovered modality
+    /// is answered with a `415` at request time, not rejected at startup.
     pub fn validate_coverage(&self) -> anyhow::Result<()> {
-        for tier in [ModelTier::Fast, ModelTier::Balanced, ModelTier::Frontier] {
-            let covered = self
-                .models
-                .iter()
-                .any(|m| m.tier == tier && m.modality_set().contains(Modality::Text));
-            if !covered {
-                anyhow::bail!(
-                    "no model of type `{}` declares the `text` modality; complexity routing requires all three types to be text-capable",
-                    tier_name(tier)
-                );
-            }
-        }
-
-        for modality in [
-            Modality::ImageInput,
-            Modality::AudioInput,
-            Modality::FileInput,
-            Modality::AudioOutput,
-            Modality::ImageOutput,
-            Modality::Tools,
-        ] {
-            let covered = self
-                .models
-                .iter()
-                .any(|m| m.modality_set().contains(modality));
-            if !covered {
-                anyhow::bail!(
-                    "no model declares the `{}` modality; single-modality requests for it could never resolve",
-                    modality.as_str()
-                );
-            }
+        let text_covered = self
+            .models
+            .iter()
+            .any(|m| m.modality_set().contains(Modality::Text));
+        if !text_covered {
+            anyhow::bail!(
+                "no model declares the `text` modality; text is the fallback baseline and must be served by at least one model"
+            );
         }
         Ok(())
     }
@@ -426,14 +405,6 @@ fn tier_rank(tier: ModelTier, want: ModelTier) -> i32 {
         10 + (t - w) // escalate: prefer the nearest higher type
     } else {
         100 + (w - t) // fallback: prefer the highest lower type
-    }
-}
-
-fn tier_name(tier: ModelTier) -> &'static str {
-    match tier {
-        ModelTier::Fast => "fast",
-        ModelTier::Balanced => "balanced",
-        ModelTier::Frontier => "frontier",
     }
 }
 
@@ -790,76 +761,33 @@ port = 8080
     }
 
     #[test]
-    fn coverage_fails_missing_text_tier() {
-        let cfg = catalogue(vec![
-            model("fast", ModelTier::Fast, &[Modality::Text]),
-            model("balanced", ModelTier::Balanced, &[Modality::Text]),
-            // no frontier text model
-            model(
-                "img",
-                ModelTier::Balanced,
-                &[
-                    Modality::Text,
-                    Modality::ImageInput,
-                    Modality::AudioInput,
-                    Modality::FileInput,
-                    Modality::AudioOutput,
-                    Modality::ImageOutput,
-                ],
-            ),
-        ]);
-        // Remove frontier: rebuild without it.
-        let cfg = catalogue(
-            cfg.models
-                .into_iter()
-                .filter(|m| m.tier != ModelTier::Frontier)
-                .collect(),
-        );
-        assert!(cfg.validate_coverage().is_err());
+    fn coverage_passes_with_text_in_a_single_tier() {
+        // Text is the only mandatory coverage, and it need exist in just one
+        // tier. Complexity requests fall back to it via `select_model`.
+        let cfg = catalogue(vec![model("only", ModelTier::Balanced, &[Modality::Text])]);
+        assert!(cfg.validate_coverage().is_ok());
     }
 
     #[test]
-    fn coverage_fails_missing_modality() {
-        // Full text tiers but no audio-output model anywhere.
+    fn coverage_allows_uncovered_non_text_modalities() {
+        // No audio/image/file/tools model anywhere: still valid. Such requests
+        // get a 415 at request time (see `select_uncovered_combination_...`).
         let cfg = catalogue(vec![
             model("fast", ModelTier::Fast, &[Modality::Text]),
-            model(
-                "balanced",
-                ModelTier::Balanced,
-                &[
-                    Modality::Text,
-                    Modality::ImageInput,
-                    Modality::AudioInput,
-                    Modality::FileInput,
-                    Modality::ImageOutput,
-                ],
-            ),
             model("frontier", ModelTier::Frontier, &[Modality::Text]),
         ]);
-        assert!(cfg.validate_coverage().is_err());
+        assert!(cfg.validate_coverage().is_ok());
     }
 
     #[test]
-    fn coverage_fails_missing_tools() {
-        // Full modality coverage except tool calling.
+    fn coverage_fails_when_no_text_model() {
+        // Every model is special-modality-only; nothing can serve plain text.
         let cfg = catalogue(vec![
-            model("fast", ModelTier::Fast, &[Modality::Text]),
-            model(
-                "balanced",
-                ModelTier::Balanced,
-                &[
-                    Modality::Text,
-                    Modality::ImageInput,
-                    Modality::AudioInput,
-                    Modality::FileInput,
-                    Modality::AudioOutput,
-                    Modality::ImageOutput,
-                ],
-            ),
-            model("frontier", ModelTier::Frontier, &[Modality::Text]),
+            model("vision", ModelTier::Balanced, &[Modality::ImageInput]),
+            model("voice", ModelTier::Balanced, &[Modality::AudioInput]),
         ]);
         let err = cfg.validate_coverage().unwrap_err();
-        assert!(err.to_string().contains("tools"), "got: {err}");
+        assert!(err.to_string().contains("text"), "got: {err}");
     }
 
     #[test]

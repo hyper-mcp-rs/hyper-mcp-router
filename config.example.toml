@@ -31,8 +31,10 @@ image_generation_threshold = 0.5
 
 # `modalities` is a set; one model may declare several. `tools` marks a model as
 # tool/function-calling capable — requests that offer `tools` route only to such
-# models (it does not affect the complexity tier). At least one model must
-# declare each modality, or startup validation fails.
+# models (it does not affect the complexity tier). Only `text` coverage is
+# mandatory (it is the fallback baseline; at least one model, any tier, must
+# declare it). Every other modality is optional — a request that requires an
+# uncovered modality is answered with a 415 at request time.
 
 # 1. Plaintext key directly in the file.
 [[models]]
