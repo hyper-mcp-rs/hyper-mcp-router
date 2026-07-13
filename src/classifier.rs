@@ -11,12 +11,26 @@ use std::sync::{Condvar, LazyLock, Mutex};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
+use tokenizers::{
+    PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection,
+    TruncationParams, TruncationStrategy,
+};
 
 use crate::{MODEL_BYTES, TOKENIZER_BYTES};
 
 /// Prompt-length guard, in **characters** (never bytes — see [`truncate_prompt`]).
 const PROMPT_CHAR_LIMIT: usize = 400;
+
+/// The classifier model's hard token ceiling (`deberta-v3-xsmall`
+/// `max_position_embeddings`). The tokenizer truncates premise+hypothesis pairs
+/// to this so a long context window can never exceed what the model can encode.
+const MODEL_MAX_TOKENS: usize = 512;
+
+/// Character budget for the complexity-classification window
+/// ([`build_classification_window`]). Deliberately well under [`MODEL_MAX_TOKENS`]
+/// (~4 chars/token) so the packed context plus a hypothesis stays inside the
+/// model even for dense/code text; tokenizer truncation is the hard backstop.
+pub const CLASSIFICATION_CHAR_BUDGET: usize = 1000;
 
 /// Default upper word count for the trivial fast-path (see [`looks_trivial`]).
 /// Overridable via the `--trivial-max-words` CLI flag. Keeps the short-circuit
@@ -365,6 +379,19 @@ impl Classifier {
             pad_type_id: 0,
             pad_token: "[PAD]".to_string(),
         }));
+        // Hard backstop against the model's token ceiling. `LongestFirst` trims
+        // the longer sequence (the premise, never the short hypothesis), and
+        // `Left` drops from the front — i.e. the oldest context is shed first,
+        // preserving the most recent turn. The char budget keeps this from
+        // firing in the common case; this guarantees correctness in the tail.
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MODEL_MAX_TOKENS,
+                strategy: TruncationStrategy::LongestFirst,
+                direction: TruncationDirection::Left,
+                stride: 0,
+            }))
+            .map_err(|e| anyhow::anyhow!("tokenizer truncation: {e}"))?;
 
         let hypotheses = vec![
             (
@@ -397,22 +424,29 @@ impl Classifier {
         })
     }
 
-    /// Model-free fast-path classification using this classifier's configured
-    /// [`trivial_max_words`](Self::trivial_max_words) ceiling. Returns `Some`
-    /// only for turns that can be routed without the NLI pass; see
-    /// [`fast_path_classification`].
-    pub fn fast_path(&self, prompt: &str) -> Option<Classification> {
-        fast_path_classification(prompt, self.trivial_max_words)
+    /// The configured trivial fast-path word ceiling (see [`looks_trivial`]).
+    pub fn trivial_max_words(&self) -> usize {
+        self.trivial_max_words
     }
 
-    /// Categorise the prompt in a single batched forward pass, then combine the
-    /// per-hypothesis scores.
+    /// Categorise in a single batched forward pass, then combine the per-hypothesis
+    /// scores.
+    ///
+    /// `complexity_premise` is the windowed recent user context
+    /// ([`build_classification_window`]); `image_premise` is the *current* turn,
+    /// which alone decides image-generation intent — an old "draw a cat" turn in
+    /// the context window must not trigger image routing for an unrelated request
+    /// now. The two premises ride in one batch (different premise per row).
     ///
     /// CPU-bound: callers should invoke this on a blocking thread (the proxy
     /// does so via `spawn_blocking`) rather than on an async worker.
-    pub fn classify(&self, prompt: &str) -> anyhow::Result<Classification> {
-        let lexical_image_match = looks_like_image_generation(prompt);
-        let scores = self.score_hypotheses(prompt)?;
+    pub fn classify(
+        &self,
+        complexity_premise: &str,
+        image_premise: &str,
+    ) -> anyhow::Result<Classification> {
+        let lexical_image_match = looks_like_image_generation(image_premise);
+        let scores = self.score_hypotheses(complexity_premise, image_premise)?;
         Ok(combine(
             &scores,
             lexical_image_match,
@@ -423,17 +457,29 @@ impl Classifier {
     /// Score every hypothesis against `prompt` in one batched NLI pass,
     /// returning `(kind, P(entailment))` in hypothesis order.
     ///
-    /// Each hypothesis is paired with the prompt (packed into `input_ids`; the
-    /// model consumes no `token_type_ids`). The pairs are tokenised together
-    /// and padded to the longest, forming a `[N, seq]` batch fed through a
-    /// single `run`; row `i` yields the entailment probability for hypothesis
-    /// `i`. `Session::run` requires `&mut self`, so a session is leased from the
-    /// pool for the pass; up to `pool_size` passes run concurrently.
-    fn score_hypotheses(&self, prompt: &str) -> anyhow::Result<Vec<(HypothesisKind, f32)>> {
+    /// Each hypothesis is paired with its premise (the complexity hypotheses use
+    /// `complexity_premise`; the image-generation hypothesis uses `image_premise`)
+    /// and packed into `input_ids` (the model consumes no `token_type_ids`). The
+    /// pairs are tokenised together and padded to the longest, forming a
+    /// `[N, seq]` batch fed through a single `run`; row `i` yields the entailment
+    /// probability for hypothesis `i`. `Session::run` requires `&mut self`, so a
+    /// session is leased from the pool for the pass; up to `pool_size` passes run
+    /// concurrently.
+    fn score_hypotheses(
+        &self,
+        complexity_premise: &str,
+        image_premise: &str,
+    ) -> anyhow::Result<Vec<(HypothesisKind, f32)>> {
         let pairs: Vec<(&str, &str)> = self
             .hypotheses
             .iter()
-            .map(|(_, hypothesis)| (prompt, hypothesis.as_str()))
+            .map(|(kind, hypothesis)| {
+                let premise = match kind {
+                    HypothesisKind::ImageGeneration => image_premise,
+                    HypothesisKind::Complexity(_) => complexity_premise,
+                };
+                (premise, hypothesis.as_str())
+            })
             .collect();
 
         let encodings = self
@@ -605,27 +651,6 @@ pub fn looks_trivial(prompt: &str, max_words: usize) -> bool {
         && ACK_PHRASES.is_match(trimmed)
 }
 
-/// Model-free routing decision for the cheap cases, returning `Some` only when a
-/// classification can be made without the NLI pass:
-/// - image-creation intent (lexical) is left to the full path (returns `None`),
-///   so the NLI image-gen threshold still applies;
-/// - otherwise a [`looks_trivial`] turn resolves to [`ModelTier::Fast`].
-///
-/// Callers that get `None` must run the classifier as usual. `max_words` bounds
-/// the trivial-turn length (see [`looks_trivial`]); pass 0 to disable.
-pub fn fast_path_classification(prompt: &str, max_words: usize) -> Option<Classification> {
-    if looks_like_image_generation(prompt) {
-        return None;
-    }
-    if looks_trivial(prompt, max_words) {
-        return Some(Classification {
-            complexity: ModelTier::Fast,
-            image_generation: false,
-        });
-    }
-    None
-}
-
 /// Numerically stable two-class softmax, returning P(entailment).
 pub fn softmax2(entailment: f32, not_entailment: f32) -> f32 {
     let m = entailment.max(not_entailment);
@@ -634,24 +659,13 @@ pub fn softmax2(entailment: f32, not_entailment: f32) -> f32 {
     e / (e + n)
 }
 
-/// Extract the text to classify from the parsed request JSON: the `content` of
-/// the last `role == "user"` message. Multi-part content concatenates the
-/// `text` fields of its parts, ignoring non-text parts. Returns `None` when no
-/// user message exists (the caller then uses the default classification).
-pub fn extract_prompt(body: &serde_json::Value) -> Option<String> {
-    let messages = body.get("messages")?.as_array()?;
-
-    let last_user = messages
-        .iter()
-        .rev()
-        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))?;
-
-    let content = last_user.get("content")?;
-
+/// The text content of a single message: a string `content` verbatim, or the
+/// concatenated `text` fields of a multi-part `content` (non-text parts ignored).
+fn message_text(msg: &serde_json::Value) -> Option<String> {
+    let content = msg.get("content")?;
     if let Some(text) = content.as_str() {
         return Some(text.to_owned());
     }
-
     if let Some(parts) = content.as_array() {
         let text: String = parts
             .iter()
@@ -660,8 +674,68 @@ pub fn extract_prompt(body: &serde_json::Value) -> Option<String> {
             .join(" ");
         return Some(text);
     }
-
     None
+}
+
+/// The current turn's text: the `content` of the last `role == "user"` message.
+/// Used for the image-generation axis (a per-current-turn intent) and logging.
+/// Returns `None` when no user message exists.
+pub fn extract_prompt(body: &serde_json::Value) -> Option<String> {
+    let messages = body.get("messages")?.as_array()?;
+    let last_user = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))?;
+    message_text(last_user)
+}
+
+/// Build the complexity-classification premise by walking the conversation's
+/// **user** turns newest→oldest, skipping trivially-simple ones ([`looks_trivial`]),
+/// and accumulating substantive turns until the conversation start or
+/// `char_budget` is reached. Surviving turns are returned in chronological order,
+/// newline-joined. Returns `None` when no substantive user text remains (e.g.
+/// pure chit-chat), which the caller routes as the baseline tier without the model.
+///
+/// This is what lets a terse follow-up inherit the difficulty of its recent
+/// context: "ok, continue" is pruned as trivial, and the walk-back reaches the
+/// substantive turns behind it. Only *user* turns are considered — assistant
+/// responses (usually the longest messages) are skipped, so the budget stretches
+/// across many turns of actual intent. Filler is pruned, so the window ages by
+/// *substantive* turns, not by chit-chat.
+pub fn build_classification_window(
+    body: &serde_json::Value,
+    trivial_max_words: usize,
+    char_budget: usize,
+) -> Option<String> {
+    let messages = body.get("messages")?.as_array()?;
+    let mut collected: Vec<String> = Vec::new(); // newest-first
+    let mut used = 0usize;
+
+    for msg in messages.iter().rev() {
+        if used >= char_budget {
+            break;
+        }
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let Some(text) = message_text(msg) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() || looks_trivial(text, trivial_max_words) {
+            continue;
+        }
+        // Truncate by characters (never bytes) to what remains of the budget.
+        let piece: String = text.chars().take(char_budget - used).collect();
+        used += piece.chars().count();
+        collected.push(piece);
+    }
+
+    if collected.is_empty() {
+        return None;
+    }
+    collected.reverse(); // chronological: oldest context first, current turn last
+    Some(collected.join("\n"))
 }
 
 /// Truncate the prompt to [`PROMPT_CHAR_LIMIT`] **characters** (never byte
@@ -871,7 +945,7 @@ mod tests {
         assert_eq!(plan_inference(18).pool_size, 9);
     }
 
-    // ── looks_trivial / fast_path_classification ─────────────────────────────
+    // ── looks_trivial ─────────────────────────────────────────────────────────
     #[test]
     fn trivial_positives_match() {
         for p in [
@@ -929,10 +1003,15 @@ mod tests {
     }
 
     #[test]
-    fn trivial_max_words_zero_disables_fast_path() {
-        // A ceiling of 0 makes nothing trivial, disabling the short-circuit.
+    fn trivial_max_words_zero_disables_pruning() {
+        // A ceiling of 0 makes nothing trivial, so no turn is pruned as filler.
         assert!(!looks_trivial("ok", 0));
-        assert!(fast_path_classification("ok thanks", 0).is_none());
+        let body = json!({"messages": [{"role": "user", "content": "ok"}]});
+        // With pruning disabled, even "ok" survives into the window.
+        assert_eq!(
+            build_classification_window(&body, 0, WIN_BUDGET).as_deref(),
+            Some("ok")
+        );
     }
 
     #[test]
@@ -942,39 +1021,88 @@ mod tests {
         assert!(!looks_trivial("ok sure thanks", 2));
     }
 
-    #[test]
-    fn fast_path_returns_fast_for_trivial() {
-        let c = fast_path_classification("ok thanks", DEFAULT_TRIVIAL_MAX_WORDS)
-            .expect("trivial => Some");
-        assert_eq!(c.complexity, ModelTier::Fast);
-        assert!(!c.image_generation);
-    }
+    // ── build_classification_window ───────────────────────────────────────────
+    const WIN_BUDGET: usize = 1000;
 
     #[test]
-    fn fast_path_defers_image_generation_to_model() {
-        // Short and image-y, but image intent must take the full (NLI) path.
+    fn window_none_when_no_user_messages() {
+        let body = json!({"messages": [{"role": "system", "content": "sys"}]});
         assert!(
-            fast_path_classification("draw a picture of a cat", DEFAULT_TRIVIAL_MAX_WORDS)
-                .is_none()
-        );
-        assert!(
-            fast_path_classification("generate an image of a dog", DEFAULT_TRIVIAL_MAX_WORDS)
-                .is_none()
+            build_classification_window(&body, DEFAULT_TRIVIAL_MAX_WORDS, WIN_BUDGET).is_none()
         );
     }
 
     #[test]
-    fn fast_path_defers_non_trivial_to_model() {
-        assert!(fast_path_classification(
-            "Explain how TLS handshakes work.",
-            DEFAULT_TRIVIAL_MAX_WORDS
-        )
-        .is_none());
-        assert!(fast_path_classification(
-            "Prove that sqrt 2 is irrational.",
-            DEFAULT_TRIVIAL_MAX_WORDS
-        )
-        .is_none());
+    fn window_none_when_all_turns_trivial() {
+        // Pure chit-chat prunes to nothing → caller routes baseline Fast.
+        let body = json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello!"},
+            {"role": "user", "content": "thanks"},
+            {"role": "user", "content": "ok"},
+        ]});
+        assert!(
+            build_classification_window(&body, DEFAULT_TRIVIAL_MAX_WORDS, WIN_BUDGET).is_none()
+        );
+    }
+
+    #[test]
+    fn window_skips_assistant_and_trivial_turns_keeps_substantive() {
+        // A terse follow-up inherits the substantive context behind it.
+        let body = json!({"messages": [
+            {"role": "user", "content": "Prove that sqrt 2 is irrational."},
+            {"role": "assistant", "content": "A very long proof the window must ignore..."},
+            {"role": "user", "content": "ok, continue"},
+        ]});
+        let window = build_classification_window(&body, DEFAULT_TRIVIAL_MAX_WORDS, WIN_BUDGET)
+            .expect("substantive turn present");
+        assert!(window.contains("sqrt 2 is irrational"));
+        assert!(
+            !window.contains("long proof"),
+            "assistant text must be excluded"
+        );
+        assert!(
+            !window.contains("ok, continue"),
+            "trivial turn must be pruned"
+        );
+    }
+
+    #[test]
+    fn window_orders_chronologically_current_turn_last() {
+        let body = json!({"messages": [
+            {"role": "user", "content": "first substantive question about topology"},
+            {"role": "user", "content": "second substantive question about homology"},
+        ]});
+        let window =
+            build_classification_window(&body, DEFAULT_TRIVIAL_MAX_WORDS, WIN_BUDGET).unwrap();
+        let first = window.find("topology").unwrap();
+        let second = window.find("homology").unwrap();
+        assert!(
+            first < second,
+            "older context should precede the current turn"
+        );
+    }
+
+    #[test]
+    fn window_respects_char_budget() {
+        let long_a = "a".repeat(80);
+        let long_b = "b".repeat(80);
+        let body = json!({"messages": [
+            {"role": "user", "content": long_a},
+            {"role": "user", "content": long_b},
+        ]});
+        // Budget (90) fits the most recent turn (80) fully and only a sliver of
+        // the older one; total collected content stays within budget.
+        let window = build_classification_window(&body, DEFAULT_TRIVIAL_MAX_WORDS, 90).unwrap();
+        assert!(
+            window.contains(long_b.as_str()),
+            "most recent turn kept in full"
+        );
+        let a_count = window.chars().filter(|&c| c == 'a').count();
+        assert!(
+            a_count > 0 && a_count < 80,
+            "older turn should be truncated to the remaining budget, got {a_count}"
+        );
     }
 
     // ── detect_required_modalities ──────────────────────────────────────────
@@ -1117,14 +1245,11 @@ mod tests {
     fn routing_directionality_guard() {
         let clf =
             Classifier::new(DEFAULT_IMAGE_GEN_THRESHOLD, DEFAULT_TRIVIAL_MAX_WORDS, 1, 1).unwrap();
-        let simple = clf.classify("hi").unwrap();
-        let complex = clf
-            .classify(
-                "Derive and rigorously prove the asymptotic time complexity of red-black \
-                 tree rebalancing across a sequence of insertions and deletions, with a \
-                 formal amortized analysis.",
-            )
-            .unwrap();
+        let simple = clf.classify("hi", "hi").unwrap();
+        let complex_text = "Derive and rigorously prove the asymptotic time complexity of \
+             red-black tree rebalancing across a sequence of insertions and deletions, \
+             with a formal amortized analysis.";
+        let complex = clf.classify(complex_text, complex_text).unwrap();
         assert!(
             simple.complexity <= complex.complexity,
             "trivial prompt ({:?}) should route no higher than a complex one ({:?})",

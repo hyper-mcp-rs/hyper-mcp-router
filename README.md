@@ -21,9 +21,10 @@ No external state, no database, no runtime model downloads.
 - **Modality-aware routing** — each request is sent to a backend that supports
   every modality it requires (including tool calling), independent of
   complexity.
-- **Trivial-prompt fast path** — greetings and acknowledgements skip the model
-  entirely and route to the Fast tier in microseconds (see
-  [Performance & tuning](#performance--tuning)).
+- **Context-aware complexity** — classified over a window of recent substantive
+  user turns, so a terse follow-up inherits its context's difficulty; pure
+  filler skips the model and routes to Fast (see
+  [Performance & tuning](#performance--tuning)). No brittle history heuristic.
 - **Adaptive inference concurrency** — the classifier auto-sizes a pool of
   inference sessions to the host's core count (container-aware), scaling
   throughput across cores with no configuration.
@@ -56,8 +57,9 @@ hyper-mcp-router serve [--config <path>] [--log-stdout] \
   missing or unparseable file is fatal (no fallback).
 - `--log-stdout` — write structured JSON logs to stdout instead of the
   well-known rolling file location (use this for Cloud Run / containers).
-- `--trivial-max-words <N>` — length ceiling for the trivial-prompt fast path
-  (default `6`; `0` disables it). See [Performance & tuning](#performance--tuning).
+- `--trivial-max-words <N>` — length ceiling for pruning filler turns from the
+  complexity window (default `6`; `0` disables pruning). See
+  [Performance & tuning](#performance--tuning).
 - `--inference-pool-size <N>` — concurrent inference sessions (default: auto,
   from the detected core count).
 - `--intra-op-threads <N>` — ONNX Runtime intra-op threads per session
@@ -99,8 +101,9 @@ Each request resolves two axes:
   `image-output` is the only inferred modality, via a hardened
   lexical-OR-NLI-threshold signal.
 - **Complexity type** (preference) — the argmax of three complexity hypotheses,
-  escalated by cheap message-history heuristics. Trivial turns skip the model
-  via a fast path (see [Performance & tuning](#performance--tuning)).
+  classified over a **window of recent substantive user turns** (see
+  [Performance & tuning](#performance--tuning)), so a terse follow-up inherits
+  the difficulty of its context. There is no message-history heuristic.
 
 The router selects the configured model whose declared modalities are a
 **superset** of the required set, preferring the resolved complexity type
@@ -109,26 +112,40 @@ set it returns `415`.
 
 ## Performance & tuning
 
-Every request that isn't short-circuited runs a single batched forward pass
-through the embedded NLI model, and that pass is the router's main CPU cost. Two
-mechanisms keep it off the hot path and let it scale across cores. **Both are
-automatic** — the knobs below exist only for override.
+Complexity classification runs a single batched forward pass through the
+embedded NLI model, and that pass is the router's main CPU cost. The mechanisms
+below keep it accurate, off the hot path where possible, and scalable across
+cores. **All are automatic** — the knobs exist only for override.
 
-### Trivial-prompt fast path
+### Complexity window (context-aware, no history heuristic)
 
-Terse turns — greetings, acknowledgements, `"ok"`, `"thanks"`, `"please
-continue"` — skip the model entirely via a cheap lexical/length guard and route
-directly to the **Fast** tier. The guard is deliberately conservative: a turn
-must be short **and** free of reasoning cues (`prove`, `derive`, `analyze`, …)
-**and** match an acknowledgement pattern, so a terse `"Prove P != NP."` is not
-mistaken for filler. Image-generation intent always defers to the full path, and
-history-based escalation still applies on top — a terse turn on a deep or
-tool-calling thread is unaffected.
+Complexity is classified over a **window of recent substantive user turns**, not
+just the last message. Walking back from the current turn, the router:
 
-- Skipped turns cost roughly **0.3 ms instead of ~13 ms** and never occupy the
-  inference pool.
-- `--trivial-max-words <N>` (default `6`) sets the length ceiling; `0` disables
-  the fast path.
+- skips **trivially-simple** turns — greetings/acknowledgements like `"ok"`,
+  `"thanks"`, `"please continue"` (a short turn that is also free of reasoning
+  cues like `prove`/`derive`/`analyze` **and** matches an acknowledgement
+  pattern, so a terse `"Prove P != NP."` is never mistaken for filler);
+- skips **assistant/tool** messages entirely (usually the longest text), so the
+  budget stretches across many turns of actual user intent;
+- accumulates substantive user turns until the conversation start or a character
+  budget (kept safely inside the model's 512-token limit).
+
+Consequences:
+
+- A **terse follow-up inherits its context**: `"ok, continue"` after a proof
+  request classifies as hard, because the walk-back reaches the substantive turn
+  behind it. Because filler is pruned, the window ages by *substantive* turns
+  — a hard conversation stays hard until genuinely new (substantive) work pushes
+  it out; the natural reset is a **new conversation**.
+- A conversation of **pure filler** prunes to an empty window and routes to the
+  **Fast** tier **without running the model** (~0.3 ms vs ~13 ms) — the old
+  fast-path, now falling out naturally.
+- Image-generation intent is judged on the **current turn only**, so an old
+  "draw a cat" turn in the window can't misroute a later, unrelated request.
+
+`--trivial-max-words <N>` (default `6`) sets the filler-pruning length ceiling;
+`0` disables pruning.
 
 ### Adaptive inference concurrency (session pool)
 
@@ -171,9 +188,16 @@ cargo test --test api_routing -- --ignored --nocapture load_test_progressive_con
 ```
 
 Environment overrides: `LOAD_REQUESTS` (requests per concurrency level),
-`LOAD_PROMPT` (fixed prompt — a trivial one measures the fast path),
-`LOAD_POOL_SIZE` / `LOAD_INTRA_OP` (build a dedicated classifier to sweep pool
-size).
+`LOAD_PROMPT` (fixed prompt — a trivial one measures the empty-window Fast path),
+`LOAD_TURNS` (build N-user-turn conversations to measure how the windowed
+classifier scales with conversation depth), `LOAD_POOL_SIZE` / `LOAD_INTRA_OP`
+(build a dedicated classifier to sweep pool size).
+
+The windowed classifier's per-request cost grows with conversation depth but is
+**bounded** by the character budget — measured on an 18-core host (pool 8,
+single request): ~15 ms (1 turn) → ~31 ms (4) → ~60 ms (8) → ~81 ms (16), then
+**flat** (32 turns ≈ 16 turns), because the window saturates at the budget
+rather than growing with the transcript.
 
 ## Logging
 

@@ -19,8 +19,9 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::classifier::{
-    detect_required_modalities, extract_prompt, looks_like_image_generation, truncate_prompt,
-    Classification, Classifier, Modality, ModalitySet, ModelTier,
+    build_classification_window, detect_required_modalities, extract_prompt,
+    looks_like_image_generation, truncate_prompt, Classification, Classifier, Modality,
+    ModalitySet, ModelTier, CLASSIFICATION_CHAR_BUDGET,
 };
 use crate::config::RouterConfig;
 
@@ -107,9 +108,9 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
         required.insert(Modality::ImageOutput);
     }
 
-    let complexity = classification
-        .complexity
-        .max(infer_from_history(&body["messages"]));
+    // Complexity comes entirely from the windowed classification (recent
+    // substantive user turns); there is no separate history heuristic.
+    let complexity = classification.complexity;
 
     let prompt_len = extract_prompt(&body)
         .map(|p| p.chars().count())
@@ -201,25 +202,44 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
     }
 }
 
-/// Extract, truncate, and classify the prompt, mapping any failure to the
-/// balanced default. Image *analysis* is detected deterministically elsewhere,
-/// so a classifier failure can only lose image-*creation* intent.
+/// Classify a request's complexity from a **window of recent substantive user
+/// turns** (see [`build_classification_window`]), mapping any model failure to
+/// the balanced default.
+///
+/// - No user message at all → balanced default (unchanged).
+/// - User turns exist but all are trivial (pure chit-chat) → the window is empty,
+///   so route the baseline `Fast` *without* running the model.
+/// - Otherwise classify the window once. The current turn (last user message)
+///   drives the image-generation axis so an old image request in the window
+///   can't misroute the present one.
 async fn classify_or_default(classifier: &Arc<Classifier>, body: &Value) -> Classification {
-    let Some(prompt) = extract_prompt(body) else {
-        return Classification::balanced_default();
+    let window = build_classification_window(
+        body,
+        classifier.trivial_max_words(),
+        CLASSIFICATION_CHAR_BUDGET,
+    );
+    let Some(window) = window else {
+        // Nothing substantive to classify.
+        return if extract_prompt(body).is_some() {
+            // A user message exists but was trivial: pure chit-chat → Fast.
+            Classification {
+                complexity: ModelTier::Fast,
+                image_generation: false,
+            }
+        } else {
+            Classification::balanced_default()
+        };
     };
-    let prompt = truncate_prompt(&prompt);
-    // Cheap lexical/length short-circuit: trivial turns (greetings,
-    // acknowledgements) skip the serialized NLI pass entirely and route as Fast.
-    // The word ceiling is configured via `--trivial-max-words`. History
-    // escalation is still applied by the caller via `max`.
-    if let Some(fast) = classifier.fast_path(&prompt) {
-        return fast;
-    }
+
+    // Image-generation intent is a property of the *current* turn only.
+    let current_turn = extract_prompt(body)
+        .map(|p| truncate_prompt(&p))
+        .unwrap_or_default();
+
     // Inference is CPU-bound (one batched forward pass): run it on the blocking
     // pool so it never stalls an async worker.
     let classifier = Arc::clone(classifier);
-    match tokio::task::spawn_blocking(move || classifier.classify(&prompt)).await {
+    match tokio::task::spawn_blocking(move || classifier.classify(&window, &current_turn)).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             tracing::error!(error = %e, "classification failed; using balanced default");
@@ -229,38 +249,6 @@ async fn classify_or_default(classifier: &Arc<Classifier>, body: &Value) -> Clas
             tracing::error!(error = %e, "classification task panicked; using balanced default");
             Classification::balanced_default()
         }
-    }
-}
-
-/// Complexity escalation from message-history metadata. Returns the first match:
-/// assistant `tool_calls` → Frontier; >8 user turns → Frontier; >3 → Balanced;
-/// otherwise Fast (overridden by the classifier result via `max`).
-///
-/// Metadata only — never calls the classifier or runs the model.
-pub fn infer_from_history(messages: &Value) -> ModelTier {
-    let Some(arr) = messages.as_array() else {
-        return ModelTier::Fast;
-    };
-
-    let has_tool_calls = arr.iter().any(|m| {
-        m.get("role").and_then(Value::as_str) == Some("assistant")
-            && m.get("tool_calls").is_some_and(|tc| !tc.is_null())
-    });
-    if has_tool_calls {
-        return ModelTier::Frontier;
-    }
-
-    let user_turns = arr
-        .iter()
-        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-        .count();
-
-    if user_turns > 8 {
-        ModelTier::Frontier
-    } else if user_turns > 3 {
-        ModelTier::Balanced
-    } else {
-        ModelTier::Fast
     }
 }
 
@@ -367,51 +355,6 @@ mod tests {
         assert_eq!(v["data"].as_array().unwrap().len(), 1);
     }
 
-    // ── infer_from_history ────────────────────────────────────────────────
-    #[test]
-    fn history_tool_calls_frontier() {
-        let msgs = json!([
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "tool_calls": [{"id": "1"}]},
-        ]);
-        assert_eq!(infer_from_history(&msgs), ModelTier::Frontier);
-    }
-
-    #[test]
-    fn history_many_users_frontier() {
-        let mut arr = vec![];
-        for _ in 0..9 {
-            arr.push(json!({"role": "user", "content": "x"}));
-        }
-        assert_eq!(infer_from_history(&Value::Array(arr)), ModelTier::Frontier);
-    }
-
-    #[test]
-    fn history_several_users_balanced() {
-        let mut arr = vec![];
-        for _ in 0..4 {
-            arr.push(json!({"role": "user", "content": "x"}));
-        }
-        // system/assistant should not count
-        arr.push(json!({"role": "assistant", "content": "y"}));
-        assert_eq!(infer_from_history(&Value::Array(arr)), ModelTier::Balanced);
-    }
-
-    #[test]
-    fn history_fallthrough_fast() {
-        let msgs = json!([
-            {"role": "system", "content": "s"},
-            {"role": "user", "content": "u"},
-        ]);
-        assert_eq!(infer_from_history(&msgs), ModelTier::Fast);
-    }
-
-    #[test]
-    fn history_null_tool_calls_not_frontier() {
-        let msgs = json!([{"role": "assistant", "tool_calls": null, "content": "x"}]);
-        assert_eq!(infer_from_history(&msgs), ModelTier::Fast);
-    }
-
     // ── modality resolution (route resolution composition) ─────────────────
     // Mirrors the proxy's Route Resolution without needing an ONNX session.
     fn resolve_required(body: &Value, image_generation: bool) -> ModalitySet {
@@ -451,14 +394,12 @@ mod tests {
     }
 
     #[test]
-    fn resolution_escalation_never_changes_modalities() {
+    fn resolution_complexity_never_changes_modalities() {
         let body = json!({"messages": [
             {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]},
-            {"role": "assistant", "tool_calls": [{"id": "1"}]},
         ]});
         let before = resolve_required(&body, false);
-        // Escalation would push complexity to Frontier, but modalities are untouched.
-        assert_eq!(infer_from_history(&body["messages"]), ModelTier::Frontier);
+        // The complexity tier and the modality set are independent axes.
         let after = resolve_required(&body, false);
         assert_eq!(before, after);
         assert!(before.contains(Modality::ImageInput));

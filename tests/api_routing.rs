@@ -800,21 +800,16 @@ async fn health_endpoint_is_ok() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Conversation depth / history escalation (`infer_from_history`)
+// Contextual complexity (windowed user turns)
 // ───────────────────────────────────────────────────────────────────────────
 //
-// The effective complexity is `max(classifier, infer_from_history)`, so history
-// can only *escalate* the tier, never lower it. `infer_from_history` maps
-// history metadata to a tier: assistant `tool_calls` → Frontier, >8 user turns →
-// Frontier, >3 → Balanced, else Fast. Because Frontier is the ceiling, the
-// `tool_calls` and deep-history cases are deterministic regardless of what the
-// (non-deterministic) classifier returns for the final user turn; the mid-depth
-// and monotonicity assertions hold because the classifier sees the *same* final
-// user turn across every depth variant.
+// Complexity is classified from a window of recent *substantive* user turns
+// (trivial greetings/acks pruned). There is no `infer_from_history` heuristic:
+// a terse turn inherits the difficulty of the substantive context behind it,
+// and a conversation of pure filler routes to Fast without the model.
 
 /// Map a text-tier backend name to its rank (Fast < Balanced < Frontier). Panics
-/// on any non-text-tier backend, which makes an unexpected reroute a loud
-/// failure rather than a silent skip.
+/// on any non-text-tier backend, so an unexpected reroute fails loudly.
 fn text_tier_rank(model: &str) -> u8 {
     match model {
         "fast-text" => 0,
@@ -824,367 +819,88 @@ fn text_tier_rank(model: &str) -> u8 {
     }
 }
 
-/// A conversation with exactly `user_turns` user messages and no `tool_calls`.
-/// Every earlier user turn is filler; the final user turn carries `last_prompt`
-/// (the only message the classifier sees).
-fn with_user_turns(last_prompt: &str, user_turns: usize) -> Value {
-    assert!(user_turns >= 1);
-    let mut messages = Vec::new();
-    for i in 0..(user_turns - 1) {
-        messages.push(json!({"role": "user", "content": format!("Follow-up context {i}.")}));
-        messages.push(json!({"role": "assistant", "content": format!("Understood ({i}).")}));
-    }
-    messages.push(json!({"role": "user", "content": last_prompt}));
-    json!({"model": ADVERTISED_MODEL, "messages": messages})
-}
-
-/// A short conversation containing an assistant `tool_calls` turn, ending with
-/// `last_prompt` as the final user message.
-fn with_tool_calls(last_prompt: &str) -> Value {
-    json!({
-        "model": ADVERTISED_MODEL,
-        "messages": [
-            {"role": "user", "content": "What is the weather in Paris?"},
-            {"role": "assistant", "tool_calls": [{
-                "id": "call_1",
-                "type": "function",
-                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
-            }]},
-            {"role": "tool", "tool_call_id": "call_1", "content": "18C and sunny"},
-            {"role": "user", "content": last_prompt},
-        ],
-    })
-}
-
-/// Terse continuation prompts, all verified not to trip the image-generation
-/// axis, so every one routes to a text-tier backend and `text_tier_rank` applies.
-fn continuation_prompts() -> Vec<&'static str> {
-    vec![
-        "Please continue.",
-        "Can you elaborate on that?",
-        "Tell me more.",
-        "Why is that the case?",
-        "Summarize the discussion so far.",
-        "What are the next steps?",
-        "Give me an example.",
-        "How does that compare to the alternative?",
-        "What are the tradeoffs?",
-        "Explain that in simpler terms.",
-        "What could go wrong?",
-        "Is there a better approach?",
-        "Walk me through the reasoning.",
-        "What assumptions are we making?",
-        "How would you test this?",
-        "What is the time complexity?",
-        "Can you refactor that?",
-        "What are the edge cases?",
-        "How should we handle errors here?",
-        "What would you recommend?",
-    ]
-}
-
-/// An assistant `tool_calls` turn escalates to Frontier regardless of how the
-/// final (terse) user turn classifies.
+/// A conversation of only trivial turns prunes to an empty window and routes to
+/// the Fast tier *without* invoking the model.
 #[tokio::test]
-async fn history_tool_calls_forces_frontier() {
-    let h = Harness::start().await;
-    let resp = h.chat(&with_tool_calls("Thanks, please continue.")).await;
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert_eq!(h.last_call()["model"], "frontier-text");
-}
-
-/// A deep conversation (>8 user turns) escalates to Frontier regardless of how
-/// the final (terse) user turn classifies.
-#[tokio::test]
-async fn history_deep_user_turns_forces_frontier() {
-    let h = Harness::start().await;
-    let resp = h.chat(&with_user_turns("Please continue.", 9)).await;
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert_eq!(h.last_call()["model"], "frontier-text");
-}
-
-/// Mid-depth history (4–8 user turns) guarantees at least the Balanced tier: the
-/// selected tier is never Fast, whatever the classifier decides for the final
-/// turn.
-#[tokio::test]
-async fn history_mid_depth_is_at_least_balanced() {
-    let h = Harness::start().await;
-    for turns in [4usize, 6, 8] {
-        let resp = h.chat(&with_user_turns("Please continue.", turns)).await;
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        let model = h.last_call()["model"].as_str().unwrap().to_string();
-        assert!(
-            text_tier_rank(&model) >= 1,
-            "{turns} user turns must escalate to at least Balanced, got {model:?}"
-        );
-    }
-}
-
-/// Escalation is monotonic in conversation depth: for a fixed final user turn,
-/// deeper history never selects a lower tier, and both the deep-turn and
-/// `tool_calls` variants reach the Frontier ceiling. Exercised across many
-/// prompts at several depths so history is stressed broadly, not just once.
-#[tokio::test]
-async fn history_escalation_is_monotonic_across_depths() {
-    let h = Harness::start().await;
-
-    for prompt in continuation_prompts() {
-        // depth 1 (Fast baseline), depth 4 (Balanced floor), depth 9 (Frontier).
-        let r1 = {
-            h.chat(&with_user_turns(prompt, 1)).await;
-            h.last_call()["model"].as_str().unwrap().to_string()
-        };
-        let r4 = {
-            h.chat(&with_user_turns(prompt, 4)).await;
-            h.last_call()["model"].as_str().unwrap().to_string()
-        };
-        let r9 = {
-            h.chat(&with_user_turns(prompt, 9)).await;
-            h.last_call()["model"].as_str().unwrap().to_string()
-        };
-        let rt = {
-            h.chat(&with_tool_calls(prompt)).await;
-            h.last_call()["model"].as_str().unwrap().to_string()
-        };
-
-        let (t1, t4, t9) = (
-            text_tier_rank(&r1),
-            text_tier_rank(&r4),
-            text_tier_rank(&r9),
-        );
-        // `tool_calls` must also sit at the ceiling.
-        assert_eq!(
-            text_tier_rank(&rt),
-            2,
-            "tool_calls must reach Frontier for {prompt:?}"
-        );
-
-        assert!(
-            t1 <= t4 && t4 <= t9,
-            "tier must not decrease with depth for {prompt:?}: d1={r1}, d4={r4}, d9={r9}"
-        );
-        assert!(
-            t4 >= 1,
-            "4 user turns must be at least Balanced for {prompt:?}, got {r4}"
-        );
-        assert_eq!(
-            r9, "frontier-text",
-            ">8 user turns must reach Frontier for {prompt:?}"
-        );
-        assert_eq!(
-            rt, "frontier-text",
-            "tool_calls must reach Frontier for {prompt:?}"
-        );
-    }
-}
-
-/// History escalation changes the *tier* but must never change the required
-/// modality set: an image-analysis final turn behind a `tool_calls` history
-/// still resolves to the vision backend (the only image-input-capable model),
-/// even though the tier is escalated to Frontier.
-#[tokio::test]
-async fn history_escalation_preserves_modality_routing() {
+async fn pure_chit_chat_routes_to_fast() {
     let h = Harness::start().await;
     let body = json!({
         "model": ADVERTISED_MODEL,
         "messages": [
-            {"role": "user", "content": "What is the weather in Paris?"},
-            {"role": "assistant", "tool_calls": [{
-                "id": "call_1",
-                "type": "function",
-                "function": {"name": "get_weather", "arguments": "{}"},
-            }]},
-            {"role": "tool", "tool_call_id": "call_1", "content": "18C"},
-            {"role": "user", "content": [
-                {"type": "text", "text": "How many people are shown here?"},
-                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
-            ]},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello!"},
+            {"role": "user", "content": "thanks, ok"},
         ],
     });
-
     let resp = h.chat(&body).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    // Frontier escalation cannot invent a frontier vision model; the only
-    // image-input-capable backend is `vision`.
-    assert_eq!(h.last_call()["model"], "vision");
+    assert_eq!(h.last_call()["model"], "fast-text");
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Extended multi-turn chat sessions (real corpus prompts, growing transcript)
-// ───────────────────────────────────────────────────────────────────────────
-//
-// These simulate a real client: each turn appends the new user message to the
-// running transcript, POSTs the *entire* accumulated history, then appends the
-// (mocked) assistant reply before the next turn. This exercises
-// `infer_from_history` the way it actually runs in production — the user-turn
-// count grows with the session — rather than via synthetic one-shot histories.
-//
-// The classifier sees only the latest user turn, so per-turn complexity varies
-// and the session tier is *not* globally monotonic. What is guaranteed is the
-// history *floor*: effective >= infer_from_history(depth). We assert that floor.
-
-/// Sessions drawn from the main corpus, verified to stay on the text path so
-/// `text_tier_rank` applies to every turn. Lengths vary to cross all three
-/// history floors (Fast ≤3, Balanced 4–8, Frontier >8).
-fn corpus_sessions() -> Vec<Vec<&'static str>> {
-    vec![
-        // Short (5 turns): stays within the Fast/Balanced floors.
-        vec![
-            "hi",
-            "What is the capital of France?",
-            "What is 2 + 2?",
-            "List five synonyms for 'happy'.",
-            "What are the pros and cons of remote work?",
-        ],
-        // Mid (9 turns): crosses into the Balanced floor and reaches the
-        // Frontier floor on the last turn.
-        vec![
-            "How are you?",
-            "What is the boiling point of water in Celsius?",
-            "Convert 100 kilometers to miles.",
-            "Write a function to reverse a string in Python.",
-            "What is the time complexity of quicksort in the worst case?",
-            "Explain the difference between let and const in JavaScript.",
-            "How does garbage collection work in the JVM?",
-            "Explain how a bill becomes a law in the United States.",
-            "What causes the seasons to change?",
-        ],
-        // Long (12 turns): spends several turns in the Frontier floor.
-        vec![
-            "Good morning",
-            "Who wrote Hamlet?",
-            "Solve for x: 3x + 5 = 20.",
-            "What is the derivative of x^2?",
-            "Implement binary search in Rust.",
-            "Explain the borrow checker in Rust to a beginner.",
-            "Design a rate limiter for a REST API.",
-            "How would you shard a Postgres database for horizontal scaling?",
-            "Derive and rigorously prove the asymptotic time complexity of red-black \
-             tree rebalancing across a sequence of insertions and deletions, with a \
-             formal amortized analysis.",
-            "Compare and contrast the epistemological foundations of Bayesian and \
-             frequentist statistics.",
-            "Discuss the tradeoffs between CAP theorem guarantees in a globally \
-             distributed database.",
-            "What are the next steps?",
-        ],
-    ]
-}
-
-/// Drive an extended chat session, returning the backend chosen for each turn.
-/// Asserts the per-turn transport invariants: exactly one upstream call per
-/// turn, and the full growing transcript forwarded each time.
-async fn run_session(h: &Harness, prompts: &[&str]) -> Vec<String> {
-    let mut history: Vec<Value> = Vec::new();
-    let mut models = Vec::new();
-    let base = h.call_count();
-
-    for (turn, prompt) in prompts.iter().enumerate() {
-        history.push(json!({"role": "user", "content": prompt}));
-        let resp = h
-            .chat(&json!({"model": ADVERTISED_MODEL, "messages": history}))
-            .await;
-        assert_eq!(
-            resp.status(),
-            reqwest::StatusCode::OK,
-            "turn {} should route successfully: {prompt:?}",
-            turn + 1
-        );
-
-        // One upstream call per turn — no duplicate billable generations.
-        assert_eq!(
-            h.call_count(),
-            base + turn + 1,
-            "turn {} must make exactly one upstream call",
-            turn + 1
-        );
-
-        // The entire accumulated transcript is forwarded, not just the last turn.
-        let forwarded = h.last_call();
-        assert_eq!(
-            forwarded["messages"].as_array().map(Vec::len),
-            Some(history.len()),
-            "turn {} must forward the full transcript",
-            turn + 1
-        );
-
-        models.push(forwarded["model"].as_str().unwrap().to_string());
-
-        // The client appends the assistant's reply before the next turn.
-        history.push(json!({"role": "assistant", "content": "ok"}));
-    }
-
-    models
-}
-
-/// Corpus-driven extended sessions of varying depth must honour the
-/// `infer_from_history` floor on every turn: turns 4–8 route at least Balanced,
-/// turns beyond 8 route to the Frontier ceiling.
+/// A terse follow-up inherits the difficulty of the recent context: the same
+/// "ok, continue" routes to Fast on its own but escalates when it follows a hard
+/// question. This is the behavior the old turn-count/tool heuristic faked.
 #[tokio::test]
-async fn extended_sessions_honour_history_floor_per_turn() {
+async fn terse_followup_inherits_hard_context() {
     let h = Harness::start().await;
-    let sessions = corpus_sessions();
-    assert!(
-        sessions.iter().any(|s| s.len() > 8),
-        "at least one session must exceed 8 turns to exercise the Frontier floor"
+    let hard = "Derive and rigorously prove the asymptotic time complexity of red-black \
+                tree rebalancing across a sequence of insertions and deletions, with a \
+                formal amortized analysis.";
+
+    // Fresh terse turn, no context → empty window → Fast, no model call.
+    h.chat(&json!({
+        "model": ADVERTISED_MODEL,
+        "messages": [{"role": "user", "content": "ok, continue"}],
+    }))
+    .await;
+    let fresh = h.last_call()["model"].as_str().unwrap().to_string();
+
+    // Same terse turn behind a hard question → window reaches the hard turn.
+    h.chat(&json!({
+        "model": ADVERTISED_MODEL,
+        "messages": [
+            {"role": "user", "content": hard},
+            {"role": "assistant", "content": "(a long proof the window ignores)"},
+            {"role": "user", "content": "ok, continue"},
+        ],
+    }))
+    .await;
+    let with_context = h.last_call()["model"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        fresh, "fast-text",
+        "a terse turn with no context routes to Fast"
     );
-
-    for (s, session) in sessions.iter().enumerate() {
-        let models = run_session(&h, session).await;
-        for (turn_idx, model) in models.iter().enumerate() {
-            let user_turns = turn_idx + 1;
-            let rank = text_tier_rank(model);
-            if user_turns > 8 {
-                assert_eq!(
-                    model, "frontier-text",
-                    "session {s} turn {user_turns} (>8 turns) must reach the Frontier floor"
-                );
-            } else if user_turns > 3 {
-                assert!(
-                    rank >= 1,
-                    "session {s} turn {user_turns} (4–8 turns) must be at least Balanced, got {model:?}"
-                );
-            }
-        }
-    }
+    assert!(
+        text_tier_rank(&with_context) > text_tier_rank(&fresh),
+        "a terse follow-up on a hard thread must escalate above Fast, got {with_context:?}"
+    );
 }
 
-/// An agentic session: partway through, the assistant issues a tool call. From
-/// then on the transcript carries a `tool_calls` message, so every subsequent
-/// turn — even a trivial "thanks" — escalates to the Frontier tier.
+/// A growing multi-turn session forwards the full transcript each turn and makes
+/// exactly one upstream call per turn (transport invariants, tier aside).
 #[tokio::test]
-async fn agentic_session_tool_call_pins_frontier_thereafter() {
+async fn multi_turn_session_forwards_full_transcript_one_call_per_turn() {
     let h = Harness::start().await;
     let mut history: Vec<Value> = Vec::new();
-
-    // Turn 1: an ordinary request; the mocked assistant answers a tool call.
-    history.push(json!({"role": "user", "content": "Book me a flight to Tokyo next Friday."}));
-    let resp = h
-        .chat(&json!({"model": ADVERTISED_MODEL, "messages": history}))
-        .await;
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-
-    // The client records the model's tool call and the tool's result.
-    history.push(json!({"role": "assistant", "tool_calls": [{
-        "id": "call_flight",
-        "type": "function",
-        "function": {"name": "search_flights", "arguments": "{\"dest\":\"HND\"}"},
-    }]}));
-    history
-        .push(json!({"role": "tool", "tool_call_id": "call_flight", "content": "3 flights found"}));
-
-    // Subsequent turns — even trivial ones — are pinned to Frontier by the
-    // tool_calls turn now living in the history.
-    for follow_up in ["Thanks!", "Which is cheapest?", "ok"] {
-        history.push(json!({"role": "user", "content": follow_up}));
+    for (turn, prompt) in ["What is a monad?", "ok", "give an example", "thanks"]
+        .iter()
+        .enumerate()
+    {
+        history.push(json!({"role": "user", "content": prompt}));
         let resp = h
             .chat(&json!({"model": ADVERTISED_MODEL, "messages": history}))
             .await;
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         assert_eq!(
-            h.last_call()["model"],
-            "frontier-text",
-            "a tool_calls history must pin {follow_up:?} to Frontier"
+            h.call_count(),
+            turn + 1,
+            "exactly one upstream call per turn"
+        );
+        assert_eq!(
+            h.last_call()["messages"].as_array().map(Vec::len),
+            Some(history.len()),
+            "the full accumulated transcript is forwarded"
         );
         history.push(json!({"role": "assistant", "content": "ok"}));
     }
@@ -1245,11 +961,41 @@ fn summarize(latencies: &[Duration]) -> LatencyStats {
 /// When `fixed_prompt` is `Some`, every request uses it verbatim (set it to a
 /// trivial phrase like "ok" to measure the lexical fast path); otherwise each
 /// request gets a unique non-trivial prompt that exercises the NLI model.
+/// Build a request body with `turns` user turns. The final turn is `content`;
+/// each earlier turn is a distinct *substantive* user message (interleaved with
+/// an assistant reply the classifier's window ignores), so a multi-turn body
+/// exercises the windowed classifier over real accumulated context.
+fn load_request_body(content: &str, turns: usize) -> Value {
+    if turns <= 1 {
+        return json!({
+            "model": ADVERTISED_MODEL,
+            "messages": [{"role": "user", "content": content}],
+        });
+    }
+    let mut messages = Vec::with_capacity(turns * 2);
+    for t in 0..(turns - 1) {
+        messages.push(json!({
+            "role": "user",
+            "content": format!(
+                "Explain in detail, with rigorous reasoning, aspect {t} of the \
+                 distributed system design under discussion."
+            ),
+        }));
+        messages.push(json!({
+            "role": "assistant",
+            "content": "(a long assistant response the classification window ignores)",
+        }));
+    }
+    messages.push(json!({"role": "user", "content": content}));
+    json!({"model": ADVERTISED_MODEL, "messages": messages})
+}
+
 async fn run_load(
     h: &Harness,
     concurrency: usize,
     total: usize,
     fixed_prompt: Arc<Option<String>>,
+    turns: usize,
 ) -> Vec<Duration> {
     let counter = Arc::new(AtomicUsize::new(0));
     let mut workers = Vec::with_capacity(concurrency);
@@ -1270,10 +1016,7 @@ async fn run_load(
                     Some(p) => p.clone(),
                     None => format!("load request {i}"),
                 };
-                let body = json!({
-                    "model": ADVERTISED_MODEL,
-                    "messages": [{"role": "user", "content": content}],
-                });
+                let body = load_request_body(&content, turns);
                 let start = Instant::now();
                 let resp = client.post(&url).json(&body).send().await.expect("send");
                 assert!(
@@ -1306,6 +1049,14 @@ async fn load_test_progressive_concurrency() {
     // `LOAD_PROMPT=ok` (or any trivial phrase) measures the lexical fast path;
     // unset measures the full NLI model path with unique prompts.
     let fixed_prompt = Arc::new(std::env::var("LOAD_PROMPT").ok());
+    // `LOAD_TURNS=N` builds N-user-turn conversations to measure how the
+    // windowed classifier's cost scales with conversation depth (bounded by the
+    // character budget); unset = single-turn.
+    let turns: usize = std::env::var("LOAD_TURNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .max(1);
 
     // `LOAD_POOL_SIZE=N` (optionally `LOAD_INTRA_OP=T`) builds a dedicated
     // classifier with that pool size to sweep inference concurrency; unset uses
@@ -1343,7 +1094,7 @@ async fn load_test_progressive_concurrency() {
     } else {
         "full NLI model path"
     };
-    println!("\nload test — {total} requests per concurrency level ({path})");
+    println!("\nload test — {total} requests per concurrency level ({path}, {turns} turn(s))");
     println!(
         "{:>5}  {:>8}  {:>9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
         "conc", "wall_s", "req/s", "min_ms", "mean_ms", "p50_ms", "p95_ms", "p99_ms", "max_ms"
@@ -1351,7 +1102,7 @@ async fn load_test_progressive_concurrency() {
 
     for &conc in &levels {
         let started = Instant::now();
-        let latencies = run_load(&h, conc, total, Arc::clone(&fixed_prompt)).await;
+        let latencies = run_load(&h, conc, total, Arc::clone(&fixed_prompt), turns).await;
         let wall = started.elapsed().as_secs_f64();
 
         assert_eq!(latencies.len(), total, "every request must complete");
