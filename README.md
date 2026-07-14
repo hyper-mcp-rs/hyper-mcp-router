@@ -203,9 +203,14 @@ startup log reports `detected_cores`, `pool_size`, and `intra_op_threads`.
 | `--intra-op-threads <N>` | auto (`2`) | ONNX Runtime intra-op threads per session (`0` = runtime default). Keep `pool_size × intra_op_threads` near the core count to avoid oversubscription. |
 
 Because each session is a full in-memory copy of the embedded ~87 MB model, a
-larger pool uses proportionally more memory — budget roughly
-`pool_size × 90 MB` (e.g. the auto-plan on an 18-core host builds 9 sessions,
-≈ 800 MB). Cap `--inference-pool-size` on memory-constrained hosts.
+larger pool uses proportionally more memory. Measured
+(`scripts/measure_session_memory.sh`, macOS, debug profile): **~105 MB per
+session at startup** (weights), growing to **~190 MB per session under
+sustained max-length load** — ONNX Runtime's arena allocator retains the
+worst-case activation memory it has seen. Both scale linearly with pool size,
+so budget `pool_size × ~190 MB` (e.g. the auto-plan on an 18-core host builds
+9 sessions ≈ 1.7 GB under load). Cap `--inference-pool-size` on
+memory-constrained hosts.
 
 Measured on an 18-core host — per-request latency ~15 ms, essentially unchanged
 by pool size — throughput scales with the pool until the CPU saturates:
@@ -235,6 +240,12 @@ Environment overrides: `LOAD_REQUESTS` (requests per concurrency level),
 `LOAD_TURNS` (build N-user-turn conversations to measure how the windowed
 classifier scales with conversation depth), `LOAD_POOL_SIZE` / `LOAD_INTRA_OP`
 (build a dedicated classifier to sweep pool size).
+
+Per-session **memory** is measured separately by
+`scripts/measure_session_memory.sh`, which starts the router at two pool
+sizes, records RSS after startup and after a burst of max-length requests,
+and divides the deltas (fixed costs cancel out). Overrides: `PROFILE`
+(`debug`/`release`), `POOLS` (e.g. `"1 4"`), `REQUESTS`, `PORT`.
 
 The windowed classifier's per-request cost grows with conversation depth but is
 **bounded** by the character budget — measured on an 18-core host (pool 8,
