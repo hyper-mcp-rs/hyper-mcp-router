@@ -1,6 +1,6 @@
-//! Configuration: TOML deserialization, the model catalogue, API-key
-//! resolution (plaintext / env / keyring), model selection, and startup
-//! coverage validation.
+//! Configuration: TOML/YAML/JSON deserialization, the model catalogue,
+//! API-key resolution (plaintext / env / keyring), model selection, and
+//! startup coverage validation.
 //!
 //! Requests and responses elsewhere are handled as raw JSON; this module is the
 //! only place typed structs are used, and only for the operator's config file.
@@ -19,8 +19,8 @@ use crate::classifier::{ClassifierModel, ModelTier, DEFAULT_IMAGE_GEN_THRESHOLD}
 use crate::modality::{Modality, ModalitySet};
 use crate::prompt::DEFAULT_TRIVIAL_MAX_WORDS;
 
-mod engine_tables;
-pub use engine_tables::{
+mod engines;
+pub use engines::{
     DebertaV3XsmallZeroshotConfig, GoogleApi, GoogleEmbeddingConfig, RemoteEmbeddingConfig,
     VertexEmbeddingConfig,
 };
@@ -450,31 +450,67 @@ pub fn resolve_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf>
     );
 }
 
+/// Config file names probed in each well-known directory, in priority order.
+const CONFIG_FILE_NAMES: [&str; 4] = ["config.toml", "config.yaml", "config.yml", "config.json"];
+
 /// Platform-appropriate config locations, user-scoped before system-wide.
+/// Within a directory, `config.toml` wins over `config.yaml`/`config.yml`,
+/// which win over `config.json`.
 fn well_known_config_paths() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(dirs) = ProjectDirs::from("", "", APP_NAME) {
-        candidates.push(dirs.config_dir().join("config.toml"));
+        for name in CONFIG_FILE_NAMES {
+            candidates.push(dirs.config_dir().join(name));
+        }
     }
     #[cfg(unix)]
-    candidates.push(PathBuf::from(format!("/etc/{APP_NAME}/config.toml")));
+    for name in CONFIG_FILE_NAMES {
+        candidates.push(PathBuf::from(format!("/etc/{APP_NAME}/{name}")));
+    }
     candidates
 }
 
-/// Load, env-expand, parse, and validate the config at `path`.
+/// Map a config path to its parse format by file extension
+/// (case-insensitive). Anything else is a loud error rather than a silent
+/// guess at the wrong format.
+fn format_for_path(path: &Path) -> anyhow::Result<config::FileFormat> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("toml") => Ok(config::FileFormat::Toml),
+        Some("yaml") | Some("yml") => Ok(config::FileFormat::Yaml),
+        Some("json") => Ok(config::FileFormat::Json),
+        _ => anyhow::bail!(
+            "unsupported config file extension for `{}`: expected `.toml`, `.yaml`, `.yml`, or `.json`",
+            path.display()
+        ),
+    }
+}
+
+/// Load, env-expand, parse, and validate the config at `path`. The format is
+/// chosen by file extension (`.toml`, `.yaml`/`.yml`, or `.json`).
 pub fn load(path: &Path) -> anyhow::Result<RouterConfig> {
+    let format = format_for_path(path)?;
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config `{}`: {e}", path.display()))?;
-    let cfg = parse(&raw)?;
+    let cfg = parse_with_format(&raw, format)?;
     cfg.validate()?;
     Ok(cfg)
 }
 
 /// Env-expand then TOML-parse config text. Split out for unit testing.
 pub fn parse(raw: &str) -> anyhow::Result<RouterConfig> {
+    parse_with_format(raw, config::FileFormat::Toml)
+}
+
+/// Env-expand then parse config text in the given format. Env expansion runs
+/// on the raw text, so `${VAR}` works identically in TOML, YAML, and JSON.
+pub fn parse_with_format(raw: &str, format: config::FileFormat) -> anyhow::Result<RouterConfig> {
     let expanded = expand_env(raw)?;
     let cfg: RouterConfig = config::Config::builder()
-        .add_source(config::File::from_str(&expanded, config::FileFormat::Toml))
+        .add_source(config::File::from_str(&expanded, format))
         .build()?
         .try_deserialize()
         .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
@@ -706,7 +742,101 @@ mod tests {
         );
     }
 
-    // ── engine tables: see `engine_tables::tests` ────────────────────
+    // ── config file formats ───────────────────────────────────────────
+    #[test]
+    fn format_for_path_maps_known_extensions() {
+        use config::FileFormat;
+        let cases = [
+            ("config.toml", FileFormat::Toml),
+            ("config.yaml", FileFormat::Yaml),
+            ("config.yml", FileFormat::Yaml),
+            ("config.json", FileFormat::Json),
+            // Extension matching must be case-insensitive.
+            ("CONFIG.TOML", FileFormat::Toml),
+            ("config.YAML", FileFormat::Yaml),
+        ];
+        for (name, want) in cases {
+            let got = format_for_path(Path::new(name)).expect(name);
+            // `FileFormat` isn't PartialEq; compare debug representations.
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "path {name}");
+        }
+    }
+
+    #[test]
+    fn format_for_path_rejects_unknown_or_missing_extension() {
+        for name in ["config.ini", "config", "config.tml"] {
+            let err = format_for_path(Path::new(name)).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("unsupported config file extension"),
+                "path {name}: got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_config_parses_like_toml() {
+        std::env::set_var("ROUTER_TEST_YAML_KEY", "yaml-key");
+        let cfg = parse_with_format(
+            "server:\n  host: \"0.0.0.0\"\n  port: 1\nmodels:\n  - name: m\n    base_url: \"http://u\"\n    api_key: \"${ROUTER_TEST_YAML_KEY}\"\n    type: fast\n    modalities: [text]\n  - name: adc\n    base_url: \"http://u\"\n    api_key: { source: google-adc }\n    type: frontier\n    modalities: [text]\n",
+            config::FileFormat::Yaml,
+        )
+        .expect("YAML config should parse");
+        cfg.validate().expect("YAML config should validate");
+        assert_eq!(cfg.server.host, "0.0.0.0");
+        assert_eq!(cfg.models.len(), 2);
+        assert_eq!(
+            cfg.models[0].api_key,
+            Some(ModelApiKey::Static("yaml-key".to_string()))
+        );
+        // A map-shaped api_key (YAML mapping instead of a TOML inline table)
+        // must hit the same custom deserializer path.
+        assert_eq!(cfg.models[1].api_key, Some(ModelApiKey::GoogleAdc));
+    }
+
+    #[test]
+    fn json_config_parses_like_toml() {
+        std::env::set_var("ROUTER_TEST_JSON_KEY", "json-key");
+        let cfg = parse_with_format(
+            r#"{
+                "server": { "host": "0.0.0.0", "port": 1 },
+                "models": [
+                    {
+                        "name": "m",
+                        "base_url": "http://u",
+                        "api_key": "${ROUTER_TEST_JSON_KEY}",
+                        "type": "fast",
+                        "modalities": ["text"]
+                    }
+                ]
+            }"#,
+            config::FileFormat::Json,
+        )
+        .expect("JSON config should parse");
+        cfg.validate().expect("JSON config should validate");
+        assert_eq!(cfg.models.len(), 1);
+        assert_eq!(
+            cfg.models[0].api_key,
+            Some(ModelApiKey::Static("json-key".to_string()))
+        );
+    }
+
+    #[test]
+    fn well_known_paths_probe_all_formats_toml_first() {
+        let paths = well_known_config_paths();
+        assert!(!paths.is_empty());
+        // Every candidate is one of the supported file names, and within each
+        // directory TOML is probed before YAML before JSON.
+        let names: Vec<&str> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        for chunk in names.chunks(CONFIG_FILE_NAMES.len()) {
+            assert_eq!(chunk, CONFIG_FILE_NAMES, "candidates {names:?}");
+        }
+    }
+
+    // ── engine settings: see `engines::tests` ───────────────────────
 
     // ── ApiKey resolution ─────────────────────────────────────────────────────────
     fn parse_single_model(toml: &str) -> RouterConfig {
@@ -855,27 +985,44 @@ port = 8080
         assert!(err.to_string().contains("http or https"), "got: {err}");
     }
 
-    // ── shipped example config (drift guard) ──────────────────────────────────
+    // ── shipped example configs (drift guard) ─────────────────────────
+
+    /// Parse + validate a checked-in example. Secret *resolution* (env vars,
+    /// OS keyring) is covered by dedicated tests, so neutralize those two
+    /// constructs (in their format-specific spelling) to a plaintext key here
+    /// rather than depend on external state.
+    fn parse_example(
+        label: &str,
+        raw: &str,
+        keyring_table: &str,
+        format: config::FileFormat,
+    ) -> RouterConfig {
+        let neutralized = raw
+            .replace(keyring_table, "\"sk-example\"")
+            .replace("${OPENAI_API_KEY}", "sk-example");
+        let cfg = parse_with_format(&neutralized, format)
+            .unwrap_or_else(|e| panic!("{label} must parse under the current schema: {e}"));
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("{label} must pass startup validation: {e}"));
+        cfg
+    }
+
+    fn toml_example() -> RouterConfig {
+        parse_example(
+            "config.example.toml",
+            include_str!("../../config.example.toml"),
+            "{ source = \"keyring\", service = \"hyper-mcp-router\", user = \"openai-frontier\" }",
+            config::FileFormat::Toml,
+        )
+    }
+
     #[test]
     fn example_config_matches_current_schema() {
-        // The checked-in example is documentation only (nothing parses it at
-        // build or run time), so it can silently drift out of sync with the
-        // schema. This guards that it still parses and passes startup
-        // validation. Secret *resolution* (env vars, OS keyring) is covered by
-        // dedicated tests, so neutralize those two constructs to a plaintext key
-        // here rather than depend on external state.
-        let raw = include_str!("../../config.example.toml");
-        let neutralized = raw
-            .replace(
-                "{ source = \"keyring\", service = \"hyper-mcp-router\", user = \"openai-frontier\" }",
-                "\"sk-example\"",
-            )
-            .replace("${OPENAI_API_KEY}", "sk-example");
-
-        let cfg =
-            parse(&neutralized).expect("config.example.toml must parse under the current schema");
-        cfg.validate()
-            .expect("config.example.toml must pass startup validation");
+        // The checked-in examples are documentation only (nothing parses them
+        // at build or run time), so they can silently drift out of sync with
+        // the schema. This guards that the canonical TOML example still parses
+        // and passes startup validation.
+        let cfg = toml_example();
 
         // Sanity: the example still demonstrates its documented features.
         assert!(
@@ -888,6 +1035,31 @@ port = 8080
                 .any(|m| m.modality_set().contains(Modality::AudioOutput)),
             "example should cover audio-output"
         );
+    }
+
+    #[test]
+    fn yaml_example_config_is_equivalent_to_toml() {
+        let cfg = parse_example(
+            "config.example.yaml",
+            include_str!("../../config.example.yaml"),
+            "{ source: \"keyring\", service: \"hyper-mcp-router\", user: \"openai-frontier\" }",
+            config::FileFormat::Yaml,
+        );
+        // The YAML example is documented as an exact translation of the TOML
+        // one; comparing the fully-parsed configs guards against drift in
+        // either direction.
+        assert_eq!(format!("{cfg:?}"), format!("{:?}", toml_example()));
+    }
+
+    #[test]
+    fn json_example_config_is_equivalent_to_toml() {
+        let cfg = parse_example(
+            "config.example.json",
+            include_str!("../../config.example.json"),
+            "{ \"source\": \"keyring\", \"service\": \"hyper-mcp-router\", \"user\": \"openai-frontier\" }",
+            config::FileFormat::Json,
+        );
+        assert_eq!(format!("{cfg:?}"), format!("{:?}", toml_example()));
     }
 
     // ── select_model ──────────────────────────────────────────────────────────

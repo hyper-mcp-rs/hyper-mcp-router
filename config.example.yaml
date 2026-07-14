@@ -1,0 +1,183 @@
+# Example / default configuration for hyper-mcp-router (YAML flavour).
+#
+# This file is an example template — it is NOT embedded in the binary and is NOT
+# read from the repository. Copy it to a well-known location *as* `config.yaml`
+# (e.g. ~/Library/Application Support/hyper-mcp-router/config.yaml on macOS, or
+# $XDG_CONFIG_HOME/hyper-mcp-router/config.yaml on Linux) or pass it explicitly
+# with `--config <path>` (any `.toml`/`.yaml`/`.yml`/`.json` filename works
+# with `--config`; the extension selects the parser).
+#
+# This is the YAML equivalent of `config.example.toml` — same schema, same
+# semantics. Every backend must be OpenAI Chat Completions v1 compatible and
+# expose `POST {base_url}/chat/completions`. `base_url` must be a valid
+# http/https URL (validated at startup; a malformed or non-HTTP URL is a fatal
+# config error).
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  # GET /v1/models always advertises the single virtual model
+  # "hyper-mcp-router"; the configured backends are never listed there.
+  # (Upstream response bodies pass through verbatim, so a completion's `model`
+  # field does name the backend that produced it.)
+  # Upstream timeouts (seconds). No retries are ever performed.
+  connect_timeout_secs: 10
+  # Total deadline for NON-streaming requests only. Streaming responses have no
+  # total deadline (an SSE stream may legitimately run long)…
+  request_timeout_secs: 600
+  # …they are bounded by this idle guard instead: abort when no bytes arrive
+  # for this long (0 disables).
+  stream_idle_timeout_secs: 300
+  # Maximum accepted request body size in bytes (default 32 MiB).
+  # Base64-encoded image/audio/file payloads are large; raise this if yours
+  # are larger.
+  max_body_bytes: 33554432
+
+# Optional classifier tuning. All fields have sensible defaults. Classifier
+# behaviour is config-only — there are no CLI overrides, because each model
+# brings its own configuration (a `classifier.<model>` table); different
+# classifier models mean different config files.
+classifier:
+  # Which classification model to run (exactly one per process). Available:
+  #   "deberta-v3-xsmall-zeroshot"  embedded NLI model; fully local (default)
+  #   "gemini-embedding-001"        remote Gemini embeddings; requires api_key
+  #   "gemini-embedding-2"          as above, much larger context window
+  #   "text-embedding-005"          remote Vertex AI embeddings; needs project + token
+  # NOTE: the remote engines send prompt text (the classification window and
+  # current turn) to their provider's API (Google); only
+  # "deberta-v3-xsmall-zeroshot" keeps everything local.
+  model: "deberta-v3-xsmall-zeroshot"
+  # Image-generation modality decision (score floor; scale is engine-specific —
+  # P(entailment) for the embedded NLI engine; default 0.5).
+  image_generation_threshold: 0.5
+  # Word ceiling for the trivial fast-path (0 disables; default 6).
+  trivial_max_words: 6
+
+  # Settings specific to the embedded NLI engine (local ORT inference
+  # sessions). Ignored unless model = "deberta-v3-xsmall-zeroshot". Omit either
+  # field for auto-sizing from the detected core count and memory budget;
+  # explicit values the host can't handle are honored but log a startup
+  # warning.
+  deberta-v3-xsmall-zeroshot: {}
+  #  inference_pool_size: 4
+  #  intra_op_threads: 2
+
+  # Settings for the remote embedding engines. Ignored unless selected above.
+  # The gemini-embedding models are published on TWO Google API surfaces, and
+  # the auth fields choose which engine runs — set EXACTLY ONE of:
+  #   api_key  -> Generative Language API (generativelanguage.googleapis.com);
+  #               resolves like a routed model's key (plaintext, env-var
+  #               expansion, or a keyring table)
+  #   project  -> Vertex AI; auth via ADC by default, or a static access_token
+  #               override; location is then REQUIRED (a region, or "global"),
+  #               quota_project optional — as for text-embedding-005 below
+  # Setting both (or neither) fails fast at startup.
+  # (The ":-" empty default below keeps config loading working when the env
+  # var is unset — env expansion runs over the whole file, comments included;
+  # a selected engine with an empty key still fails fast with a clear error.)
+  #gemini-embedding-001:
+  #  api_key: "${GEMINI_API_KEY:-}"   # Generative Language API…
+  #  #project: "my-gcp-project"       # …OR Vertex AI (never both)
+  #  #location: "us-central1"         # REQUIRED with project (a region/"global")
+  #  base_url: "https://generativelanguage.googleapis.com"  # optional override
+  #  max_concurrency: 32          # concurrent embed calls (the "session pool")
+  #  request_timeout_secs: 10     # per embed call
+
+  #gemini-embedding-2:
+  #  api_key: "${GEMINI_API_KEY:-}"
+
+  # text-embedding-005 is published only on Vertex AI (a different API), so it
+  # takes a GCP project and a location instead of an api_key. location is
+  # REQUIRED with no default — it determines model availability (some of the
+  # newest models are served only at multi-region "us"/"eu" or "global"), data
+  # residency, and the endpoint host: a hyphenated region like "us-central1"
+  # maps to https://us-central1-aiplatform.googleapis.com, while multi-region
+  # ("us", "eu") and "global" map to https://aiplatform.googleapis.com. Auth
+  # defaults to Application Default Credentials — a service-account key file
+  # (GOOGLE_APPLICATION_CREDENTIALS), `gcloud auth application-default login`,
+  # or the GCE/Cloud Run metadata server — with token refresh handled
+  # automatically. Set access_token only to pin a STATIC token instead (e.g.
+  # `gcloud auth print-access-token` for a quick test; expires ~1h, never
+  # refreshed).
+  # quota_project (optional) attributes API-call quota/billing to a chosen
+  # project (sent as the x-goog-user-project header). Mostly relevant with
+  # user-credential ADC or cross-project billing; the principal needs
+  # serviceusage.services.use on that project.
+  #text-embedding-005:
+  #  project: "my-gcp-project"
+  #  location: "us-central1"                   # REQUIRED: a region, or "global"
+  #  quota_project: "my-billing-project"       # optional quota/billing project
+  #  access_token: "${GOOGLE_ACCESS_TOKEN:-}"  # optional static override of ADC
+  #  base_url: "https://us-central1-aiplatform.googleapis.com"  # optional override
+  #  max_concurrency: 32
+  #  request_timeout_secs: 10
+
+# `api_key` resolves four ways (below), or may be omitted entirely for a
+# keyless backend (e.g. a local Ollama / vLLM / LM Studio server, or a gateway
+# that injects auth). An omitted field or an empty string "" both mean "no
+# auth" — no Authorization header is sent.
+
+# `modalities` is a set; one model may declare several. `tools` marks a model
+# as tool/function-calling capable — requests that offer `tools` route only to
+# such models (it does not affect the complexity tier). Only `text` coverage
+# is mandatory (it is the fallback baseline; at least one model, any tier,
+# must declare it). Every other modality is optional — a request that requires
+# an uncovered modality is answered with a 422 at request time. (Exception:
+# *inferred* image-generation intent is soft — if no model declares
+# "image-output", such requests degrade to a text route instead of failing.)
+models:
+  # 1. Plaintext key directly in the file.
+  - name: "gpt-4.1-mini"
+    base_url: "https://api.openai.com/v1"
+    api_key: "sk-plaintext-key"
+    type: "fast"
+    modalities: ["text", "tools"]
+
+  # 1b. Keyless backend: omit api_key (or set it to "").
+  - name: "llama3"
+    base_url: "http://localhost:11434/v1"
+    type: "fast"
+    modalities: ["text"]
+
+  # 2. Environment variable, expanded during config parsing. Use
+  #    ${VAR:-default} for a fallback, or $${VAR} for a literal.
+  - name: "gpt-4.1"
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    type: "balanced"
+    modalities: ["text", "tools"]
+
+  # 3. OS keyring lookup.
+  - name: "o3"
+    base_url: "https://api.openai.com/v1"
+    api_key: { source: "keyring", service: "hyper-mcp-router", user: "openai-frontier" }
+    type: "frontier"
+    modalities: ["text", "tools"]
+
+  # 4. Google Application Default Credentials, for backends hosted on Vertex
+  #    AI (its OpenAI-compatible endpoint takes OAuth Bearer tokens, not API
+  #    keys). The token is resolved PER REQUEST and auto-refreshed — never a
+  #    baked-in ~1h gcloud token. Credentials come from the standard ADC chain
+  #    at startup: GOOGLE_APPLICATION_CREDENTIALS, `gcloud auth
+  #    application-default login`, or the GCE/Cloud Run metadata server
+  #    (startup fails fast if none is available). Commented out so the example
+  #    works without a GCP setup:
+  #- name: "google/gemini-2.5-pro"
+  #  base_url: "https://us-central1-aiplatform.googleapis.com/v1/projects/MY_PROJECT/locations/us-central1/endpoints/openapi"
+  #  api_key: { source: "google-adc" }
+  #  type: "frontier"
+  #  modalities: ["text", "tools"]
+
+  # A single multimodal model can cover several modalities at once.
+  - name: "gpt-4o"
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    type: "balanced"
+    modalities: ["text", "image-input", "file-input", "image-output", "tools"]
+
+  # A dedicated voice model: audio in and audio out (plus text).
+  - name: "gpt-audio"
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    type: "balanced"
+    modalities: ["text", "audio-input", "audio-output"]

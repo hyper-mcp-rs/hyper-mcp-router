@@ -1,0 +1,58 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "connect_timeout_secs": 10,
+    "request_timeout_secs": 600,
+    "stream_idle_timeout_secs": 300,
+    "max_body_bytes": 33554432
+  },
+  "classifier": {
+    "model": "deberta-v3-xsmall-zeroshot",
+    "image_generation_threshold": 0.5,
+    "trivial_max_words": 6
+  },
+  "models": [
+    {
+      "name": "gpt-4.1-mini",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "sk-plaintext-key",
+      "type": "fast",
+      "modalities": ["text", "tools"]
+    },
+    {
+      "name": "llama3",
+      "base_url": "http://localhost:11434/v1",
+      "type": "fast",
+      "modalities": ["text"]
+    },
+    {
+      "name": "gpt-4.1",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${OPENAI_API_KEY}",
+      "type": "balanced",
+      "modalities": ["text", "tools"]
+    },
+    {
+      "name": "o3",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": { "source": "keyring", "service": "hyper-mcp-router", "user": "openai-frontier" },
+      "type": "frontier",
+      "modalities": ["text", "tools"]
+    },
+    {
+      "name": "gpt-4o",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${OPENAI_API_KEY}",
+      "type": "balanced",
+      "modalities": ["text", "image-input", "file-input", "image-output", "tools"]
+    },
+    {
+      "name": "gpt-audio",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${OPENAI_API_KEY}",
+      "type": "balanced",
+      "modalities": ["text", "audio-input", "audio-output"]
+    }
+  ]
+}

@@ -1,8 +1,8 @@
-//! The `[classifier.<model>]` engine tables: per-engine settings structs for
-//! every classifier engine. Split out of the config root module — this file
-//! owns the *shapes* of the engine tables (including the auth-driven Google
-//! API surface choice); parsing, env expansion, key resolution, and the model
-//! catalogue stay in `config`.
+//! The `classifier.<model>` engine settings (`[classifier.<model>]` in TOML):
+//! per-engine settings structs for every classifier engine. Split out of the
+//! config root module — this file owns the *shapes* of those settings
+//! (including the auth-driven Google API surface choice); parsing, env
+//! expansion, key resolution, and the model catalogue stay in `config`.
 
 use serde::Deserialize;
 use url::Url;
@@ -226,7 +226,7 @@ mod tests {
     use crate::config::parse;
 
     #[test]
-    fn gemini_engine_tables_parse_with_api_key_resolution() {
+    fn gemini_engine_settings_parse_with_api_key_resolution() {
         std::env::set_var("ROUTER_TEST_GEMINI_KEY", "g-key");
         let cfg = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n\
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_tables_reject_google_adc() {
+    fn engine_settings_reject_google_adc() {
         // The engines operate differently (Gemini takes real API keys; the
         // vertex engine already defaults to ADC), so the marker is
         // routed-model-only.

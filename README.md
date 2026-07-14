@@ -62,7 +62,9 @@ hyper-mcp-router serve [--config <path>] [--log-stdout]
 ```
 
 - `--config <path>` — explicit config file. If given it is used verbatim; a
-  missing or unparseable file is fatal (no fallback).
+  missing or unparseable file is fatal (no fallback). The format is chosen by
+  file extension: `.toml`, `.yaml`/`.yml`, or `.json` (anything else is an
+  error).
 - `--log-stdout` — write structured JSON logs to stdout instead of the
   well-known rolling file location (use this for Cloud Run / containers).
 
@@ -78,16 +80,21 @@ requests and lets in-flight ones (including open SSE streams) finish.
 
 ### Config discovery
 
-Without `--config`, the first existing file is used:
+Without `--config`, the first existing file is used. In each directory the
+file names `config.toml`, `config.yaml`, `config.yml`, and `config.json` are
+probed in that order:
 
 | OS | Search order (first match wins) |
 |---|---|
-| Linux | `$XDG_CONFIG_HOME/hyper-mcp-router/config.toml` (or `~/.config/...`), then `/etc/hyper-mcp-router/config.toml` |
-| macOS | `~/Library/Application Support/hyper-mcp-router/config.toml`, then `/etc/hyper-mcp-router/config.toml` |
-| Windows | `%APPDATA%\hyper-mcp-router\config.toml` |
+| Linux | `$XDG_CONFIG_HOME/hyper-mcp-router/config.{toml,yaml,yml,json}` (or `~/.config/...`), then `/etc/hyper-mcp-router/config.{toml,yaml,yml,json}` |
+| macOS | `~/Library/Application Support/hyper-mcp-router/config.{toml,yaml,yml,json}`, then `/etc/hyper-mcp-router/config.{toml,yaml,yml,json}` |
+| Windows | `%APPDATA%\hyper-mcp-router\config.{toml,yaml,yml,json}` |
 
 A missing config is a fatal error. See
-[`config.example.toml`](./config.example.toml) for a fully-annotated example,
+[`config.example.toml`](./config.example.toml) for a fully-annotated example
+([`config.example.yaml`](./config.example.yaml) and
+[`config.example.json`](./config.example.json) are exact equivalents — JSON
+has no comments, so the TOML file is the canonical reference),
 including plaintext / environment-variable / OS-keyring API keys and
 `{ source = "google-adc" }` for Vertex-AI-hosted backends (per-request Google
 OAuth tokens via Application Default Credentials, auto-refreshed).
