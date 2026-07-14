@@ -16,6 +16,7 @@ pub mod classifier;
 pub mod cli;
 pub mod config;
 pub mod engines;
+pub mod gcp_auth;
 pub mod logging;
 pub mod modality;
 pub mod planning;

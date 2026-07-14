@@ -50,7 +50,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use google_cloud_auth::credentials::{AccessTokenCredentials, Builder as AdcBuilder};
 use reqwest::header::HeaderValue;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
@@ -58,13 +57,11 @@ use tokio::sync::Semaphore;
 use crate::classifier::{Classification, ClassifierEngine};
 use crate::config::VertexEmbeddingConfig;
 use crate::engines::embedding::{anchor_texts, build_prototypes, combine_similarities, Prototypes};
+use crate::gcp_auth::{self, AccessTokenCredentials};
 
 /// Task type sent with every embed request; anchors and premises must use the
 /// same one for their similarities to be comparable.
 const TASK_TYPE: &str = "SEMANTIC_SIMILARITY";
-
-/// OAuth scope requested for ADC tokens; the standard scope for Vertex AI.
-const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
 /// Header carrying the [quota project](https://cloud.google.com/docs/quotas/quota-project):
 /// which project's API quota is consumed and billed for the call.
@@ -84,21 +81,18 @@ enum TokenSource {
 
 impl TokenSource {
     /// Build the ADC-backed source (used when no static `access_token` is
-    /// configured). Credential *discovery* problems surface here; a broken or
-    /// expired credential surfaces on the first token fetch — either way,
-    /// startup anchor embedding fails fast with an actionable error.
+    /// configured), via the shared [`crate::gcp_auth`] support. Credential
+    /// *discovery* problems surface here; a broken or expired credential
+    /// surfaces on the first token fetch — either way, startup anchor
+    /// embedding fails fast with an actionable error.
     fn adc(engine: &str) -> anyhow::Result<Self> {
-        let credentials = AdcBuilder::default()
-            .with_scopes([CLOUD_PLATFORM_SCOPE])
-            .build_access_token_credentials()
-            .with_context(|| {
-                format!(
-                    "classifier engine `{engine}`: no static `access_token` is set in \
-                     [classifier.{engine}], and Application Default Credentials could not \
-                     be loaded (set GOOGLE_APPLICATION_CREDENTIALS, run `gcloud auth \
-                     application-default login`, or configure `access_token`)"
-                )
-            })?;
+        let credentials = gcp_auth::adc_credentials().with_context(|| {
+            format!(
+                "classifier engine `{engine}`: no static `access_token` is set in \
+                 [classifier.{engine}], so Application Default Credentials are required \
+                 (or configure `access_token`)"
+            )
+        })?;
         Ok(TokenSource::Adc(credentials))
     }
 
@@ -107,11 +101,7 @@ impl TokenSource {
     async fn bearer(&self) -> anyhow::Result<String> {
         match self {
             TokenSource::Static(token) => Ok(token.clone()),
-            TokenSource::Adc(credentials) => Ok(credentials
-                .access_token()
-                .await
-                .context("fetching an ADC access token for Vertex AI")?
-                .token),
+            TokenSource::Adc(credentials) => gcp_auth::bearer(credentials).await,
         }
     }
 

@@ -88,8 +88,9 @@ Without `--config`, the first existing file is used:
 
 A missing config is a fatal error. See
 [`config.example.toml`](./config.example.toml) for a fully-annotated example,
-including plaintext / environment-variable / OS-keyring
-API keys.
+including plaintext / environment-variable / OS-keyring API keys and
+`{ source = "google-adc" }` for Vertex-AI-hosted backends (per-request Google
+OAuth tokens via Application Default Credentials, auto-refreshed).
 
 ## Endpoints
 

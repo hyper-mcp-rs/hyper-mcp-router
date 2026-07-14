@@ -276,12 +276,14 @@ pub struct ModelConfig {
     /// per-request failure. `{base_url}/chat/completions` is the forward target.
     #[serde(deserialize_with = "deserialize_http_url")]
     pub base_url: Url,
-    /// Resolved secret (from plaintext / env / keyring), or `None` for a keyless
-    /// backend. An omitted field, an empty string, or a keyring value that
-    /// resolves empty all mean "no auth": no `Authorization` header is sent.
-    /// Never logged.
-    #[serde(default, deserialize_with = "resolve_api_key")]
-    pub api_key: Option<String>,
+    /// Authentication material, or `None` for a keyless backend. A static
+    /// secret (plaintext / env / keyring) is resolved at load; `{ source =
+    /// "google-adc" }` marks the model for per-request Google OAuth tokens
+    /// (see [`ModelApiKey`]). An omitted field, an empty string, or a keyring
+    /// value that resolves empty all mean "no auth": no `Authorization`
+    /// header is sent. Never logged.
+    #[serde(default, deserialize_with = "resolve_model_api_key")]
+    pub api_key: Option<ModelApiKey>,
     /// Deserialised from `type` (a Rust reserved word).
     #[serde(rename = "type")]
     pub tier: ModelTier,
@@ -330,43 +332,63 @@ fn parse_http_url(raw: &str) -> Result<Url, String> {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────
 // API key resolution
-// ───────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────
 
-/// Custom deserializer for a model's `api_key`. A TOML string yields the
-/// plaintext/env-expanded key verbatim; an inline table
-/// `{ source = "keyring", service = "...", user = "..." }` triggers an OS
-/// keyring lookup at load time. Only the resolved secret is retained. An empty
-/// resolved value becomes `None` (keyless backend), so `""` is treated the same
-/// as omitting the field.
-fn resolve_api_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+/// A routed model's authentication material, as it stands after config load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelApiKey {
+    /// A static secret — plaintext, `${ENV_VAR}`-expanded, or looked up from
+    /// the OS keyring — fully resolved at config load and sent verbatim as
+    /// `Authorization: Bearer`.
+    Static(String),
+    /// `api_key = { source = "google-adc" }`: authenticate with a Google
+    /// OAuth 2.0 access token resolved **per request** via Application
+    /// Default Credentials (for backends hosted on Vertex AI). Deliberately a
+    /// *marker*: at startup it is resolved into a credential-owning runtime
+    /// handle (see `proxy::ModelAuth`), not at config load — parsing stays
+    /// hermetic and tokens are cached/refreshed by `google-cloud-auth`,
+    /// never baked in.
+    GoogleAdc,
+}
+
+/// Custom deserializer for a routed model's `api_key`. A TOML string yields
+/// the plaintext/env-expanded key verbatim; `{ source = "keyring", service,
+/// user }` triggers an OS keyring lookup at load time (only the resolved
+/// secret is retained); `{ source = "google-adc" }` records the per-request
+/// Google-token marker. An empty resolved value becomes `None` (keyless
+/// backend), so `""` is treated the same as omitting the field.
+fn resolve_model_api_key<'de, D>(deserializer: D) -> Result<Option<ModelApiKey>, D::Error>
 where
     D: Deserializer<'de>,
 {
     /// Empty string => no auth.
-    fn non_empty(s: String) -> Option<String> {
-        (!s.is_empty()).then_some(s)
+    fn non_empty(s: String) -> Option<ModelApiKey> {
+        (!s.is_empty()).then_some(ModelApiKey::Static(s))
     }
 
     struct ApiKeyVisitor;
 
     impl<'de> Visitor<'de> for ApiKeyVisitor {
-        type Value = Option<String>;
+        type Value = Option<ModelApiKey>;
 
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a plaintext API key string or a keyring lookup table")
+            f.write_str(
+                "a plaintext API key string, a keyring lookup table, or \
+                 { source = \"google-adc\" }",
+            )
         }
 
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Option<String>, E> {
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Option<ModelApiKey>, E> {
             Ok(non_empty(v.to_owned()))
         }
 
-        fn visit_string<E: de::Error>(self, v: String) -> Result<Option<String>, E> {
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Option<ModelApiKey>, E> {
             Ok(non_empty(v))
         }
 
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Option<String>, A::Error> {
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Option<ModelApiKey>, A::Error> {
             let mut source: Option<String> = None;
             let mut service: Option<String> = None;
             let mut user: Option<String> = None;
@@ -384,30 +406,67 @@ where
                 }
             }
 
-            let source = source.ok_or_else(|| de::Error::missing_field("source"))?;
-            if source != "keyring" {
-                return Err(de::Error::custom(format!(
-                    "unsupported api_key source `{source}`; expected `keyring`"
-                )));
-            }
-            let service = service.ok_or_else(|| de::Error::missing_field("service"))?;
-            let user = user.ok_or_else(|| de::Error::missing_field("user"))?;
-
-            let entry = keyring::Entry::new(&service, &user).map_err(|e| {
-                de::Error::custom(format!(
-                    "keyring entry (service={service}, user={user}) unavailable: {e}"
-                ))
-            })?;
-            let password = entry.get_password().map_err(|e| {
-                de::Error::custom(format!(
-                    "keyring lookup failed (service={service}, user={user}): {e}"
-                ))
-            })?;
-            Ok(non_empty(password))
+            api_key_from_table(source, service, user).map_err(de::Error::custom)
         }
     }
 
     deserializer.deserialize_any(ApiKeyVisitor)
+}
+
+/// Dispatch a parsed `api_key` table (`source` + optional fields) to its
+/// resolution: keyring lookup, or the `google-adc` marker. String errors are
+/// wrapped by the caller into serde errors.
+fn api_key_from_table(
+    source: Option<String>,
+    service: Option<String>,
+    user: Option<String>,
+) -> Result<Option<ModelApiKey>, String> {
+    let source = source.ok_or("missing field `source`")?;
+    match source.as_str() {
+        "keyring" => {
+            let service = service.ok_or("missing field `service`")?;
+            let user = user.ok_or("missing field `user`")?;
+            let secret = keyring_secret(&service, &user)?;
+            Ok((!secret.is_empty()).then_some(ModelApiKey::Static(secret)))
+        }
+        "google-adc" if service.is_some() || user.is_some() => {
+            Err("api_key source `google-adc` takes no `service`/`user` fields".into())
+        }
+        "google-adc" => Ok(Some(ModelApiKey::GoogleAdc)),
+        other => Err(format!(
+            "unsupported api_key source `{other}`; expected `keyring` or `google-adc`"
+        )),
+    }
+}
+
+/// Look up a secret in the OS keyring, with readable failure messages.
+fn keyring_secret(service: &str, user: &str) -> Result<String, String> {
+    let entry = keyring::Entry::new(service, user)
+        .map_err(|e| format!("keyring entry (service={service}, user={user}) unavailable: {e}"))?;
+    entry
+        .get_password()
+        .map_err(|e| format!("keyring lookup failed (service={service}, user={user}): {e}"))
+}
+
+/// Custom deserializer for the classifier engine tables' static secrets
+/// (`api_key` / `access_token`): the same surface as a routed model's
+/// `api_key` — plaintext / `${ENV_VAR}` / keyring — **except** `google-adc`,
+/// which only makes sense for routed models (the engines own their auth:
+/// Gemini takes real API keys, and the vertex engine already defaults to
+/// ADC).
+fn resolve_api_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match resolve_model_api_key(deserializer)? {
+        None => Ok(None),
+        Some(ModelApiKey::Static(secret)) => Ok(Some(secret)),
+        Some(ModelApiKey::GoogleAdc) => Err(de::Error::custom(
+            "api_key source `google-adc` is only supported on routed models \
+             (`[[models]] api_key`); this field takes a static secret \
+             (plaintext, ${ENV_VAR}, or a keyring table)",
+        )),
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -576,24 +635,49 @@ impl RouterConfig {
         required: &ModalitySet,
         complexity: ModelTier,
     ) -> Option<&ModelConfig> {
-        // 1. Filter by capability (superset), preserving config order.
-        // 2 & 3–6. Rank survivors; `min_by_key` returns the first minimum, so a
-        //          tie resolves toward the earlier-declared model.
-        self.models
-            .iter()
-            .filter(|m| m.modality_set().is_superset(required))
-            .min_by_key(|m| tier_rank(m.tier, complexity))
+        select_candidate(self.models.iter(), |m| m, required, complexity)
     }
 
     /// How many models can serve `required` (declare a superset of it). When this
     /// is `<= 1` the complexity tier is irrelevant — there is nothing to rank —
     /// so the proxy can skip classification entirely and route directly.
     pub fn candidate_count(&self, required: &ModalitySet) -> usize {
-        self.models
-            .iter()
-            .filter(|m| m.modality_set().is_superset(required))
-            .count()
+        count_candidates(self.models.iter(), |m| m, required)
     }
+}
+
+/// The model-selection policy, generic over any collection of model-bearing
+/// items — the one implementation behind [`RouterConfig::select_model`]
+/// (pure config) and the proxy's runtime catalogue (config paired with
+/// resolved auth). `model_of` projects an item to its [`ModelConfig`].
+///
+/// 1. Filter by capability (superset), preserving declaration order.
+/// 2. Rank survivors: exact type → nearest higher (escalation) → highest
+///    lower (fallback); `min_by_key` returns the first minimum, so a tie
+///    resolves toward the earlier-declared item.
+pub(crate) fn select_candidate<'a, T: 'a>(
+    items: impl IntoIterator<Item = &'a T>,
+    model_of: impl Fn(&T) -> &ModelConfig,
+    required: &ModalitySet,
+    complexity: ModelTier,
+) -> Option<&'a T> {
+    items
+        .into_iter()
+        .filter(|item| model_of(item).modality_set().is_superset(required))
+        .min_by_key(|item| tier_rank(model_of(item).tier, complexity))
+}
+
+/// Companion to [`select_candidate`]: how many items could serve `required`.
+/// When this is `<= 1` the complexity tier is irrelevant (nothing to rank).
+pub(crate) fn count_candidates<'a, T: 'a>(
+    items: impl IntoIterator<Item = &'a T>,
+    model_of: impl Fn(&T) -> &ModelConfig,
+    required: &ModalitySet,
+) -> usize {
+    items
+        .into_iter()
+        .filter(|item| model_of(item).modality_set().is_superset(required))
+        .count()
 }
 
 /// Distance ranking for model selection. Lower is better:
@@ -836,7 +920,10 @@ port = 8080
         let cfg = parse_single_model(&format!(
             "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key=\"sk-plain\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
         ));
-        assert_eq!(cfg.models[0].api_key.as_deref(), Some("sk-plain"));
+        assert_eq!(
+            cfg.models[0].api_key,
+            Some(ModelApiKey::Static("sk-plain".into()))
+        );
     }
 
     #[test]
@@ -873,7 +960,10 @@ port = 8080
         let cfg = parse_single_model(&format!(
             "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key=\"${{ROUTER_TEST_KEY}}\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
         ));
-        assert_eq!(cfg.models[0].api_key.as_deref(), Some("sk-from-env"));
+        assert_eq!(
+            cfg.models[0].api_key,
+            Some(ModelApiKey::Static("sk-from-env".into()))
+        );
     }
 
     #[test]
@@ -890,8 +980,63 @@ port = 8080
         let cfg = parse_single_model(&format!(
             "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"keyring\", service = \"{service}\", user = \"{user}\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\n"
         ));
-        assert_eq!(cfg.models[0].api_key.as_deref(), Some("sk-keyring-secret"));
+        assert_eq!(
+            cfg.models[0].api_key,
+            Some(ModelApiKey::Static("sk-keyring-secret".into()))
+        );
         let _ = entry.delete_credential();
+    }
+
+    #[test]
+    fn api_key_google_adc_parses_to_marker() {
+        // Parsing must record the marker WITHOUT touching ADC (hermetic):
+        // credential discovery happens at startup, not at config load.
+        let cfg = parse_single_model(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"google-adc\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+        ));
+        assert_eq!(cfg.models[0].api_key, Some(ModelApiKey::GoogleAdc));
+    }
+
+    #[test]
+    fn api_key_google_adc_rejects_extra_fields() {
+        let err = parse(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"google-adc\", service = \"x\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("takes no `service`/`user`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn api_key_unknown_source_lists_the_valid_ones() {
+        let err = parse(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"vault\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected `keyring` or `google-adc`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn engine_tables_reject_google_adc() {
+        // The engines operate differently (Gemini takes real API keys; the
+        // vertex engine already defaults to ADC), so the marker is
+        // routed-model-only.
+        let err = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n\
+             [classifier.gemini-embedding-001]\napi_key={ source = \"google-adc\" }\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("only supported on routed models"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -963,7 +1108,7 @@ port = 8080
         ModelConfig {
             name: name.to_string(),
             base_url: Url::parse("http://x").unwrap(),
-            api_key: Some("k".to_string()),
+            api_key: Some(ModelApiKey::Static("k".to_string())),
             tier,
             modalities: mods.to_vec(),
         }

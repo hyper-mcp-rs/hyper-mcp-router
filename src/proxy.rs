@@ -19,8 +19,11 @@ use axum::{
 };
 use serde_json::{json, Value};
 
+use anyhow::Context;
+
 use crate::classifier::{Classification, ClassifierEngine, ModelTier};
-use crate::config::RouterConfig;
+use crate::config::{count_candidates, select_candidate, ModelApiKey, ModelConfig, RouterConfig};
+use crate::gcp_auth::{self, AccessTokenCredentials};
 use crate::modality::{detect_required_modalities, Modality, ModalitySet};
 use crate::prompt::{
     build_classification_window, extract_prompt, has_nonempty_user_text,
@@ -37,6 +40,117 @@ pub struct AppState {
     pub config: Arc<RouterConfig>,
     pub http: reqwest::Client,
     pub trivial_max_words: usize,
+    /// The runtime model catalogue: each configured model paired with its
+    /// resolved auth handle, exactly as they are paired in the config file.
+    /// Built once at startup; the proxy routes over THIS, not raw config.
+    pub models: Arc<[RoutedModel]>,
+}
+
+/// A backend model as the proxy actually routes to it: the static
+/// configuration together with its resolved runtime auth. Mirrors the config
+/// file, where a `[[models]]` entry carries its own `api_key` — the pairing
+/// is never split across parallel structures.
+pub struct RoutedModel {
+    pub config: ModelConfig,
+    pub auth: ModelAuth,
+}
+
+impl RoutedModel {
+    /// Pair every configured model with its resolved auth handle, discovering
+    /// ADC once iff some model asks for it — a missing/broken credential
+    /// setup is a boot error here, not a per-request surprise. Configs
+    /// without `google-adc` models never touch the host's credential
+    /// environment.
+    fn resolve_all(config: &RouterConfig) -> anyhow::Result<Vec<RoutedModel>> {
+        let mut adc: Option<AccessTokenCredentials> = None;
+        config
+            .models
+            .iter()
+            .map(|m| {
+                let auth = match &m.api_key {
+                    None => ModelAuth::None,
+                    Some(ModelApiKey::Static(key)) => ModelAuth::Static(key.clone()),
+                    Some(ModelApiKey::GoogleAdc) => {
+                        ModelAuth::GoogleAdc(shared_adc(&mut adc, &m.name)?)
+                    }
+                };
+                Ok(RoutedModel {
+                    config: m.clone(),
+                    auth,
+                })
+            })
+            .collect()
+    }
+}
+
+/// A routed model's **runtime** authentication handle — the resolved form of
+/// [`ModelApiKey`]. The `google-adc` variant *owns* its credential, so "an
+/// ADC model without credentials" is unrepresentable; the proxy only ever
+/// calls [`bearer`](Self::bearer).
+pub enum ModelAuth {
+    /// Keyless backend: no `Authorization` header.
+    None,
+    /// Static secret (plaintext / env / keyring), sent verbatim.
+    Static(String),
+    /// A current Google OAuth token per request via Application Default
+    /// Credentials (cached/refreshed by the auth library). Every `google-adc`
+    /// model shares one process-wide credential — ADC identifies the process
+    /// principal, so per-model credentials would be identical.
+    GoogleAdc(AccessTokenCredentials),
+}
+
+impl ModelAuth {
+    /// The `Authorization` bearer for one request to this model: `None` for
+    /// keyless backends, the static secret verbatim, or a current ADC token.
+    /// A token-fetch failure yields a ready error `Response` (boxed — it is
+    /// the rare, large arm) rather than limping along unauthenticated.
+    async fn bearer(&self, model: &str) -> Result<Option<String>, Box<Response>> {
+        match self {
+            ModelAuth::None => Ok(None),
+            ModelAuth::Static(key) => Ok(Some(key.clone())),
+            ModelAuth::GoogleAdc(credentials) => adc_bearer(credentials, model).await.map(Some),
+        }
+    }
+}
+
+/// Memoized ADC discovery for [`RoutedModel::resolve_all`]: the first
+/// `google-adc` model triggers discovery (a boot error when unavailable,
+/// named after the model that asked); every later one clones the shared
+/// credential.
+fn shared_adc(
+    adc: &mut Option<AccessTokenCredentials>,
+    model: &str,
+) -> anyhow::Result<AccessTokenCredentials> {
+    if let Some(shared) = adc {
+        return Ok(shared.clone());
+    }
+    let discovered = gcp_auth::adc_credentials().with_context(|| {
+        format!(
+            "model `{model}` sets api_key = {{ source = \"google-adc\" }}, \
+             which requires Application Default Credentials"
+        )
+    })?;
+    Ok(adc.insert(discovered).clone())
+}
+
+/// The `google-adc` arm of [`ModelAuth::bearer`]: fetch a current token from
+/// the shared credential, mapping failure to a 502 response.
+async fn adc_bearer(
+    credentials: &AccessTokenCredentials,
+    model: &str,
+) -> Result<String, Box<Response>> {
+    gcp_auth::bearer(credentials).await.map_err(|e| {
+        tracing::warn!(
+            error = %e,
+            model,
+            status = 502u16,
+            "google-adc token fetch failed"
+        );
+        Box::new(upstream_error(
+            StatusCode::BAD_GATEWAY,
+            "upstream_auth_failed",
+        ))
+    })
 }
 
 impl AppState {
@@ -60,11 +174,14 @@ impl AppState {
                 builder.read_timeout(Duration::from_secs(config.server.stream_idle_timeout_secs));
         }
         let http = builder.build()?;
+        let models: Arc<[RoutedModel]> = RoutedModel::resolve_all(&config)?.into();
+
         Ok(AppState {
             classifier,
             config,
             http,
             trivial_max_words,
+            models,
         })
     }
 }
@@ -140,8 +257,13 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
     // the sole (or zero) candidate.
     let complexity = route.classified.unwrap_or(ModelTier::Balanced);
 
-    let backend = match state.config.select_model(&route.required, complexity) {
-        Some(m) => m,
+    let backend = match select_candidate(
+        state.models.iter(),
+        |routed| &routed.config,
+        &route.required,
+        complexity,
+    ) {
+        Some(routed) => routed,
         None => {
             tracing::info!(
                 modalities = ?route.required.to_kebab_vec(),
@@ -157,14 +279,14 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
 
     // 5. Rewrite the model field to the selected backend's configured name.
     //    Everything else is forwarded untouched.
-    body["model"] = Value::String(backend.name.clone());
+    body["model"] = Value::String(backend.config.name.clone());
 
     // Metadata-only routing log (no user content).
     tracing::info!(
         modalities = ?route.required.to_kebab_vec(),
         image_output_source = route.image_source,
         complexity = ?route.classified,
-        model = %backend.name,
+        model = %backend.config.name,
         streaming,
         prompt_chars = route.prompt_chars,
         "routing request"
@@ -175,17 +297,20 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
     //    client-level idle (read) timeout instead.
     let url = format!(
         "{}/chat/completions",
-        backend.base_url.as_str().trim_end_matches('/')
+        backend.config.base_url.as_str().trim_end_matches('/')
     );
-    // Keyless backends (no configured `api_key`) get no `Authorization` header.
     let mut request = state.http.post(&url).json(&body);
     if !streaming {
         request = request.timeout(Duration::from_secs(
             state.config.server.request_timeout_secs,
         ));
     }
-    if let Some(api_key) = &backend.api_key {
-        request = request.bearer_auth(api_key);
+    // Keyless backends get no `Authorization` header; google-adc backends
+    // get a per-request token (see [`ModelAuth::bearer`]).
+    match backend.auth.bearer(&backend.config.name).await {
+        Ok(Some(token)) => request = request.bearer_auth(token),
+        Ok(None) => {}
+        Err(error_response) => return *error_response,
     }
     let upstream = request.send().await;
 
@@ -197,7 +322,7 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
             } else {
                 (StatusCode::BAD_GATEWAY, "upstream_unavailable")
             };
-            tracing::warn!(error = %e, status = code.as_u16(), model = %backend.name, "upstream request failed");
+            tracing::warn!(error = %e, status = code.as_u16(), model = %backend.config.name, "upstream request failed");
             return upstream_error(code, kind);
         }
     };
@@ -205,7 +330,7 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
     let status = resp.status();
     let latency_ms = started.elapsed().as_millis();
     tracing::info!(
-        model = %backend.name,
+        model = %backend.config.name,
         upstream_status = status.as_u16(),
         latency_ms = latency_ms as u64,
         streaming,
@@ -267,26 +392,28 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
         }
     }
 
-    let classified: Option<ModelTier> = if state.config.candidate_count(&required) <= 1 {
-        None
-    } else {
-        let classification = classify_or_default(state, body, &current_turn, lexical_image).await;
-        if classification.image_generation
-            && !required.contains(Modality::ImageOutput)
-            && !image_intent_dropped
-        {
-            if try_require_image_output(&state.config, &mut required) {
-                image_source = Some(if lexical_image {
-                    "lexical"
+    let classified: Option<ModelTier> =
+        if count_candidates(state.models.iter(), |routed| &routed.config, &required) <= 1 {
+            None
+        } else {
+            let classification =
+                classify_or_default(state, body, &current_turn, lexical_image).await;
+            if classification.image_generation
+                && !required.contains(Modality::ImageOutput)
+                && !image_intent_dropped
+            {
+                if try_require_image_output(&state.config, &mut required) {
+                    image_source = Some(if lexical_image {
+                        "lexical"
+                    } else {
+                        "nli-threshold"
+                    });
                 } else {
-                    "nli-threshold"
-                });
-            } else {
-                image_intent_dropped = true;
+                    image_intent_dropped = true;
+                }
             }
-        }
-        Some(classification.complexity)
-    };
+            Some(classification.complexity)
+        };
     if image_intent_dropped {
         tracing::info!(
             modalities = ?required.to_kebab_vec(),
@@ -566,6 +693,41 @@ mod tests {
         let after = resolve_required(&body, false);
         assert_eq!(before, after);
         assert!(before.contains(Modality::ImageInput));
+    }
+
+    // ── model auth handles ──────────────────────────────────────────
+    #[tokio::test]
+    async fn model_auth_keyless_and_static_bearers() {
+        assert_eq!(ModelAuth::None.bearer("m").await.unwrap(), None);
+        assert_eq!(
+            ModelAuth::Static("sk-static".into())
+                .bearer("m")
+                .await
+                .unwrap(),
+            Some("sk-static".to_string())
+        );
+    }
+
+    #[test]
+    fn routed_models_without_google_adc_never_touch_adc() {
+        // Static and keyless models resolve to their handles without ADC
+        // discovery — this test must pass on hosts with NO Google credential
+        // environment at all (hermetic). Each model stays paired with its
+        // own auth, exactly as in the config file.
+        let keyless = model("keyless", &[Modality::Text]);
+        let mut keyed = model("keyed", &[Modality::Text]);
+        keyed.api_key = Some(crate::config::ModelApiKey::Static("sk-1".into()));
+
+        let cfg = crate::config::RouterConfig {
+            server: Default::default(),
+            classifier: Default::default(),
+            models: vec![keyless, keyed],
+        };
+        let routed = RoutedModel::resolve_all(&cfg).expect("no ADC needed");
+        assert_eq!(routed[0].config.name, "keyless");
+        assert!(matches!(routed[0].auth, ModelAuth::None));
+        assert_eq!(routed[1].config.name, "keyed");
+        assert!(matches!(&routed[1].auth, ModelAuth::Static(k) if k == "sk-1"));
     }
 
     // ── n validation ──────────────────────────────────────────────────

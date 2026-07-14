@@ -97,7 +97,7 @@ trivial_max_words = 6
 #max_concurrency = 32
 #request_timeout_secs = 10
 
-# `api_key` resolves three ways (below), or may be omitted entirely for a
+# `api_key` resolves four ways (below), or may be omitted entirely for a
 # keyless backend (e.g. a local Ollama / vLLM / LM Studio server, or a gateway
 # that injects auth). An omitted field or an empty string "" both mean "no
 # auth" — no Authorization header is sent.
@@ -142,6 +142,20 @@ base_url   = "https://api.openai.com/v1"
 api_key    = { source = "keyring", service = "hyper-mcp-router", user = "openai-frontier" }
 type       = "frontier"
 modalities = ["text", "tools"]
+
+# 4. Google Application Default Credentials, for backends hosted on Vertex AI
+#    (its OpenAI-compatible endpoint takes OAuth Bearer tokens, not API keys).
+#    The token is resolved PER REQUEST and auto-refreshed — never a baked-in
+#    ~1h gcloud token. Credentials come from the standard ADC chain at
+#    startup: GOOGLE_APPLICATION_CREDENTIALS, `gcloud auth application-default
+#    login`, or the GCE/Cloud Run metadata server (startup fails fast if none
+#    is available). Commented out so the example works without a GCP setup:
+#[[models]]
+#name       = "google/gemini-2.5-pro"
+#base_url   = "https://us-central1-aiplatform.googleapis.com/v1/projects/MY_PROJECT/locations/us-central1/endpoints/openapi"
+#api_key    = { source = "google-adc" }
+#type       = "frontier"
+#modalities = ["text", "tools"]
 
 # A single multimodal model can cover several modalities at once.
 [[models]]
