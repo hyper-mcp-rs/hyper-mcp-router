@@ -1,11 +1,15 @@
-//! Integration tests for the Gemini embedding engines.
+//! Integration tests for the Vertex AI embedding engine (`text-embedding-005`).
 //!
-//! A mock Gemini API returns deterministic 4-dimensional "embeddings" derived
-//! from keyword features (dims = [fast, balanced, frontier, image]), so the
-//! engine's anchor prototypes collapse to near-unit class vectors and routing
-//! through a real router instance is fully predictable — no network, no real
-//! model. A mock chat backend records the forwarded `model` field as the
-//! routing witness, exactly like `api_routing.rs`.
+//! A mock Vertex `:predict` API returns deterministic 4-dimensional
+//! "embeddings" derived from keyword features (dims = [fast, balanced,
+//! frontier, image]), so the engine's anchor prototypes collapse to near-unit
+//! class vectors and routing through a real router instance is fully
+//! predictable — no network, no real model. A mock chat backend records the
+//! forwarded `model` field as the routing witness.
+//!
+//! Mirrors `gemini_engine.rs`, but for the Vertex wire format: the
+//! `publishers/google/models/<model>:predict` endpoint, the
+//! `instances`/`predictions` payload, and `Authorization: Bearer` auth.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,15 +30,15 @@ use hyper_mcp_router::engines;
 use hyper_mcp_router::proxy::{build_router, AppState, ADVERTISED_MODEL};
 
 // ───────────────────────────────────────────────────────────────────────────
-// Mock Gemini embeddings API
+// Mock Vertex AI :predict API
 // ───────────────────────────────────────────────────────────────────────────
 
-/// One recorded embed call: request path, the `x-goog-api-key` header, and
-/// how many texts were embedded.
+/// One recorded embed call: request path, the Bearer token from the
+/// `Authorization` header, and how many texts were embedded.
 #[derive(Clone, Debug)]
 struct EmbedCall {
     path: String,
-    api_key: Option<String>,
+    bearer: Option<String>,
     text_count: usize,
 }
 
@@ -101,19 +105,20 @@ async fn mock_embed(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let texts: Vec<String> = body["requests"]
+    let texts: Vec<String> = body["instances"]
         .as_array()
         .unwrap_or(&Vec::new())
         .iter()
-        .filter_map(|r| r["content"]["parts"][0]["text"].as_str())
+        .filter_map(|i| i["content"].as_str())
         .map(str::to_owned)
         .collect();
 
     state.calls.lock().unwrap().push(EmbedCall {
         path: uri.path().to_string(),
-        api_key: headers
-            .get("x-goog-api-key")
+        bearer: headers
+            .get("authorization")
             .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
             .map(str::to_owned),
         text_count: texts.len(),
     });
@@ -125,23 +130,23 @@ async fn mock_embed(
             .unwrap();
     }
 
-    let embeddings: Vec<Value> = texts
+    let predictions: Vec<Value> = texts
         .iter()
-        .map(|t| json!({"values": mock_embedding(t)}))
+        .map(|t| json!({"embeddings": {"values": mock_embedding(t)}}))
         .collect();
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::to_vec(&json!({"embeddings": embeddings})).unwrap(),
+            serde_json::to_vec(&json!({"predictions": predictions})).unwrap(),
         ))
         .unwrap()
 }
 
-async fn spawn_mock_gemini() -> (SocketAddr, EmbedState) {
+async fn spawn_mock_vertex() -> (SocketAddr, EmbedState) {
     let state = EmbedState::default();
-    // Fallback route: matches any path, so the `:batchEmbedContents` URL
-    // shape is recorded rather than hardcoded here.
+    // Fallback route matches any path, so the full `:predict` URL shape is
+    // recorded rather than hardcoded here.
     let app = Router::new()
         .fallback(post(mock_embed))
         .with_state(state.clone());
@@ -185,7 +190,7 @@ async fn spawn_mock_chat() -> (SocketAddr, ChatCalls) {
 // Harness
 // ───────────────────────────────────────────────────────────────────────────
 
-fn gemini_config_toml(model: &str, embed_addr: SocketAddr, chat_addr: SocketAddr) -> String {
+fn vertex_config_toml(embed_addr: SocketAddr, chat_addr: SocketAddr) -> String {
     let chat = format!("http://{chat_addr}");
     format!(
         r#"
@@ -194,10 +199,12 @@ host = "127.0.0.1"
 port = 0
 
 [classifier]
-model = "{model}"
+model = "text-embedding-005"
 
-[classifier.{model}]
-api_key = "test-gemini-key"
+[classifier.text-embedding-005]
+project = "test-project"
+location = "us-central1"
+access_token = "test-vertex-token"
 base_url = "http://{embed_addr}"
 
 [[models]]
@@ -235,19 +242,18 @@ struct Harness {
 }
 
 impl Harness {
-    /// Start a full router whose classifier is a Gemini engine wired to the
-    /// mock embeddings API. Anchor embedding happens here, at engine build.
-    async fn start(model: &str) -> Harness {
-        let (embed_addr, embed) = spawn_mock_gemini().await;
+    /// Start a full router whose classifier is the Vertex engine wired to the
+    /// mock `:predict` API. Anchor embedding happens here, at engine build.
+    async fn start() -> Harness {
+        let (embed_addr, embed) = spawn_mock_vertex().await;
         let (chat_addr, chat_calls) = spawn_mock_chat().await;
 
-        let cfg =
-            config::parse(&gemini_config_toml(model, embed_addr, chat_addr)).expect("parse config");
+        let cfg = config::parse(&vertex_config_toml(embed_addr, chat_addr)).expect("parse config");
         cfg.validate().expect("validate config");
 
         let engine = engines::build(&cfg.classifier)
             .await
-            .expect("build gemini engine against mock");
+            .expect("build vertex engine against mock");
         let trivial_max_words = cfg.classifier.trivial_max_words;
         let state =
             AppState::new(engine, Arc::new(cfg), trivial_max_words).expect("build app state");
@@ -299,29 +305,48 @@ impl Harness {
 // Tests
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Startup embeds the class anchors in one batch, hitting the model-specific
-/// endpoint with the configured API key sent as a header (never in the URL).
+/// Startup embeds the class anchors in one batch, hitting the regional
+/// `:predict` endpoint with the configured OAuth token as a Bearer header.
 #[tokio::test]
-async fn startup_embeds_anchors_with_api_key_header() {
-    let h = Harness::start("gemini-embedding-001").await;
+async fn startup_embeds_anchors_with_bearer_token() {
+    let h = Harness::start().await;
     let calls = h.embed_calls();
     assert_eq!(calls.len(), 1, "anchors must be one batched call");
     assert!(
         calls[0]
             .path
-            .contains("models/gemini-embedding-001:batchEmbedContents"),
+            .contains("publishers/google/models/text-embedding-005:predict"),
         "unexpected endpoint path: {}",
         calls[0].path
     );
-    assert_eq!(calls[0].api_key.as_deref(), Some("test-gemini-key"));
+    assert!(
+        calls[0]
+            .path
+            .contains("/projects/test-project/locations/us-central1/"),
+        "unexpected endpoint path: {}",
+        calls[0].path
+    );
+    assert_eq!(calls[0].bearer.as_deref(), Some("test-vertex-token"));
     assert!(calls[0].text_count >= 12, "all anchor classes embedded");
+}
+
+/// Engine identity and the 2048-token-class budgets are model-specific.
+#[tokio::test]
+async fn engine_name_and_budgets() {
+    let (embed_addr, _embed) = spawn_mock_vertex().await;
+    let (chat_addr, _chat) = spawn_mock_chat().await;
+    let cfg = config::parse(&vertex_config_toml(embed_addr, chat_addr)).expect("parse config");
+    let engine = engines::build(&cfg.classifier).await.expect("build engine");
+    assert_eq!(engine.name(), "text-embedding-005");
+    assert_eq!(engine.context_char_budget(), 6_000);
+    assert_eq!(engine.current_turn_char_budget(), 2_000);
 }
 
 /// Complexity routing through embedding prototypes: balanced-flavored text to
 /// the balanced tier, frontier-flavored text to the frontier tier.
 #[tokio::test]
 async fn embedding_classification_routes_by_tier() {
-    let h = Harness::start("gemini-embedding-001").await;
+    let h = Harness::start().await;
 
     let resp = h
         .chat("Explain how compound interest works over several years.")
@@ -340,8 +365,7 @@ async fn embedding_classification_routes_by_tier() {
 /// to evade the lexical prefilter) routes to the image backend.
 #[tokio::test]
 async fn embedding_image_signal_routes_to_image_backend() {
-    let h = Harness::start("gemini-embedding-001").await;
-    // No lexical verb+noun pair; the mock scores "watercolor" on the image dim.
+    let h = Harness::start().await;
     let resp = h
         .chat("A watercolor of a mountain sunrise would be lovely please.")
         .await;
@@ -353,7 +377,7 @@ async fn embedding_image_signal_routes_to_image_backend() {
 /// still served), exactly like any engine failure.
 #[tokio::test]
 async fn embed_failure_degrades_to_balanced_default() {
-    let h = Harness::start("gemini-embedding-001").await;
+    let h = Harness::start().await;
     h.embed.fail.store(true, Ordering::SeqCst);
     let resp = h
         .chat("Prove that the halting problem is undecidable with a rigorous argument.")
@@ -374,7 +398,7 @@ async fn embed_failure_degrades_to_balanced_default() {
 /// without a single embedding call beyond the startup anchors.
 #[tokio::test]
 async fn chit_chat_routes_fast_with_zero_embed_calls() {
-    let h = Harness::start("gemini-embedding-001").await;
+    let h = Harness::start().await;
     let anchors_only = h.embed_calls().len();
     let resp = h.chat("thanks, ok!").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -386,55 +410,39 @@ async fn chit_chat_routes_fast_with_zero_embed_calls() {
     );
 }
 
-/// gemini-embedding-2 is a distinct engine: its own endpoint path and its
-/// larger, model-specific context budgets.
+/// The GCP project is mandatory: a selected Vertex engine without one must
+/// fail at startup with an actionable message (never limp along).
 #[tokio::test]
-async fn gemini_embedding_2_uses_own_endpoint_and_budgets() {
-    let h = Harness::start("gemini-embedding-2").await;
-    let calls = h.embed_calls();
-    assert!(
-        calls[0]
-            .path
-            .contains("models/gemini-embedding-2:batchEmbedContents"),
-        "unexpected endpoint path: {}",
-        calls[0].path
-    );
-
-    // Budgets are exposed via the trait; check through a directly-built engine.
-    let (embed_addr, _embed) = spawn_mock_gemini().await;
+async fn missing_project_fails_engine_build() {
+    let (embed_addr, _embed) = spawn_mock_vertex().await;
     let (chat_addr, _chat) = spawn_mock_chat().await;
-    let cfg = config::parse(&gemini_config_toml(
-        "gemini-embedding-2",
-        embed_addr,
-        chat_addr,
-    ))
-    .expect("parse config");
-    let engine = engines::build(&cfg.classifier).await.expect("build engine");
-    assert_eq!(engine.name(), "gemini-embedding-2");
-    assert_eq!(engine.context_char_budget(), 24_000);
-    assert_eq!(engine.current_turn_char_budget(), 8_000);
-
-    // And it still routes.
-    let resp = h.chat("Explain how compound interest works today.").await;
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert_eq!(h.routed_model(), "balanced-text");
-}
-
-/// The API key is mandatory: a selected Gemini engine without one must fail
-/// at startup with an actionable message (never limp along).
-#[tokio::test]
-async fn missing_api_key_fails_engine_build() {
-    let (embed_addr, _embed) = spawn_mock_gemini().await;
-    let (chat_addr, _chat) = spawn_mock_chat().await;
-    let toml = gemini_config_toml("gemini-embedding-001", embed_addr, chat_addr)
-        .replace("api_key = \"test-gemini-key\"\n", "");
-    let cfg = config::parse(&toml).expect("config parses without the key");
+    let toml =
+        vertex_config_toml(embed_addr, chat_addr).replace("project = \"test-project\"\n", "");
+    let cfg = config::parse(&toml).expect("config parses without the project");
     let msg = match engines::build(&cfg.classifier).await {
-        Ok(_) => panic!("engine build must fail without an API key"),
+        Ok(_) => panic!("engine build must fail without a project"),
         Err(e) => e.to_string(),
     };
     assert!(
-        msg.contains("requires an API key") && msg.contains("gemini-embedding-001"),
+        msg.contains("requires a GCP project") && msg.contains("text-embedding-005"),
+        "unhelpful error: {msg}"
+    );
+}
+
+/// The access token is mandatory too.
+#[tokio::test]
+async fn missing_access_token_fails_engine_build() {
+    let (embed_addr, _embed) = spawn_mock_vertex().await;
+    let (chat_addr, _chat) = spawn_mock_chat().await;
+    let toml = vertex_config_toml(embed_addr, chat_addr)
+        .replace("access_token = \"test-vertex-token\"\n", "");
+    let cfg = config::parse(&toml).expect("config parses without the token");
+    let msg = match engines::build(&cfg.classifier).await {
+        Ok(_) => panic!("engine build must fail without an access token"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("requires an OAuth access token") && msg.contains("text-embedding-005"),
         "unhelpful error: {msg}"
     );
 }

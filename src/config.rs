@@ -126,17 +126,9 @@ pub struct ClassifierConfig {
     /// Settings for the `text-embedding-005` engine
     /// (`[classifier.text-embedding-005]`). Ignored unless selected. Uses the
     /// Vertex-specific shape (this model is Vertex-AI-only), not the shared
-    /// [`RemoteEmbeddingConfig`] the Gemini/OpenAI families use.
+    /// [`RemoteEmbeddingConfig`] the Gemini family uses.
     #[serde(default, rename = "text-embedding-005")]
     pub text_embedding_005: VertexEmbeddingConfig,
-    /// Settings for the `text-embedding-3-small` engine
-    /// (`[classifier.text-embedding-3-small]`). Ignored unless selected.
-    #[serde(default, rename = "text-embedding-3-small")]
-    pub text_embedding_3_small: RemoteEmbeddingConfig,
-    /// Settings for the `text-embedding-3-large` engine
-    /// (`[classifier.text-embedding-3-large]`). Ignored unless selected.
-    #[serde(default, rename = "text-embedding-3-large")]
-    pub text_embedding_3_large: RemoteEmbeddingConfig,
 }
 
 impl Default for ClassifierConfig {
@@ -149,16 +141,14 @@ impl Default for ClassifierConfig {
             gemini_embedding_001: RemoteEmbeddingConfig::default(),
             gemini_embedding_2: RemoteEmbeddingConfig::default(),
             text_embedding_005: VertexEmbeddingConfig::default(),
-            text_embedding_3_small: RemoteEmbeddingConfig::default(),
-            text_embedding_3_large: RemoteEmbeddingConfig::default(),
         }
     }
 }
 
-/// Settings for a remote embedding engine (any provider — the
-/// `[classifier.<model>]` tables of the Gemini and OpenAI families all share
-/// this shape). Remote engines have no local session pool; their "sessions"
-/// are concurrent in-flight API requests.
+/// Settings for a remote embedding engine (the `[classifier.<model>]` tables
+/// of the Gemini family — `gemini-embedding-001`, `gemini-embedding-2` —
+/// share this shape). Remote engines have no local session pool; their
+/// "sessions" are concurrent in-flight API requests.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RemoteEmbeddingConfig {
     /// API key for the provider. **Required when the engine is selected**
@@ -169,9 +159,7 @@ pub struct RemoteEmbeddingConfig {
     #[serde(default, deserialize_with = "resolve_api_key")]
     pub api_key: Option<String>,
     /// Endpoint override (e.g. a proxy/gateway, or a mock in tests). Must be
-    /// http/https. Defaults to the provider's public endpoint. NOTE: the
-    /// OpenAI engines append `/v1/embeddings`, so their override must not
-    /// include a `/v1` suffix.
+    /// http/https. Defaults to the provider's public endpoint.
     #[serde(default, deserialize_with = "deserialize_opt_http_url")]
     pub base_url: Option<Url>,
     /// Maximum concurrent embedding requests in flight (this engine's
@@ -804,33 +792,6 @@ mod tests {
         assert_eq!(cfg.classifier.gemini_embedding_001.api_key, None);
         assert_eq!(cfg.classifier.gemini_embedding_001.base_url, None);
         assert_eq!(cfg.classifier.gemini_embedding_2.max_concurrency, None);
-    }
-
-    #[test]
-    fn openai_engine_tables_parse() {
-        let cfg = parse(
-            "[server]\nhost=\"0.0.0.0\"\nport=1\n\
-             [classifier]\nmodel=\"text-embedding-3-small\"\n\
-             [classifier.text-embedding-3-small]\napi_key=\"sk-small\"\nmax_concurrency=8\n\
-             [classifier.text-embedding-3-large]\napi_key=\"sk-large\"\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
-        )
-        .unwrap();
-        assert_eq!(cfg.classifier.model, ClassifierModel::TextEmbedding3Small);
-        assert_eq!(
-            cfg.classifier.text_embedding_3_small.api_key.as_deref(),
-            Some("sk-small")
-        );
-        assert_eq!(
-            cfg.classifier.text_embedding_3_small.max_concurrency,
-            Some(8)
-        );
-        assert_eq!(
-            cfg.classifier.text_embedding_3_large.api_key.as_deref(),
-            Some("sk-large")
-        );
-        // Omitted fields default.
-        assert_eq!(cfg.classifier.text_embedding_3_large.base_url, None);
     }
 
     #[test]

@@ -142,8 +142,6 @@ and never change when an engine is added.
 | `gemini-embedding-001` | `engines/gemini/embedding_001.rs` | remote anchor-prototype embeddings (Gemini API) | concurrent embed calls (default 32) | 6000 / 2000 chars (2048-token model) |
 | `gemini-embedding-2` | `engines/gemini/embedding_2.rs` | remote anchor-prototype embeddings (Gemini API) | concurrent embed calls (default 32) | 24000 / 8000 chars (8192-token model) |
 | `text-embedding-005` | `engines/vertex/text_embedding_005.rs` | remote anchor-prototype embeddings (Vertex AI) | concurrent embed calls (default 32) | 6000 / 2000 chars (2048-token model) |
-| `text-embedding-3-small` | `engines/openai/text_embedding_3_small.rs` | remote anchor-prototype embeddings (OpenAI API) | concurrent embed calls (default 32) | 24000 / 8000 chars (8191-token model) |
-| `text-embedding-3-large` | `engines/openai/text_embedding_3_large.rs` | remote anchor-prototype embeddings (OpenAI API) | concurrent embed calls (default 32) | 24000 / 8000 chars (8191-token model) |
 
 Both budgets are trait methods (`context_char_budget`,
 `current_turn_char_budget`), so an engine backed by a large-context model can
@@ -151,22 +149,22 @@ raise them — e.g. to see image-generation intent expressed deep in a long
 prompt — without touching the routing core. They bound classifier input only;
 forwarded requests are never truncated.
 
-The remote engines (Gemini, OpenAI, and Vertex AI families) classify by
+The remote engines (Gemini and Vertex AI families) classify by
 **anchor prototypes** (shared, provider-neutral logic in
 `engines/embedding.rs`): at startup they embed a curated exemplar set per
 class (one batched call, failing fast on a bad credential or unreachable
 endpoint), mean-pool them into prototype vectors, and per request cosine-score
 the window and current turn against those prototypes. Each family's `mod.rs`
-owns only its transport — wire format, auth, endpoint layout. The Gemini and
-OpenAI families take a **required** `api_key` (plaintext / `${ENV_VAR}` / OS
-keyring); `text-embedding-005` is published only on **Vertex AI**, so its
+owns only its transport — wire format, auth, endpoint layout. The Gemini
+family takes a **required** `api_key` (plaintext / `${ENV_VAR}` / OS keyring);
+`text-embedding-005` is published only on **Vertex AI**, so its
 `vertex/` family instead takes a GCP `project`, a `location`, and a required
 OAuth `access_token` (a static token today — e.g. `gcloud auth
 print-access-token`). Per-request API failures degrade to the balanced default
 like any engine failure.
 
 **Privacy caveat**: the remote engines send prompt text (the classification
-window and current turn) to their provider's API (Google or OpenAI). The
+window and current turn) to their provider's API (Google). The
 "zero customer-data collection, fully local" property in the highlights holds
 **only for the default `deberta-v3-xsmall-zeroshot` engine**.
 

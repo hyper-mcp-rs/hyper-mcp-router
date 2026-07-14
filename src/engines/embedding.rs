@@ -1,6 +1,6 @@
 //! Anchor-prototype classification support shared by every embedding-based
 //! engine, regardless of provider. **Not a model** — provider families
-//! (`gemini/`, `openai/`) own their transport; this module owns the method.
+//! (`gemini/`, `vertex/`) own their transport; this module owns the method.
 //!
 //! ## How embedding classification works
 //!
