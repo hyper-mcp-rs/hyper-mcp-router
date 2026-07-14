@@ -10,7 +10,8 @@
 //! context budgets — the model accepts 2048 input tokens (and emits up to
 //! 768-dim vectors specialised for English and code), so the budgets match
 //! the 2048-token siblings. Requires `[classifier.text-embedding-005]`
-//! `project` and `access_token`.
+//! `project`; auth is Application Default Credentials by default, or a
+//! static `access_token` override (see this directory's `mod.rs`).
 //!
 //! Privacy note: selecting this engine sends prompt text (the classification
 //! window and current turn) to the Vertex AI API.

@@ -5,27 +5,31 @@
 //! and `parse_embeddings`/cosine logic.
 //!
 //! Ignored by default (needs credentials + network). Run with:
-//!   TE005_PROJECT=<proj> GOOGLE_ACCESS_TOKEN=<tok> \
-//!     cargo test --test vertex_live -- --ignored --nocapture
+//!   TE005_PROJECT=<proj> cargo test --test vertex_live -- --ignored --nocapture
+//! Auth: Application Default Credentials by default (`gcloud auth
+//! application-default login`); set GOOGLE_ACCESS_TOKEN to pin a static
+//! token instead.
 
 use hyper_mcp_router::classifier::{ClassifierModel, ModelTier};
 use hyper_mcp_router::config::{ClassifierConfig, VertexEmbeddingConfig};
 
 #[tokio::test]
-#[ignore = "hits the live Vertex AI API; needs TE005_PROJECT + GOOGLE_ACCESS_TOKEN"]
+#[ignore = "hits the live Vertex AI API; needs TE005_PROJECT (+ ADC or GOOGLE_ACCESS_TOKEN)"]
 async fn vertex_text_embedding_005_classifies_live() {
-    let (Ok(project), Ok(token)) = (
-        std::env::var("TE005_PROJECT"),
-        std::env::var("GOOGLE_ACCESS_TOKEN"),
-    ) else {
-        panic!("set TE005_PROJECT and GOOGLE_ACCESS_TOKEN to run this test");
+    let Ok(project) = std::env::var("TE005_PROJECT") else {
+        panic!("set TE005_PROJECT to run this test");
     };
+    // Optional static override; omitted means Application Default Credentials.
+    let access_token = std::env::var("GOOGLE_ACCESS_TOKEN").ok();
+    // Optional quota/billing project (sent as x-goog-user-project).
+    let quota_project = std::env::var("TE005_QUOTA_PROJECT").ok();
 
     let cfg = ClassifierConfig {
         model: ClassifierModel::TextEmbedding005,
         text_embedding_005: VertexEmbeddingConfig {
             project: Some(project),
-            access_token: Some(token),
+            quota_project,
+            access_token,
             ..Default::default()
         },
         ..Default::default()

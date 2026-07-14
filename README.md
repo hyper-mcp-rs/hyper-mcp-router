@@ -157,11 +157,14 @@ endpoint), mean-pool them into prototype vectors, and per request cosine-score
 the window and current turn against those prototypes. Each family's `mod.rs`
 owns only its transport — wire format, auth, endpoint layout. The Gemini
 family takes a **required** `api_key` (plaintext / `${ENV_VAR}` / OS keyring);
-`text-embedding-005` is published only on **Vertex AI**, so its
-`vertex/` family instead takes a GCP `project`, a `location`, and a required
-OAuth `access_token` (a static token today — e.g. `gcloud auth
-print-access-token`). Per-request API failures degrade to the balanced default
-like any engine failure.
+`text-embedding-005` is published only on **Vertex AI**, so its `vertex/`
+family instead takes a GCP `project` and `location` (plus an optional
+`quota_project` for quota/billing attribution), authenticating via
+**Application Default Credentials** (service-account key file, `gcloud auth
+application-default login`, or the GCE/Cloud Run metadata server — token
+refresh handled by `google-cloud-auth`), with an optional static
+`access_token` override for quick tests. Per-request API failures degrade to
+the balanced default like any engine failure.
 
 **Privacy caveat**: the remote engines send prompt text (the classification
 window and current turn) to their provider's API (Google). The

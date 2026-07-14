@@ -34,11 +34,13 @@ use hyper_mcp_router::proxy::{build_router, AppState, ADVERTISED_MODEL};
 // ───────────────────────────────────────────────────────────────────────────
 
 /// One recorded embed call: request path, the Bearer token from the
-/// `Authorization` header, and how many texts were embedded.
+/// `Authorization` header, the `x-goog-user-project` quota header, and how
+/// many texts were embedded.
 #[derive(Clone, Debug)]
 struct EmbedCall {
     path: String,
     bearer: Option<String>,
+    quota_project: Option<String>,
     text_count: usize,
 }
 
@@ -119,6 +121,10 @@ async fn mock_embed(
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "))
+            .map(str::to_owned),
+        quota_project: headers
+            .get("x-goog-user-project")
+            .and_then(|v| v.to_str().ok())
             .map(str::to_owned),
         text_count: texts.len(),
     });
@@ -204,6 +210,7 @@ model = "text-embedding-005"
 [classifier.text-embedding-005]
 project = "test-project"
 location = "us-central1"
+quota_project = "test-quota-project"
 access_token = "test-vertex-token"
 base_url = "http://{embed_addr}"
 
@@ -327,7 +334,27 @@ async fn startup_embeds_anchors_with_bearer_token() {
         calls[0].path
     );
     assert_eq!(calls[0].bearer.as_deref(), Some("test-vertex-token"));
+    assert_eq!(
+        calls[0].quota_project.as_deref(),
+        Some("test-quota-project"),
+        "configured quota project must ride along as x-goog-user-project"
+    );
     assert!(calls[0].text_count >= 12, "all anchor classes embedded");
+}
+
+/// The quota header is strictly opt-in: without `quota_project` configured,
+/// no `x-goog-user-project` header is sent.
+#[tokio::test]
+async fn quota_project_header_omitted_when_not_configured() {
+    let (embed_addr, embed) = spawn_mock_vertex().await;
+    let (chat_addr, _chat) = spawn_mock_chat().await;
+    let toml = vertex_config_toml(embed_addr, chat_addr)
+        .replace("quota_project = \"test-quota-project\"\n", "");
+    let cfg = config::parse(&toml).expect("parse config");
+    let _engine = engines::build(&cfg.classifier).await.expect("build engine");
+    let calls = embed.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "anchor embedding call");
+    assert_eq!(calls[0].quota_project, None);
 }
 
 /// Engine identity and the 2048-token-class budgets are model-specific.
@@ -429,20 +456,10 @@ async fn missing_project_fails_engine_build() {
     );
 }
 
-/// The access token is mandatory too.
-#[tokio::test]
-async fn missing_access_token_fails_engine_build() {
-    let (embed_addr, _embed) = spawn_mock_vertex().await;
-    let (chat_addr, _chat) = spawn_mock_chat().await;
-    let toml = vertex_config_toml(embed_addr, chat_addr)
-        .replace("access_token = \"test-vertex-token\"\n", "");
-    let cfg = config::parse(&toml).expect("config parses without the token");
-    let msg = match engines::build(&cfg.classifier).await {
-        Ok(_) => panic!("engine build must fail without an access token"),
-        Err(e) => e.to_string(),
-    };
-    assert!(
-        msg.contains("requires an OAuth access token") && msg.contains("text-embedding-005"),
-        "unhelpful error: {msg}"
-    );
-}
+// NOTE: there is deliberately no `missing_access_token_fails_engine_build`
+// test. An omitted `access_token` now means "authenticate via Application
+// Default Credentials", and ADC discovery reads the *host environment*
+// (GOOGLE_APPLICATION_CREDENTIALS, gcloud user credentials, metadata server),
+// so any assertion about that path would be environment-dependent, not
+// hermetic. The ADC path is covered by the opt-in live test
+// (`tests/vertex_live.rs`); every mock test here pins a static token.

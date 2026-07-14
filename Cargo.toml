@@ -24,8 +24,8 @@ axum       = "0.8"
 clap       = { version = "4", features = ["derive"] }
 config     = "0.15"
 directories = "6.0"
-# Prep for ADC (Application Default Credentials) token refresh behind the
-# vertex engine's `TokenSource` seam. Not wired in yet — see TODO(adc).
+# ADC (Application Default Credentials) for the vertex engine family: token
+# discovery, caching, and refresh behind its `TokenSource`.
 google-cloud-auth = "1.14"
 keyring    = "4.1"
 ndarray    = "0.17"   # must match the ndarray version `ort` re-exports

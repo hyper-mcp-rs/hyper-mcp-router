@@ -76,15 +76,23 @@ trivial_max_words = 6
 #api_key = "${GEMINI_API_KEY:-}"
 
 # text-embedding-005 is published only on Vertex AI (a different API), so it
-# takes a GCP project, a region, and an OAuth Bearer access_token instead of
-# an api_key. location defaults to "us-central1" and also picks the regional
-# endpoint host. access_token is a STATIC token today (Option 1): tokens from
-# `gcloud auth print-access-token` expire (~1h), so a long-running process
-# needs an externally refreshed value; ADC auto-refresh is a planned follow-up.
+# takes a GCP project and a region instead of an api_key. location defaults
+# to "us-central1" and also picks the regional endpoint host. Auth defaults
+# to Application Default Credentials — a service-account key file
+# (GOOGLE_APPLICATION_CREDENTIALS), `gcloud auth application-default login`,
+# or the GCE/Cloud Run metadata server — with token refresh handled
+# automatically. Set access_token only to pin a STATIC token instead (e.g.
+# `gcloud auth print-access-token` for a quick test; expires ~1h, never
+# refreshed).
+# quota_project (optional) attributes API-call quota/billing to a chosen
+# project (sent as the x-goog-user-project header). Mostly relevant with
+# user-credential ADC or cross-project billing; the principal needs
+# serviceusage.services.use on that project.
 #[classifier.text-embedding-005]
 #project = "my-gcp-project"
 #location = "us-central1"
-#access_token = "${GOOGLE_ACCESS_TOKEN:-}"
+#quota_project = "my-billing-project"       # optional quota/billing project
+#access_token = "${GOOGLE_ACCESS_TOKEN:-}"  # optional static override of ADC
 #base_url = "https://us-central1-aiplatform.googleapis.com"  # optional override
 #max_concurrency = 32
 #request_timeout_secs = 10

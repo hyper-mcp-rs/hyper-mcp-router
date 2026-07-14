@@ -17,14 +17,25 @@
 //! misconfiguration is a clear boot error, not a silent stream of
 //! balanced-default fallbacks.
 //!
-//! ## Auth (Option 1: static token)
+//! ## Auth
 //!
-//! Today the engine sends a single operator-supplied OAuth access token (see
-//! [`TokenSource`]). Vertex tokens (e.g. from `gcloud auth
-//! print-access-token`) expire (~1h), so a long-running process needs an
-//! externally refreshed token. Auto-refreshing Application Default
-//! Credentials is a planned follow-up and slots in behind [`TokenSource`]
-//! without touching the wire code.
+//! By default the engine authenticates via [Application Default Credentials]
+//! (ADC), resolved by `google-cloud-auth`: a service-account key file
+//! (`GOOGLE_APPLICATION_CREDENTIALS`), `gcloud auth application-default
+//! login` user credentials, or the GCE/Cloud Run metadata server — with
+//! token caching and refresh handled by the library. Setting `access_token`
+//! in the engine's config table overrides ADC with a single **static** token
+//! (useful for quick tests; such tokens expire in ~1h and are never
+//! refreshed). See [`TokenSource`].
+//!
+//! An optional `quota_project` attributes API-call quota/billing to a chosen
+//! project via the `x-goog-user-project` header — sent with every request in
+//! **both** auth modes. Mostly relevant with user-credential ADC (user
+//! credentials carry no project) or deliberate cross-project billing; the
+//! principal needs `serviceusage.services.use` on that project.
+//!
+//! [Application Default Credentials]:
+//!     https://cloud.google.com/docs/authentication/application-default-credentials
 //!
 //! ## Privacy and failure notes
 //!
@@ -39,6 +50,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use google_cloud_auth::credentials::{AccessTokenCredentials, Builder as AdcBuilder};
+use reqwest::header::HeaderValue;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
@@ -50,24 +63,63 @@ use crate::engines::embedding::{anchor_texts, build_prototypes, combine_similari
 /// same one for their similarities to be comparable.
 const TASK_TYPE: &str = "SEMANTIC_SIMILARITY";
 
-/// How the engine obtains a Bearer token for the Vertex AI API. Today only a
-/// static, operator-supplied token (Option 1). The async [`bearer`] method is
-/// the seam where auto-refreshing Application Default Credentials will slot in
-/// (a new variant) without changing any of the wire code that awaits it.
-///
-/// [`bearer`]: TokenSource::bearer
+/// OAuth scope requested for ADC tokens; the standard scope for Vertex AI.
+const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+
+/// Header carrying the [quota project](https://cloud.google.com/docs/quotas/quota-project):
+/// which project's API quota is consumed and billed for the call.
+const QUOTA_PROJECT_HEADER: &str = "x-goog-user-project";
+
+/// How the engine obtains a Bearer token for the Vertex AI API: a static,
+/// operator-supplied token (the `access_token` config override), or
+/// Application Default Credentials (the default), whose token caching and
+/// refresh are handled by `google-cloud-auth`.
 enum TokenSource {
     /// A single operator-supplied token; used verbatim, never refreshed.
     Static(String),
+    /// Application Default Credentials; a current token is resolved per call
+    /// (cached and auto-refreshed by the auth library).
+    Adc(AccessTokenCredentials),
 }
 
 impl TokenSource {
-    /// Resolve the Bearer token for one request. Async today only so the ADC
-    /// variant (which fetches/refreshes over the network) can drop in later
-    /// without rippling `.await` through call sites.
+    /// Build the ADC-backed source (used when no static `access_token` is
+    /// configured). Credential *discovery* problems surface here; a broken or
+    /// expired credential surfaces on the first token fetch — either way,
+    /// startup anchor embedding fails fast with an actionable error.
+    fn adc(engine: &str) -> anyhow::Result<Self> {
+        let credentials = AdcBuilder::default()
+            .with_scopes([CLOUD_PLATFORM_SCOPE])
+            .build_access_token_credentials()
+            .with_context(|| {
+                format!(
+                    "classifier engine `{engine}`: no static `access_token` is set in \
+                     [classifier.{engine}], and Application Default Credentials could not \
+                     be loaded (set GOOGLE_APPLICATION_CREDENTIALS, run `gcloud auth \
+                     application-default login`, or configure `access_token`)"
+                )
+            })?;
+        Ok(TokenSource::Adc(credentials))
+    }
+
+    /// Resolve the Bearer token for one request. The ADC arm awaits the auth
+    /// library, which serves a cached token until it nears expiry.
     async fn bearer(&self) -> anyhow::Result<String> {
         match self {
             TokenSource::Static(token) => Ok(token.clone()),
+            TokenSource::Adc(credentials) => Ok(credentials
+                .access_token()
+                .await
+                .context("fetching an ADC access token for Vertex AI")?
+                .token),
+        }
+    }
+
+    /// Auth mode label for the startup log (never the token itself).
+    fn mode(&self) -> &'static str {
+        match self {
+            TokenSource::Static(_) => "static-token",
+            TokenSource::Adc(_) => "adc",
         }
     }
 }
@@ -98,6 +150,8 @@ pub struct VertexEmbedding {
     /// Full regional `:predict` URL.
     url: String,
     token: TokenSource,
+    /// Pre-validated `x-goog-user-project` header value, when configured.
+    quota_project: Option<HeaderValue>,
     /// Bounds concurrent in-flight embedding requests — this engine's
     /// equivalent of the embedded engine's session pool.
     permits: Semaphore,
@@ -108,9 +162,10 @@ pub struct VertexEmbedding {
 }
 
 impl VertexEmbedding {
-    /// Build the engine: validate config (`project` and `access_token` are
-    /// **required** when the engine is selected), construct the HTTP client,
-    /// and embed the class anchors — failing fast on any API problem.
+    /// Build the engine: validate config (`project` is **required** when the
+    /// engine is selected; auth is ADC unless a static `access_token` is
+    /// set), construct the HTTP client, and embed the class anchors —
+    /// failing fast on any API problem.
     pub async fn connect(
         spec: &'static VertexSpec,
         cfg: &VertexEmbeddingConfig,
@@ -130,15 +185,15 @@ impl VertexEmbedding {
                 )
             })?;
 
-        let Some(token) = cfg.access_token.clone() else {
-            anyhow::bail!(
-                "classifier engine `{}` requires an OAuth access token: set `access_token` \
-                 in [classifier.{}] (plaintext, ${{ENV_VAR}}, or a keyring table). \
-                 Tip: `gcloud auth print-access-token`.",
-                spec.name,
-                spec.name,
-            );
+        // Static token if configured, otherwise Application Default
+        // Credentials — built before the HTTP client so a credential
+        // discovery problem is the first thing to fail.
+        let token = match cfg.access_token.clone() {
+            Some(token) => TokenSource::Static(token),
+            None => TokenSource::adc(spec.name)?,
         };
+
+        let quota_project = parse_quota_project(spec.name, cfg.quota_project.as_deref())?;
 
         let location = cfg.location.trim();
         if location.is_empty() {
@@ -173,7 +228,8 @@ impl VertexEmbedding {
             spec,
             http,
             url,
-            token: TokenSource::Static(token),
+            token,
+            quota_project,
             permits: Semaphore::new(max_concurrency),
             image_gen_threshold,
             prototypes: Prototypes::default(),
@@ -192,6 +248,12 @@ impl VertexEmbedding {
             engine = spec.name,
             project,
             location,
+            auth = engine.token.mode(),
+            quota_project = engine
+                .quota_project
+                .as_ref()
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("(unset)"),
             embedding_dims = engine.prototypes.dims(),
             anchor_count = anchors.len(),
             max_concurrency,
@@ -213,11 +275,11 @@ impl VertexEmbedding {
 
         let token = self.token.bearer().await?;
         let body = build_predict_request(texts);
-        let resp = self
-            .http
-            .post(&self.url)
-            .bearer_auth(token)
-            .json(&body)
+        let mut request = self.http.post(&self.url).bearer_auth(token).json(&body);
+        if let Some(quota_project) = &self.quota_project {
+            request = request.header(QUOTA_PROJECT_HEADER, quota_project.clone());
+        }
+        let resp = request
             .send()
             .await
             .context("vertex embeddings request failed")?;
@@ -293,6 +355,27 @@ impl ClassifierEngine for VertexEmbedding {
 // Wire format (network-free, unit-testable)
 // ───────────────────────────────────────────────────────────────────────────
 
+/// Validate the optional quota project into a ready-to-send header value:
+/// whitespace is trimmed, empty counts as absent, and a value that cannot be
+/// an HTTP header fails here at startup — never at request time.
+fn parse_quota_project(
+    engine: &str,
+    quota_project: Option<&str>,
+) -> anyhow::Result<Option<HeaderValue>> {
+    quota_project
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(|q| {
+            HeaderValue::from_str(q).map_err(|_| {
+                anyhow::anyhow!(
+                    "classifier engine `{engine}` has an invalid `quota_project` in \
+                     [classifier.{engine}]: must be a plain ASCII project id"
+                )
+            })
+        })
+        .transpose()
+}
+
 /// Assemble the regional `:predict` endpoint URL. `base` is already trimmed of
 /// any trailing slash.
 fn build_predict_url(base: &str, project: &str, location: &str, api_model: &str) -> String {
@@ -361,6 +444,23 @@ mod tests {
     async fn static_token_source_returns_the_token() {
         let source = TokenSource::Static("tok-123".to_string());
         assert_eq!(source.bearer().await.unwrap(), "tok-123");
+        assert_eq!(source.mode(), "static-token");
+    }
+
+    #[test]
+    fn quota_project_parses_trims_and_rejects() {
+        // Absent and empty (incl. whitespace-only) mean "unset".
+        assert_eq!(parse_quota_project("e", None).unwrap(), None);
+        assert_eq!(parse_quota_project("e", Some("")).unwrap(), None);
+        assert_eq!(parse_quota_project("e", Some("   ")).unwrap(), None);
+        // Valid ids pass through trimmed.
+        let v = parse_quota_project("e", Some("  my-billing-proj ")).unwrap();
+        assert_eq!(v.unwrap().to_str().unwrap(), "my-billing-proj");
+        // A value that cannot be an HTTP header fails fast with the engine id.
+        let err = parse_quota_project("text-embedding-005", Some("bad\nvalue"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("quota_project") && err.contains("text-embedding-005"));
     }
 
     #[test]

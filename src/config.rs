@@ -187,15 +187,28 @@ pub struct VertexEmbeddingConfig {
     /// `base_url` is not overridden.
     #[serde(default = "default_vertex_location")]
     pub location: String,
-    /// OAuth 2.0 Bearer access token for the Vertex AI API. **Required when the
-    /// engine is selected.** Resolves exactly like a routed model's `api_key`
-    /// (a plaintext/env-expanded string or a keyring table); an empty resolved
+    /// Optional [quota project](https://cloud.google.com/docs/quotas/quota-project):
+    /// which project's API quota is consumed and billed for the embed calls,
+    /// sent as the `x-goog-user-project` header on every request (both auth
+    /// modes). Mostly relevant when authenticating as a *user* via
+    /// Application Default Credentials (user credentials carry no project of
+    /// their own) or when deliberately charging API usage to a different
+    /// project than `project`. The authenticating principal needs
+    /// `serviceusage.services.use` on this project. Omit to let Google
+    /// attribute quota by its defaults.
+    #[serde(default)]
+    pub quota_project: Option<String>,
+    /// Static OAuth 2.0 Bearer access token override for the Vertex AI API.
+    /// **Optional**: when omitted, the engine authenticates via Application
+    /// Default Credentials (a service-account key file via
+    /// `GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth application-default
+    /// login` user credentials, or the GCE/Cloud Run metadata server) with
+    /// token caching and refresh handled by `google-cloud-auth`. When set,
+    /// this exact token is used verbatim and **never refreshed** — handy for
+    /// quick tests (`gcloud auth print-access-token`), but such tokens expire
+    /// in ~1h. Resolves exactly like a routed model's `api_key` (a
+    /// plaintext/env-expanded string or a keyring table); an empty resolved
     /// value counts as absent. Never logged.
-    ///
-    /// NOTE (Option 1): this is a *static* token. `gcloud`-printed tokens
-    /// expire (~1h), so a long-running process needs an externally refreshed
-    /// token; auto-refreshing Application Default Credentials is a planned
-    /// follow-up.
     #[serde(default, deserialize_with = "resolve_api_key")]
     pub access_token: Option<String>,
     /// Endpoint override (e.g. a proxy/gateway, or a mock in tests). Must be
@@ -217,6 +230,7 @@ impl Default for VertexEmbeddingConfig {
         VertexEmbeddingConfig {
             project: None,
             location: default_vertex_location(),
+            quota_project: None,
             access_token: None,
             base_url: None,
             max_concurrency: None,
@@ -750,7 +764,7 @@ mod tests {
             "[server]\nhost=\"0.0.0.0\"\nport=1\n\
              [classifier]\nmodel=\"text-embedding-005\"\n\
              [classifier.text-embedding-005]\nproject=\"my-proj\"\nlocation=\"us-east1\"\n\
-             access_token=\"te5-token\"\nmax_concurrency=16\n\
+             quota_project=\"billing-proj\"\naccess_token=\"te5-token\"\nmax_concurrency=16\n\
              [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
         )
         .unwrap();
@@ -758,6 +772,7 @@ mod tests {
         let te5 = &cfg.classifier.text_embedding_005;
         assert_eq!(te5.project.as_deref(), Some("my-proj"));
         assert_eq!(te5.location, "us-east1");
+        assert_eq!(te5.quota_project.as_deref(), Some("billing-proj"));
         assert_eq!(te5.access_token.as_deref(), Some("te5-token"));
         assert_eq!(te5.max_concurrency, Some(16));
     }
@@ -775,6 +790,7 @@ mod tests {
         let te5 = &cfg.classifier.text_embedding_005;
         assert_eq!(te5.location, "us-central1");
         assert_eq!(te5.project, None);
+        assert_eq!(te5.quota_project, None);
         assert_eq!(te5.access_token, None);
         assert_eq!(te5.base_url, None);
     }
