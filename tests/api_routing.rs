@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 use hyper_mcp_router::classifier::{ClassifierEngine, DEFAULT_IMAGE_GEN_THRESHOLD};
 use hyper_mcp_router::config;
-use hyper_mcp_router::engines::zero_shot::ZeroShot;
+use hyper_mcp_router::engines::deberta_v3_xsmall_zeroshot::DebertaV3XsmallZeroshot;
 use hyper_mcp_router::prompt::DEFAULT_TRIVIAL_MAX_WORDS;
 use hyper_mcp_router::proxy::{build_router, AppState, ADVERTISED_MODEL};
 
@@ -38,10 +38,13 @@ use hyper_mcp_router::proxy::{build_router, AppState, ADVERTISED_MODEL};
 // Shared classifier (embedded ONNX model) — loaded once for the whole binary.
 // ───────────────────────────────────────────────────────────────────────────
 
-static CLASSIFIER: LazyLock<Arc<ZeroShot>> = LazyLock::new(|| {
+static CLASSIFIER: LazyLock<Arc<DebertaV3XsmallZeroshot>> = LazyLock::new(|| {
     // Pool of 2 (default ORT intra-op threads) so the pooling path is exercised
     // by the correctness suite without a heavy N-session startup cost.
-    Arc::new(ZeroShot::new(DEFAULT_IMAGE_GEN_THRESHOLD, 2, 0).expect("load embedded classifier"))
+    Arc::new(
+        DebertaV3XsmallZeroshot::new(DEFAULT_IMAGE_GEN_THRESHOLD, 2, 0)
+            .expect("load embedded classifier"),
+    )
 });
 
 /// Every backend name declared by [`mock_config_toml`].
@@ -687,9 +690,10 @@ async fn image_generation_routes_to_image_gen_backend() {
 }
 
 /// The classifier sees at most `current_turn_char_budget()` chars of the
-/// current turn (engine-specific; 400 for zero-shot): an image request within
-/// the budget routes to the image backend, while the same phrase buried past
-/// it is invisible to the image axis and the request degrades to a text route.
+/// current turn (engine-specific; 400 for the embedded deberta engine): an
+/// image request within the budget routes to the image backend, while the
+/// same phrase buried past it is invisible to the image axis and the request
+/// degrades to a text route.
 #[tokio::test]
 async fn image_intent_visibility_follows_engine_current_turn_budget() {
     let h = Harness::start().await;
@@ -1294,7 +1298,8 @@ async fn load_test_progressive_concurrency() {
             .unwrap_or(0);
         println!("(dedicated classifier: pool_size={pool}, intra_op_threads={intra_op})");
         let clf = Arc::new(
-            ZeroShot::new(DEFAULT_IMAGE_GEN_THRESHOLD, pool, intra_op).expect("build classifier"),
+            DebertaV3XsmallZeroshot::new(DEFAULT_IMAGE_GEN_THRESHOLD, pool, intra_op)
+                .expect("build classifier"),
         );
         Harness::start_with_classifier(clf).await
     } else {

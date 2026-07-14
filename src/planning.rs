@@ -122,7 +122,8 @@ pub fn overcommit_warnings(
                 "inference pool may exceed available memory: estimated ~{} MiB \
                  (baseline ~{} MiB + {pool_size} sessions x ~{} MiB, measured under \
                  max-length load) > detected budget {} MiB; risk of OOM kill — \
-                 consider lowering `inference_pool_size` in [classifier.zero-shot]",
+                 consider lowering `inference_pool_size` in \
+                 [classifier.deberta-v3-xsmall-zeroshot]",
                 estimated / (1024 * 1024),
                 BASELINE_MEMORY_BYTES / (1024 * 1024),
                 SESSION_MEMORY_BYTES / (1024 * 1024),

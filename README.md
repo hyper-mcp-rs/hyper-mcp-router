@@ -120,11 +120,15 @@ Request handling notes:
 
 Classification is pluggable behind the `ClassifierEngine` trait
 (`src/classifier.rs`); concrete engines live in `src/engines/`, **one file
-per model**. The active model is selected by the `[classifier] model` config
-setting — **config-only, no CLI flag**: each model brings its own settings in
-a `[classifier.<model>]` table (e.g. `[classifier.zero-shot]` holds
-`inference_pool_size` / `intra_op_threads`, which are meaningless for other
-engines), so the config file is the single source of truth. Everything
+per model**, grouped by provider family (shared family plumbing lives in the
+family's `mod.rs`, e.g. `engines/gemini/`). The active model is selected by
+the `[classifier] model` config setting — **config-only, no CLI flag**: each
+model brings its own settings in
+a `[classifier.<model>]` table (e.g. `[classifier.deberta-v3-xsmall-zeroshot]`
+holds `inference_pool_size` / `intra_op_threads`, which are meaningless for
+other engines), so the config file is the single source of truth. Engine ids
+name the **model**, never the technique — several engines can classify
+zero-shot, but only one is `deberta-v3-xsmall-zeroshot`. Everything
 model-specific is owned by the engine's file — how it is invoked (local
 inference vs. a remote API), how many concurrent "sessions" it runs and how
 they are sized, and how large its context window is. The proxy, window
@@ -134,13 +138,29 @@ and never change when an engine is added.
 
 | Model | File | Interaction | Sessions | Context budgets (window / current turn) |
 |---|---|---|---|---|
-| `zero-shot` (default) | `engines/zero_shot.rs` | embedded ONNX NLI, fully local | ORT session pool, auto-sized by CPU + memory | 1000 / 400 chars (512-token model) |
+| `deberta-v3-xsmall-zeroshot` (default) | `engines/deberta_v3_xsmall_zeroshot.rs` | embedded ONNX NLI, fully local | ORT session pool, auto-sized by CPU + memory | 1000 / 400 chars (512-token model) |
+| `gemini-embedding-001` | `engines/gemini/embedding_001.rs` | remote anchor-prototype embeddings (Gemini API) | concurrent embed calls (default 32) | 6000 / 2000 chars (2048-token model) |
+| `gemini-embedding-2` | `engines/gemini/embedding_2.rs` | remote anchor-prototype embeddings (Gemini API) | concurrent embed calls (default 32) | 24000 / 8000 chars (8192-token model) |
+| `text-embedding-005` | `engines/gemini/text_embedding_005.rs` | remote anchor-prototype embeddings (Gemini API) | concurrent embed calls (default 32) | 6000 / 2000 chars (2048-token model) |
 
 Both budgets are trait methods (`context_char_budget`,
 `current_turn_char_budget`), so an engine backed by a large-context model can
 raise them — e.g. to see image-generation intent expressed deep in a long
 prompt — without touching the routing core. They bound classifier input only;
 forwarded requests are never truncated.
+
+The Gemini engines classify by **anchor prototypes**: at startup they embed a
+curated exemplar set per class (one batched call, failing fast on a bad key or
+unreachable endpoint), mean-pool them into prototype vectors, and per request
+cosine-score the window and current turn against those prototypes. Their
+`api_key` is **required** and resolves exactly like a routed model's key
+(plaintext / `${ENV_VAR}` / OS keyring). Per-request API failures degrade to
+the balanced default like any engine failure.
+
+**Privacy caveat**: the remote engines send prompt text (the classification
+window and current turn) to the Gemini API. The "zero customer-data
+collection, fully local" property in the highlights holds **only for the
+default `deberta-v3-xsmall-zeroshot` engine**.
 
 Adding an engine = one new file in `engines/`, one `ClassifierModel` variant,
 and one `match` arm in `engines::build`. Nothing else changes.
@@ -234,12 +254,12 @@ resources available to the process and sizes the pool to fit **both**:
 
 The plan takes the **minimum** of the two, min 1. The startup log reports
 `detected_cores`, `memory_budget_mb`, `pool_size`, and `intra_op_threads`.
-Explicit `[classifier.zero-shot]` settings are always honored — but a
-configuration the host can't handle (thread oversubscription, or estimated
-memory above the detected budget) logs a **warning** at startup instead of
-failing.
+Explicit `[classifier.deberta-v3-xsmall-zeroshot]` settings are always
+honored — but a configuration the host can't handle (thread oversubscription,
+or estimated memory above the detected budget) logs a **warning** at startup
+instead of failing.
 
-| `[classifier.zero-shot]` setting | Default | Meaning |
+| `[classifier.deberta-v3-xsmall-zeroshot]` setting | Default | Meaning |
 |---|---|---|
 | `inference_pool_size` | auto (min of `cores / 2` and what fits in memory; min 1) | Concurrent inference sessions. Each is an independent in-memory copy of the model. |
 | `intra_op_threads` | auto (`2`) | ONNX Runtime intra-op threads per session (`0` = runtime default). Keep `pool_size × intra_op_threads` near the core count to avoid oversubscription. |
@@ -257,7 +277,7 @@ constants are exactly what the memory-aware auto-plan uses
 (`planning::SESSION_MEMORY_BYTES` / `planning::BASELINE_MEMORY_BYTES`), so an
 unconfigured router already fits its memory budget; an explicit
 `inference_pool_size` beyond it logs a startup warning. Cap it in
-`[classifier.zero-shot]` on memory-constrained hosts.
+`[classifier.deberta-v3-xsmall-zeroshot]` on memory-constrained hosts.
 
 Measured on an 18-core host — per-request latency ~15 ms, essentially unchanged
 by pool size — throughput scales with the pool until the CPU saturates:

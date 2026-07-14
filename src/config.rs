@@ -99,7 +99,7 @@ pub struct ClassifierConfig {
     /// `classifier::ClassifierModel`). **Config-only** — there is no CLI
     /// override, because each model brings its own configuration; different
     /// models mean different config files. Defaults to the embedded
-    /// zero-shot model.
+    /// `deberta-v3-xsmall-zeroshot` model.
     #[serde(default)]
     pub model: ClassifierModel,
     /// Score floor for the image-generation axis (scale is engine-specific;
@@ -109,11 +109,24 @@ pub struct ClassifierConfig {
     /// Word ceiling for the trivial fast-path (`0` disables).
     #[serde(default = "default_trivial_max_words")]
     pub trivial_max_words: usize,
-    /// Settings specific to the `zero-shot` engine (`[classifier.zero-shot]`).
-    /// Ignored unless `model = "zero-shot"`. Engine-specific settings live in
-    /// per-engine tables; a new engine adds its own table here.
-    #[serde(default, rename = "zero-shot")]
-    pub zero_shot: ZeroShotConfig,
+    /// Settings specific to the `deberta-v3-xsmall-zeroshot` engine
+    /// (`[classifier.deberta-v3-xsmall-zeroshot]`). Ignored unless that model
+    /// is selected. Engine-specific settings live in per-engine tables; a new
+    /// engine adds its own table here.
+    #[serde(default, rename = "deberta-v3-xsmall-zeroshot")]
+    pub deberta_v3_xsmall_zeroshot: DebertaV3XsmallZeroshotConfig,
+    /// Settings for the `gemini-embedding-001` engine
+    /// (`[classifier.gemini-embedding-001]`). Ignored unless selected.
+    #[serde(default, rename = "gemini-embedding-001")]
+    pub gemini_embedding_001: GeminiEmbeddingConfig,
+    /// Settings for the `gemini-embedding-2` engine
+    /// (`[classifier.gemini-embedding-2]`). Ignored unless selected.
+    #[serde(default, rename = "gemini-embedding-2")]
+    pub gemini_embedding_2: GeminiEmbeddingConfig,
+    /// Settings for the `text-embedding-005` engine
+    /// (`[classifier.text-embedding-005]`). Ignored unless selected.
+    #[serde(default, rename = "text-embedding-005")]
+    pub text_embedding_005: GeminiEmbeddingConfig,
 }
 
 impl Default for ClassifierConfig {
@@ -122,16 +135,44 @@ impl Default for ClassifierConfig {
             model: ClassifierModel::default(),
             image_generation_threshold: default_image_gen_threshold(),
             trivial_max_words: default_trivial_max_words(),
-            zero_shot: ZeroShotConfig::default(),
+            deberta_v3_xsmall_zeroshot: DebertaV3XsmallZeroshotConfig::default(),
+            gemini_embedding_001: GeminiEmbeddingConfig::default(),
+            gemini_embedding_2: GeminiEmbeddingConfig::default(),
+            text_embedding_005: GeminiEmbeddingConfig::default(),
         }
     }
 }
 
-/// `[classifier.zero-shot]`: settings that only make sense for the embedded
-/// zero-shot engine (local ORT sessions). Other engines have their own
-/// concurrency models and their own tables.
+/// Settings for a Gemini embedding engine (`[classifier.gemini-embedding-*]`).
+/// Remote engines have no local session pool; their "sessions" are concurrent
+/// in-flight API requests.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct ZeroShotConfig {
+pub struct GeminiEmbeddingConfig {
+    /// API key for the Gemini API. **Required when the engine is selected**
+    /// (engine construction fails at startup without it). Resolves exactly
+    /// like a routed model's `api_key`: a plaintext/env-expanded string or a
+    /// `{ source = "keyring", service, user }` table; an empty resolved value
+    /// counts as absent. Never logged.
+    #[serde(default, deserialize_with = "resolve_api_key")]
+    pub api_key: Option<String>,
+    /// Endpoint override (e.g. a proxy/gateway, or a mock in tests). Must be
+    /// http/https. Defaults to the public Gemini API endpoint.
+    #[serde(default, deserialize_with = "deserialize_opt_http_url")]
+    pub base_url: Option<Url>,
+    /// Maximum concurrent embedding requests in flight (this engine's
+    /// "session pool"). Omit for the model's default.
+    #[serde(default)]
+    pub max_concurrency: Option<usize>,
+    /// Per-call total timeout, seconds. Omit for the model's default.
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
+}
+
+/// `[classifier.deberta-v3-xsmall-zeroshot]`: settings that only make sense
+/// for the embedded NLI engine (local ORT sessions). Other engines have
+/// their own concurrency models and their own tables.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DebertaV3XsmallZeroshotConfig {
     /// Concurrent ORT inference sessions. Omit for auto-sizing from the
     /// detected core count and memory budget (see
     /// `planning::plan_inference`). An explicit value larger than the host
@@ -189,13 +230,28 @@ where
     D: Deserializer<'de>,
 {
     let raw = String::deserialize(deserializer)?;
-    let url = Url::parse(&raw)
-        .map_err(|e| de::Error::custom(format!("invalid base_url `{raw}`: {e}")))?;
+    parse_http_url(&raw).map_err(de::Error::custom)
+}
+
+/// Optional variant of [`deserialize_http_url`] for engine `base_url`
+/// overrides: absent stays `None`; present must be a valid http/https URL.
+fn deserialize_opt_http_url<'de, D>(deserializer: D) -> Result<Option<Url>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw: Option<String> = Option::deserialize(deserializer)?;
+    raw.map(|s| parse_http_url(&s).map_err(de::Error::custom))
+        .transpose()
+}
+
+/// Parse and scheme-check an http/https URL, with a readable error.
+fn parse_http_url(raw: &str) -> Result<Url, String> {
+    let url = Url::parse(raw).map_err(|e| format!("invalid base_url `{raw}`: {e}"))?;
     match url.scheme() {
         "http" | "https" => Ok(url),
-        other => Err(de::Error::custom(format!(
+        other => Err(format!(
             "base_url `{raw}` must be an http or https URL, got scheme `{other}`"
-        ))),
+        )),
     }
 }
 
@@ -537,20 +593,34 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.server.stream_idle_timeout_secs, 300);
         assert_eq!(cfg.server.max_body_bytes, 32 * 1024 * 1024);
-        assert_eq!(cfg.classifier.model, ClassifierModel::ZeroShot);
+        assert_eq!(
+            cfg.classifier.model,
+            ClassifierModel::DebertaV3XsmallZeroshot
+        );
         assert_eq!(cfg.classifier.trivial_max_words, DEFAULT_TRIVIAL_MAX_WORDS);
-        assert_eq!(cfg.classifier.zero_shot.inference_pool_size, None);
-        assert_eq!(cfg.classifier.zero_shot.intra_op_threads, None);
+        assert_eq!(
+            cfg.classifier
+                .deberta_v3_xsmall_zeroshot
+                .inference_pool_size,
+            None
+        );
+        assert_eq!(
+            cfg.classifier.deberta_v3_xsmall_zeroshot.intra_op_threads,
+            None
+        );
     }
 
     #[test]
     fn classifier_model_parses_and_rejects_unknown() {
         let cfg = parse(
-            "[server]\nhost=\"0.0.0.0\"\nport=1\n[classifier]\nmodel=\"zero-shot\"\n\
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n[classifier]\nmodel=\"deberta-v3-xsmall-zeroshot\"\n\
              [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
         )
         .unwrap();
-        assert_eq!(cfg.classifier.model, ClassifierModel::ZeroShot);
+        assert_eq!(
+            cfg.classifier.model,
+            ClassifierModel::DebertaV3XsmallZeroshot
+        );
 
         // An unknown model id must be a loud config error, never a silent default.
         let err = parse(
@@ -565,18 +635,97 @@ mod tests {
         let cfg = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\nstream_idle_timeout_secs=42\nmax_body_bytes=1024\n\
              [classifier]\ntrivial_max_words=3\n\
-             [classifier.zero-shot]\ninference_pool_size=4\nintra_op_threads=1\n\
+             [classifier.deberta-v3-xsmall-zeroshot]\ninference_pool_size=4\nintra_op_threads=1\n\
              [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
         )
         .unwrap();
         assert_eq!(cfg.server.stream_idle_timeout_secs, 42);
         assert_eq!(cfg.server.max_body_bytes, 1024);
         assert_eq!(cfg.classifier.trivial_max_words, 3);
-        assert_eq!(cfg.classifier.zero_shot.inference_pool_size, Some(4));
-        assert_eq!(cfg.classifier.zero_shot.intra_op_threads, Some(1));
+        assert_eq!(
+            cfg.classifier
+                .deberta_v3_xsmall_zeroshot
+                .inference_pool_size,
+            Some(4)
+        );
+        assert_eq!(
+            cfg.classifier.deberta_v3_xsmall_zeroshot.intra_op_threads,
+            Some(1)
+        );
     }
 
-    // ── ApiKey resolution ───────────────────────────────────────────────────────────
+    // ── gemini engine tables ─────────────────────────────────────────
+    #[test]
+    fn gemini_engine_tables_parse_with_api_key_resolution() {
+        std::env::set_var("ROUTER_TEST_GEMINI_KEY", "g-key");
+        let cfg = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n\
+             [classifier]\nmodel=\"gemini-embedding-001\"\n\
+             [classifier.gemini-embedding-001]\napi_key=\"${ROUTER_TEST_GEMINI_KEY}\"\n\
+             base_url=\"http://localhost:9\"\nmax_concurrency=8\nrequest_timeout_secs=5\n\
+             [classifier.gemini-embedding-2]\napi_key=\"plain-key\"\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.classifier.model, ClassifierModel::GeminiEmbedding001);
+        let g1 = &cfg.classifier.gemini_embedding_001;
+        // Env-expanded, exactly like a routed model's key.
+        assert_eq!(g1.api_key.as_deref(), Some("g-key"));
+        assert_eq!(
+            g1.base_url.as_ref().unwrap().as_str(),
+            "http://localhost:9/"
+        );
+        assert_eq!(g1.max_concurrency, Some(8));
+        assert_eq!(g1.request_timeout_secs, Some(5));
+        assert_eq!(
+            cfg.classifier.gemini_embedding_2.api_key.as_deref(),
+            Some("plain-key")
+        );
+    }
+
+    #[test]
+    fn text_embedding_005_table_parses() {
+        let cfg = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n\
+             [classifier]\nmodel=\"text-embedding-005\"\n\
+             [classifier.text-embedding-005]\napi_key=\"te5-key\"\nmax_concurrency=16\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.classifier.model, ClassifierModel::TextEmbedding005);
+        assert_eq!(
+            cfg.classifier.text_embedding_005.api_key.as_deref(),
+            Some("te5-key")
+        );
+        assert_eq!(cfg.classifier.text_embedding_005.max_concurrency, Some(16));
+    }
+
+    #[test]
+    fn gemini_table_defaults_and_empty_key_is_none() {
+        // Omitted table: all defaults; empty api_key string counts as absent
+        // (the engine then fails at startup with a clear message).
+        let cfg = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n\
+             [classifier.gemini-embedding-001]\napi_key=\"\"\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.classifier.gemini_embedding_001.api_key, None);
+        assert_eq!(cfg.classifier.gemini_embedding_001.base_url, None);
+        assert_eq!(cfg.classifier.gemini_embedding_2.max_concurrency, None);
+    }
+
+    #[test]
+    fn gemini_base_url_rejects_non_http_scheme() {
+        let err = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n\
+             [classifier.gemini-embedding-001]\nbase_url=\"ftp://x\"\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        );
+        assert!(err.is_err());
+    }
+
+    // ── ApiKey resolution ─────────────────────────────────────────────────────────
     fn parse_single_model(toml: &str) -> RouterConfig {
         parse(toml).expect("config should parse")
     }

@@ -1,10 +1,12 @@
-//! The embedded zero-shot NLI engine (the router's default — fully local,
-//! nothing leaves the process).
+//! The `deberta-v3-xsmall-zeroshot` engine: the embedded zero-shot NLI model
+//! (the router's default — fully local, nothing leaves the process).
 //!
 //! The model is `MoritzLaurer/deberta-v3-xsmall-zeroshot-v1.1-all-33`, a
 //! **binary** NLI model (`id2label = { 0: "entailment", 1: "not_entailment" }`,
 //! `type_vocab_size = 0` — no `token_type_ids`), embedded into the binary at
 //! build time. These facts are load-bearing for the inference code below.
+//! (The engine id drops the `-v1.1-all-33` checkpoint suffix: TOML bare keys
+//! cannot contain dots, and the pinned checkpoint lives in `build.rs`.)
 //!
 //! Model-specific concerns owned by this file: the ORT session pool and its
 //! CPU/memory sizing (via `crate::planning`), the hypothesis set, the
@@ -61,9 +63,9 @@ enum HypothesisKind {
 /// access, allowing up to N inferences to run at once.
 ///
 /// Checkout is **blocking** by design: inference already runs inside
-/// `spawn_blocking` (see [`ZeroShot::classify`]), so parking that
-/// blocking-pool thread until a session frees up is correct and needs no async
-/// machinery.
+/// `spawn_blocking` (see [`DebertaV3XsmallZeroshot::classify`]), so parking
+/// that blocking-pool thread until a session frees up is correct and needs no
+/// async machinery.
 struct SessionPool {
     idle: Mutex<Vec<Session>>,
     available: Condvar,
@@ -144,7 +146,7 @@ impl std::ops::DerefMut for PooledSession<'_> {
 /// The innards live behind an internal `Arc` so [`ClassifierEngine::classify`]
 /// can move a handle onto tokio's blocking pool (the pass is CPU-bound and
 /// must not stall an async worker).
-pub struct ZeroShot {
+pub struct DebertaV3XsmallZeroshot {
     inner: Arc<Inner>,
 }
 
@@ -156,21 +158,24 @@ struct Inner {
     image_gen_threshold: f32,
 }
 
-impl ZeroShot {
+impl DebertaV3XsmallZeroshot {
     /// Construct from config, owning the model-specific sizing: detect cores
     /// and the memory budget, derive the CPU/memory plan (see
-    /// [`crate::planning`]), apply the engine's own `[classifier.zero-shot]`
-    /// settings, and warn — never clamp — on an overcommitted explicit
-    /// configuration.
+    /// [`crate::planning`]), apply the engine's own
+    /// `[classifier.deberta-v3-xsmall-zeroshot]` settings, and warn — never
+    /// clamp — on an overcommitted explicit configuration.
     pub fn from_config(cfg: &ClassifierConfig) -> anyhow::Result<Self> {
         let detected_cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
         let memory_budget = detect_memory_budget();
         let plan = plan_inference(detected_cores, memory_budget);
-        let pool_size = cfg.zero_shot.inference_pool_size.unwrap_or(plan.pool_size);
+        let pool_size = cfg
+            .deberta_v3_xsmall_zeroshot
+            .inference_pool_size
+            .unwrap_or(plan.pool_size);
         let intra_op_threads = cfg
-            .zero_shot
+            .deberta_v3_xsmall_zeroshot
             .intra_op_threads
             .unwrap_or(plan.intra_op_threads);
         for warning in
@@ -184,7 +189,7 @@ impl ZeroShot {
             memory_budget_mb = memory_budget.map(|b| b / (1024 * 1024)),
             pool_size,
             intra_op_threads,
-            "zero-shot inference parallelism configured"
+            "deberta-v3-xsmall-zeroshot inference parallelism configured"
         );
         Ok(engine)
     }
@@ -298,9 +303,9 @@ impl ZeroShot {
 }
 
 #[async_trait]
-impl ClassifierEngine for ZeroShot {
+impl ClassifierEngine for DebertaV3XsmallZeroshot {
     fn name(&self) -> &'static str {
-        "zero-shot"
+        "deberta-v3-xsmall-zeroshot"
     }
 
     fn context_char_budget(&self) -> usize {
@@ -568,7 +573,7 @@ mod tests {
     #[test]
     #[ignore = "loads the embedded ONNX model"]
     fn routing_directionality_guard() {
-        let clf = ZeroShot::new(DEFAULT_IMAGE_GEN_THRESHOLD, 1, 1).unwrap();
+        let clf = DebertaV3XsmallZeroshot::new(DEFAULT_IMAGE_GEN_THRESHOLD, 1, 1).unwrap();
         let simple = clf.classify_sync("hi", "hi", false).unwrap();
         let complex_text = "Derive and rigorously prove the asymptotic time complexity of \
              red-black tree rebalancing across a sequence of insertions and deletions, \

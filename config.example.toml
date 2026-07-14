@@ -34,22 +34,47 @@ max_body_bytes = 33554432
 # brings its own configuration (a [classifier.<model>] table); different
 # classifier models mean different config files.
 [classifier]
-# Which classification model to run (exactly one per process). Currently
-# available: "zero-shot" (the embedded NLI model — fully local, the default).
-model = "zero-shot"
+# Which classification model to run (exactly one per process). Available:
+#   "deberta-v3-xsmall-zeroshot"  embedded NLI model; fully local (default)
+#   "gemini-embedding-001"        remote Gemini embeddings; requires api_key
+#   "gemini-embedding-2"          as above, much larger context window
+#   "text-embedding-005"          remote Gemini embeddings; smaller/cheaper
+# NOTE: the remote engines send prompt text (the classification window and
+# current turn) to the Gemini API; only "deberta-v3-xsmall-zeroshot" keeps
+# everything local.
+model = "deberta-v3-xsmall-zeroshot"
 # Image-generation modality decision (score floor; scale is engine-specific —
-# P(entailment) for the zero-shot engine; default 0.5).
+# P(entailment) for the embedded NLI engine; default 0.5).
 image_generation_threshold = 0.5
 # Word ceiling for the trivial fast-path (0 disables; default 6).
 trivial_max_words = 6
 
-# Settings specific to the zero-shot engine (local ORT inference sessions).
-# Ignored unless model = "zero-shot". Omit either field for auto-sizing from
-# the detected core count and memory budget; explicit values the host can't
-# handle are honored but log a startup warning.
-[classifier.zero-shot]
+# Settings specific to the embedded NLI engine (local ORT inference
+# sessions). Ignored unless model = "deberta-v3-xsmall-zeroshot". Omit either
+# field for auto-sizing from the detected core count and memory budget;
+# explicit values the host can't handle are honored but log a startup warning.
+[classifier.deberta-v3-xsmall-zeroshot]
 #inference_pool_size = 4
 #intra_op_threads = 2
+
+# Settings for the Gemini embedding engines. Ignored unless selected above.
+# api_key is REQUIRED when the engine is selected (startup fails without it)
+# and resolves exactly like a routed model's key: plaintext, env-var
+# expansion, or { source = "keyring", service = "...", user = "..." }.
+# (The ":-" empty default below keeps config loading working when the env
+# var is unset — env expansion runs over the whole file, comments included;
+# a selected engine with an empty key still fails fast with a clear error.)
+#[classifier.gemini-embedding-001]
+#api_key = "${GEMINI_API_KEY:-}"
+#base_url = "https://generativelanguage.googleapis.com"  # optional override
+#max_concurrency = 32          # concurrent embed calls (the "session pool")
+#request_timeout_secs = 10     # per embed call
+
+#[classifier.gemini-embedding-2]
+#api_key = "${GEMINI_API_KEY:-}"
+
+#[classifier.text-embedding-005]
+#api_key = "${GEMINI_API_KEY:-}"
 
 # `api_key` resolves three ways (below), or may be omitted entirely for a
 # keyless backend (e.g. a local Ollama / vLLM / LM Studio server, or a gateway

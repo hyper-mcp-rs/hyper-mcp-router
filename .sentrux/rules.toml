@@ -5,20 +5,22 @@
 #
 #     main                (binary entry point: CLI, logging, startup, axum bind)
 #       ├─ proxy          (HTTP surface, routing, forwarding, SSE passthrough)
-#       │    └─ config         (TOML load, model catalogue, select_model)
+#       │    └─ config         (TOML load, model catalogue, per-engine tables)
 #       │         └─ classifier    (ClassifierEngine trait, Classification,
 #       │              │            ModelTier, ClassifierModel selector — the
 #       │              │            hub; NO concrete engines)
 #       │              └─ modality / prompt / planning   (foundational leaves)
-#       └─ engines        (one file per model; implements the trait; owns all
+#       └─ engines        (one file per model, grouped by provider family —
+#                          e.g. engines/gemini/ keeps shared family plumbing
+#                          in its mod.rs. Implements the trait; owns all
 #                          model-specific sizing. Constructed ONLY by main via
 #                          engines::build — the proxy never sees a concrete
 #                          engine, only Arc<dyn ClassifierEngine>)
 #
 #   cli.rs and logging.rs are cross-cutting infrastructure leaves used only by
-#   main. cli.rs may reference declarative *types* from the classifier hub
-#   (ClassifierModel is a clap ValueEnum) but must never touch concrete
-#   engines or request handling.
+#   main. Since classifier selection became config-only, cli.rs imports
+#   NOTHING from this crate — it is pure argument parsing (--config,
+#   --log-stdout) and must stay that way.
 #
 # Dependencies must always flow downward. These rules make that non-negotiable.
 # The load-bearing inversion: classifier (the trait hub) must NEVER import
@@ -33,11 +35,13 @@ max_cycles = 0
 max_cc = 30
 
 # Cap file length. Ceiling leaves room for test-heavy files while still flagging
-# runaway *production* growth. The largest file is tests/api_routing.rs (~1300),
-# a pure integration-test file; production files are dominated by their inline
-# `#[cfg(test)]` modules. `no_god_files` is intentionally NOT enabled: its
-# hard-coded 500-line threshold would false-positive on files that are large
-# only because of their tests.
+# runaway *production* growth. The largest file is tests/api_routing.rs (~1340 —
+# close to the limit; split it by concern rather than raising the ceiling when
+# it trips), a pure integration-test file; production files are dominated by
+# their inline `#[cfg(test)]` modules (engine-family integration tests already
+# get their own file, e.g. tests/gemini_engine.rs). `no_god_files` is
+# intentionally NOT enabled: its hard-coded 500-line threshold would
+# false-positive on files that are large only because of their tests.
 max_file_lines = 1400
 
 # Overall inter-module coupling grade ceiling.
@@ -62,8 +66,8 @@ max_coupling = "B"
 #
 # lib.rs (the crate root that also holds the embedded model bytes) is
 # intentionally left unlayered: as the root it declares every module and is
-# referenced by engines/zero_shot.rs for MODEL_BYTES, which does not fit a
-# strict linear order.
+# referenced by engines/deberta_v3_xsmall_zeroshot.rs for MODEL_BYTES, which
+# does not fit a strict linear order.
 
 [[layers]]
 name = "app"
@@ -113,7 +117,17 @@ reason = "The proxy is engine-agnostic: it sees Arc<dyn ClassifierEngine> only. 
 [[boundaries]]
 from = "src/cli.rs"
 to = "src/engines"
-reason = "CLI parsing must stay declarative — it may name a model (ClassifierModel), never construct or invoke one."
+reason = "CLI parsing must stay pure argument parsing; engines are selected and configured via the config file only."
+
+[[boundaries]]
+from = "src/cli.rs"
+to = "src/classifier.rs"
+reason = "Classifier selection is config-only; the CLI must not name, construct, or reference classification types."
+
+[[boundaries]]
+from = "src/cli.rs"
+to = "src/config.rs"
+reason = "The CLI hands main a path; it must never load or interpret configuration itself."
 
 [[boundaries]]
 from = "src/cli.rs"

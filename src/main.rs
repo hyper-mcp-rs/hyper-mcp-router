@@ -36,7 +36,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     //    session pools, thread counts, memory planning, overcommit warnings —
     //    is owned by the engine itself, configured via its own
     //    `[classifier.<model>]` table (see `engines/`).
-    let classifier = engines::build(&cfg.classifier).with_context(|| {
+    let classifier = engines::build(&cfg.classifier).await.with_context(|| {
         format!(
             "initialising classifier engine `{}`",
             cfg.classifier.model.as_str()

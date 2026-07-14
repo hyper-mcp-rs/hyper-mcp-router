@@ -63,17 +63,35 @@ impl Classification {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClassifierModel {
-    /// The embedded zero-shot NLI model (`deberta-v3-xsmall-zeroshot`) —
-    /// fully local, no data leaves the process. The default.
+    /// The embedded `deberta-v3-xsmall-zeroshot` NLI model — fully local, no
+    /// data leaves the process. The default. (The id names the *model*, not
+    /// the technique: other engines can also classify zero-shot.)
     #[default]
-    ZeroShot,
+    #[serde(rename = "deberta-v3-xsmall-zeroshot")]
+    DebertaV3XsmallZeroshot,
+    /// Google `gemini-embedding-001` — remote anchor-prototype embedding
+    /// classification. Requires an API key; prompt text is sent to the
+    /// Gemini API for classification.
+    #[serde(rename = "gemini-embedding-001")]
+    GeminiEmbedding001,
+    /// Google `gemini-embedding-2` — as above, with a larger context window.
+    #[serde(rename = "gemini-embedding-2")]
+    GeminiEmbedding2,
+    /// Google `text-embedding-005` — remote anchor-prototype embedding
+    /// classification on the smaller/cheaper text-embedding model. Requires
+    /// an API key; prompt text is sent to the Gemini API.
+    #[serde(rename = "text-embedding-005")]
+    TextEmbedding005,
 }
 
 impl ClassifierModel {
     /// Kebab-case wire name (the `[classifier] model` config value).
     pub fn as_str(self) -> &'static str {
         match self {
-            ClassifierModel::ZeroShot => "zero-shot",
+            ClassifierModel::DebertaV3XsmallZeroshot => "deberta-v3-xsmall-zeroshot",
+            ClassifierModel::GeminiEmbedding001 => "gemini-embedding-001",
+            ClassifierModel::GeminiEmbedding2 => "gemini-embedding-2",
+            ClassifierModel::TextEmbedding005 => "text-embedding-005",
         }
     }
 }
@@ -138,15 +156,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifier_model_default_is_zero_shot() {
-        assert_eq!(ClassifierModel::default(), ClassifierModel::ZeroShot);
-        assert_eq!(ClassifierModel::default().as_str(), "zero-shot");
+    fn classifier_model_default_is_the_embedded_deberta() {
+        assert_eq!(
+            ClassifierModel::default(),
+            ClassifierModel::DebertaV3XsmallZeroshot
+        );
+        assert_eq!(
+            ClassifierModel::default().as_str(),
+            "deberta-v3-xsmall-zeroshot"
+        );
     }
 
     #[test]
     fn classifier_model_deserializes_from_kebab_case() {
-        let m: ClassifierModel = serde_json::from_str("\"zero-shot\"").unwrap();
-        assert_eq!(m, ClassifierModel::ZeroShot);
+        for (wire, expected) in [
+            (
+                "\"deberta-v3-xsmall-zeroshot\"",
+                ClassifierModel::DebertaV3XsmallZeroshot,
+            ),
+            (
+                "\"gemini-embedding-001\"",
+                ClassifierModel::GeminiEmbedding001,
+            ),
+            ("\"gemini-embedding-2\"", ClassifierModel::GeminiEmbedding2),
+            ("\"text-embedding-005\"", ClassifierModel::TextEmbedding005),
+        ] {
+            let m: ClassifierModel = serde_json::from_str(wire).unwrap();
+            assert_eq!(m, expected);
+            // The wire name and as_str must always agree.
+            assert_eq!(format!("\"{}\"", m.as_str()), wire);
+        }
         // Unknown model ids must fail loudly, not fall back silently.
         assert!(serde_json::from_str::<ClassifierModel>("\"not-a-model\"").is_err());
     }

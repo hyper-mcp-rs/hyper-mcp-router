@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Measure per-inference-session memory empirically.
 #
-# Starts the router with different [classifier.zero-shot] inference_pool_size
-# values (generating a config per run), records RSS after startup (weights
+# Starts the router with different [classifier.deberta-v3-xsmall-zeroshot]
+# inference_pool_size values (generating a config per run), records RSS after
+# startup (weights
 # materialized) and again after a burst of max-length classification requests
 # (activation arenas grown), then divides the deltas by the pool-size
 # difference. Fixed costs (binary, embedded model bytes, tokio runtime) cancel
@@ -64,7 +65,7 @@ port = $PORT
 connect_timeout_secs = 1
 request_timeout_secs = 5
 
-[classifier.zero-shot]
+[classifier.deberta-v3-xsmall-zeroshot]
 inference_pool_size = $pool
 intra_op_threads = 2
 
