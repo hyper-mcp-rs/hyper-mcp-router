@@ -246,7 +246,7 @@ the detected budget) logs a **warning** at startup instead of failing.
 
 Because each session is a full in-memory copy of the embedded ~87 MB model, a
 larger pool uses proportionally more memory. Measured
-(`scripts/measure_session_memory.sh`, macOS, debug profile): **~105 MB per
+(`measure_session_memory.sh`, macOS, debug profile): **~105 MB per
 session at startup** (weights), growing to **~190 MB per session under
 sustained max-length load** — ONNX Runtime's arena allocator retains the
 worst-case activation memory it has seen. Both scale linearly with pool size,
@@ -286,7 +286,7 @@ classifier scales with conversation depth), `LOAD_POOL_SIZE` / `LOAD_INTRA_OP`
 (build a dedicated classifier to sweep pool size).
 
 Per-session **memory** is measured separately by
-`scripts/measure_session_memory.sh`, which starts the router at two pool
+`measure_session_memory.sh` (repo root), which starts the router at two pool
 sizes, records RSS after startup and after a burst of max-length requests,
 and divides the deltas (fixed costs cancel out). Overrides: `PROFILE`
 (`debug`/`release`), `POOLS` (e.g. `"1 4"`), `REQUESTS`, `PORT`.

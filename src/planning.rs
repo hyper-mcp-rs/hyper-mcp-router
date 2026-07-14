@@ -10,8 +10,9 @@
 //! get the instance OOM-killed.
 //!
 //! The per-session and baseline costs are **measured**, not guessed — see
-//! `scripts/measure_session_memory.sh` (weights ~105 MB/session at startup,
-//! ~190 MB/session under sustained max-length load, ~420 MB fixed baseline).
+//! `measure_session_memory.sh` at the repo root (weights ~105 MB/session at
+//! startup, ~190 MB/session under sustained max-length load, ~420 MB fixed
+//! baseline).
 
 /// Measured steady-state memory cost per inference session under sustained
 /// max-length load (weights + retained activation arena), rounded up.

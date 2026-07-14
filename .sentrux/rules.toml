@@ -1,17 +1,28 @@
 # Architectural constraints for hyper-mcp-router, enforced by `sentrux check .`
 # (and surfaced to the agent via the `check_rules` MCP tool).
 #
-# The crate is a strict, acyclic layering:
+# The crate is a strict, acyclic layering around a pluggable classifier:
 #
-#     main            (binary entry point: CLI, logging, startup, axum bind)
-#       └─ proxy      (HTTP surface, routing, forwarding, SSE passthrough)
-#            └─ config      (TOML load, model catalogue, select_model)
-#                 └─ classifier  (NLI types + inference + pure helpers)
+#     main                (binary entry point: CLI, logging, startup, axum bind)
+#       ├─ proxy          (HTTP surface, routing, forwarding, SSE passthrough)
+#       │    └─ config         (TOML load, model catalogue, select_model)
+#       │         └─ classifier    (ClassifierEngine trait, Classification,
+#       │              │            ModelTier, ClassifierModel selector — the
+#       │              │            hub; NO concrete engines)
+#       │              └─ modality / prompt / planning   (foundational leaves)
+#       └─ engines        (one file per model; implements the trait; owns all
+#                          model-specific sizing. Constructed ONLY by main via
+#                          engines::build — the proxy never sees a concrete
+#                          engine, only Arc<dyn ClassifierEngine>)
 #
-#   cli.rs and logging.rs are cross-cutting infrastructure leaves: used only by
-#   main, and depending on nothing else in the crate.
+#   cli.rs and logging.rs are cross-cutting infrastructure leaves used only by
+#   main. cli.rs may reference declarative *types* from the classifier hub
+#   (ClassifierModel is a clap ValueEnum) but must never touch concrete
+#   engines or request handling.
 #
 # Dependencies must always flow downward. These rules make that non-negotiable.
+# The load-bearing inversion: classifier (the trait hub) must NEVER import
+# engines — adding a model must only ever add code under src/engines/.
 
 [constraints]
 # The layering is acyclic by design; keep it that way.
@@ -22,15 +33,14 @@ max_cycles = 0
 max_cc = 30
 
 # Cap file length. Ceiling leaves room for test-heavy files while still flagging
-# runaway *production* growth. The largest files are dominated by tests, not
-# logic: classifier.rs (~1100) is mostly its inline `#[cfg(test)]` module, and
-# tests/api_routing.rs (~1250) is a pure integration-test file. `no_god_files`
-# is intentionally NOT enabled: its hard-coded 500-line threshold would
-# false-positive on files that are large only because of their tests.
+# runaway *production* growth. The largest file is tests/api_routing.rs (~1300),
+# a pure integration-test file; production files are dominated by their inline
+# `#[cfg(test)]` modules. `no_god_files` is intentionally NOT enabled: its
+# hard-coded 500-line threshold would false-positive on files that are large
+# only because of their tests.
 max_file_lines = 1400
 
-# Overall inter-module coupling grade ceiling. A four-module linear chain should
-# stay well within this.
+# Overall inter-module coupling grade ceiling.
 max_coupling = "B"
 
 # ── Layers ────────────────────────────────────────────────────────────────────
@@ -41,13 +51,19 @@ max_coupling = "B"
 # NOTE: this is the direction the installed sentrux (v0.5.x) actually enforces,
 # which is inverted from the phrasing in the public docs at sentrux.dev
 # ("lower order = more foundational"). The ordering below is chosen to match the
-# tool's real behaviour so every genuine dependency
-# (main -> proxy -> config -> classifier) flows low -> high and validates.
+# tool's real behaviour so every genuine dependency flows low -> high:
+#
+#   main(0) -> proxy(1) -> config(3) -> classifier(4) -> {modality,prompt,planning}(5)
+#   main(0) -> engines(2) -> config(3) / classifier(4) / planning(5)
+#
+# engines sits between proxy and config: it may reach down into config,
+# classifier, and the foundational leaves, while nothing below main may reach
+# into it.
 #
 # lib.rs (the crate root that also holds the embedded model bytes) is
-# intentionally left unlayered: as the root it both declares every module and is
-# referenced by the foundational classifier for MODEL_BYTES, which does not fit
-# a strict linear order.
+# intentionally left unlayered: as the root it declares every module and is
+# referenced by engines/zero_shot.rs for MODEL_BYTES, which does not fit a
+# strict linear order.
 
 [[layers]]
 name = "app"
@@ -60,23 +76,44 @@ paths = ["src/proxy.rs"]
 order = 1
 
 [[layers]]
+name = "engines"
+paths = ["src/engines/**"]
+order = 2
+
+[[layers]]
 name = "config"
 paths = ["src/config.rs"]
-order = 2
+order = 3
 
 [[layers]]
 name = "classifier"
 paths = ["src/classifier.rs"]
-order = 3
+order = 4
+
+[[layers]]
+name = "foundation"
+paths = ["src/modality.rs", "src/prompt.rs", "src/planning.rs"]
+order = 5
 
 # ── Boundaries ────────────────────────────────────────────────────────────────
 # Sharp, explicit invariants — including for the unlayered infrastructure leaves
-# (cli.rs, logging.rs), which layer ordering alone does not constrain.
+# (cli.rs, logging.rs), which layer ordering alone does not constrain. The
+# first two are the plugin architecture's load-bearing walls.
+
+[[boundaries]]
+from = "src/classifier.rs"
+to = "src/engines"
+reason = "The trait hub must never know concrete engines; adding a model must only add code under src/engines/."
+
+[[boundaries]]
+from = "src/proxy.rs"
+to = "src/engines"
+reason = "The proxy is engine-agnostic: it sees Arc<dyn ClassifierEngine> only. Engines are constructed exclusively by main via engines::build."
 
 [[boundaries]]
 from = "src/cli.rs"
-to = "src/classifier.rs"
-reason = "CLI parsing must stay declarative — no domain/inference logic."
+to = "src/engines"
+reason = "CLI parsing must stay declarative — it may name a model (ClassifierModel), never construct or invoke one."
 
 [[boundaries]]
 from = "src/cli.rs"
@@ -86,7 +123,7 @@ reason = "CLI parsing must not depend on request handling."
 [[boundaries]]
 from = "src/logging.rs"
 to = "src/classifier.rs"
-reason = "Logging is cross-cutting infrastructure; it must not depend on the classifier."
+reason = "Logging is cross-cutting infrastructure; it must not depend on the classification domain."
 
 [[boundaries]]
 from = "src/logging.rs"
@@ -101,4 +138,4 @@ reason = "Config sits below the proxy; it must not reach up into request handlin
 [[boundaries]]
 from = "src/classifier.rs"
 to = "src/config.rs"
-reason = "The classifier is the foundation; it must not depend on configuration."
+reason = "The classification hub sits below config; it must not depend on configuration."

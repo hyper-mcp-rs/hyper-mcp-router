@@ -14,7 +14,7 @@
 # and harmless.
 #
 # Usage:
-#   scripts/measure_session_memory.sh
+#   ./measure_session_memory.sh
 #
 # Environment overrides:
 #   PROFILE=release|debug   cargo profile to build/measure (default: debug)
@@ -23,7 +23,7 @@
 #   PORT=8199               router port (default: 8199)
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")"
 
 PROFILE=${PROFILE:-debug}
 POOLS_STR=${POOLS:-"1 4"}
