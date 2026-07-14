@@ -164,9 +164,11 @@ runs**: `api_key` (plaintext / `${ENV_VAR}` / OS keyring) selects the
 Generative Language engine in `gemini/`, while `project` selects the Vertex
 AI engine in `vertex/` (setting both is a startup error).
 `text-embedding-005` is published only on **Vertex AI**. The `vertex/` family
-takes a GCP `project` and `location` (plus an optional `quota_project` for
-quota/billing attribution), authenticating via **Application Default
-Credentials** (service-account key file, `gcloud auth application-default
+takes a GCP `project` and `location` — both required, and `location` has
+**no default**: it determines model availability, data residency, and the
+endpoint host (a region like `us-central1`, or `global`) — plus an optional
+`quota_project` for quota/billing attribution, authenticating via
+**Application Default Credentials** (service-account key file, `gcloud auth application-default
 login`, or the GCE/Cloud Run metadata server — token refresh handled by
 `google-cloud-auth`), with an optional static `access_token` override for
 quick tests. Per-request API failures degrade to

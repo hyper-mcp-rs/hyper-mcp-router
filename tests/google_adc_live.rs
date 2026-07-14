@@ -7,7 +7,7 @@
 //!
 //! Ignored by default (needs credentials + network + a GCP project with
 //! Vertex AI enabled). Run with:
-//!   TE005_PROJECT=<proj> cargo test --test google_adc_live -- --ignored --nocapture
+//!   VERTEX_TEST_PROJECT=<proj> cargo test --test google_adc_live -- --ignored --nocapture
 //! Auth: Application Default Credentials (`gcloud auth application-default
 //! login`).
 
@@ -19,10 +19,10 @@ use hyper_mcp_router::proxy::{build_router, AppState, ADVERTISED_MODEL};
 use hyper_mcp_router::{config, engines};
 
 #[tokio::test]
-#[ignore = "hits the live Vertex AI OpenAI-compatible endpoint; needs TE005_PROJECT + ADC"]
+#[ignore = "hits the live Vertex AI OpenAI-compatible endpoint; needs VERTEX_TEST_PROJECT + ADC"]
 async fn google_adc_routed_model_completes_live() {
-    let Ok(project) = std::env::var("TE005_PROJECT") else {
-        panic!("set TE005_PROJECT to run this test");
+    let Ok(project) = std::env::var("VERTEX_TEST_PROJECT") else {
+        panic!("set VERTEX_TEST_PROJECT to run this test");
     };
 
     let toml = format!(

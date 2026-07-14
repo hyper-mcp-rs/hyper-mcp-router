@@ -41,17 +41,23 @@ pub struct RemoteEmbeddingConfig {
 /// Vertex, so it needs a GCP `project`, a `location`, and an OAuth Bearer
 /// `access_token` instead of a plain `api_key`. Also the transport slice
 /// consumed by `engines/vertex` for every Vertex engine.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct VertexEmbeddingConfig {
     /// GCP project id. **Required when the engine is selected** (engine
     /// construction fails at startup without it).
     #[serde(default)]
     pub project: Option<String>,
-    /// Vertex AI region, e.g. `us-central1`. Also selects the default regional
-    /// endpoint host (`https://{location}-aiplatform.googleapis.com`) when
-    /// `base_url` is not overridden.
-    #[serde(default = "default_vertex_location")]
-    pub location: String,
+    /// Vertex AI location. **Required when the engine is selected —
+    /// deliberately no default**: the location determines model availability
+    /// (some of the newest models are served only at multi-region `us`/`eu`
+    /// or `global`), data residency, and the endpoint host, so the operator
+    /// must choose it. A hyphenated region such as `us-central1` selects the
+    /// regional host (`https://{location}-aiplatform.googleapis.com`);
+    /// multi-region (`us`, `eu`) and `global` locations select the bare
+    /// `https://aiplatform.googleapis.com`. Ignored when `base_url` is
+    /// overridden (but still required).
+    #[serde(default)]
+    pub location: Option<String>,
     /// Optional [quota project](https://cloud.google.com/docs/quotas/quota-project):
     /// which project's API quota is consumed and billed for the embed calls,
     /// sent as the `x-goog-user-project` header on every request (both auth
@@ -90,24 +96,6 @@ pub struct VertexEmbeddingConfig {
     pub request_timeout_secs: Option<u64>,
 }
 
-impl Default for VertexEmbeddingConfig {
-    fn default() -> Self {
-        VertexEmbeddingConfig {
-            project: None,
-            location: default_vertex_location(),
-            quota_project: None,
-            access_token: None,
-            base_url: None,
-            max_concurrency: None,
-            request_timeout_secs: None,
-        }
-    }
-}
-
-fn default_vertex_location() -> String {
-    "us-central1".to_string()
-}
-
 /// Which Google API surface an engine talks to. The gemini-embedding models
 /// are published on **both**; from the router's perspective these are two
 /// completely different engines (different endpoint layout, wire format, and
@@ -127,7 +115,7 @@ pub enum GoogleApi {
 /// ([`VertexEmbeddingConfig`]). **The auth fields choose the surface** — see
 /// [`Self::surface`]: `api_key` means Generative Language; `project` (with
 /// ADC or `access_token`) means Vertex. Setting both is a startup error.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct GoogleEmbeddingConfig {
     /// Generative-Language credential. Setting it selects that surface.
     /// Resolves like a routed model's static key; empty counts as absent.
@@ -137,10 +125,11 @@ pub struct GoogleEmbeddingConfig {
     /// GCP project id. Setting it selects the **Vertex AI** surface.
     #[serde(default)]
     pub project: Option<String>,
-    /// Vertex AI region (see [`VertexEmbeddingConfig::location`]). Ignored on
-    /// the Generative-Language surface.
-    #[serde(default = "default_vertex_location")]
-    pub location: String,
+    /// Vertex AI location (see [`VertexEmbeddingConfig::location`]):
+    /// **required on the Vertex surface, deliberately no default**. Ignored
+    /// on the Generative-Language surface.
+    #[serde(default)]
+    pub location: Option<String>,
     /// Optional Vertex quota project (see
     /// [`VertexEmbeddingConfig::quota_project`]). Ignored on the
     /// Generative-Language surface.
@@ -160,21 +149,6 @@ pub struct GoogleEmbeddingConfig {
     /// Per-call total timeout, seconds.
     #[serde(default)]
     pub request_timeout_secs: Option<u64>,
-}
-
-impl Default for GoogleEmbeddingConfig {
-    fn default() -> Self {
-        GoogleEmbeddingConfig {
-            api_key: None,
-            project: None,
-            location: default_vertex_location(),
-            quota_project: None,
-            access_token: None,
-            base_url: None,
-            max_concurrency: None,
-            request_timeout_secs: None,
-        }
-    }
 }
 
 impl GoogleEmbeddingConfig {
@@ -292,16 +266,17 @@ mod tests {
         assert_eq!(cfg.classifier.model, ClassifierModel::TextEmbedding005);
         let te5 = &cfg.classifier.text_embedding_005;
         assert_eq!(te5.project.as_deref(), Some("my-proj"));
-        assert_eq!(te5.location, "us-east1");
+        assert_eq!(te5.location.as_deref(), Some("us-east1"));
         assert_eq!(te5.quota_project.as_deref(), Some("billing-proj"));
         assert_eq!(te5.access_token.as_deref(), Some("te5-token"));
         assert_eq!(te5.max_concurrency, Some(16));
     }
 
     #[test]
-    fn text_embedding_005_defaults_location_and_empty_token_is_none() {
-        // Omitted table: location defaults, project/token absent, and an empty
-        // access_token counts as absent (the engine then fails fast).
+    fn text_embedding_005_omitted_fields_stay_absent() {
+        // Omitted table: project/token absent, and — deliberately — NO
+        // location default (the engine requires an explicit choice at build);
+        // an empty access_token counts as absent.
         let cfg = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n\
              [classifier.text-embedding-005]\naccess_token=\"\"\n\
@@ -309,7 +284,7 @@ mod tests {
         )
         .unwrap();
         let te5 = &cfg.classifier.text_embedding_005;
-        assert_eq!(te5.location, "us-central1");
+        assert_eq!(te5.location, None, "location must never default");
         assert_eq!(te5.project, None);
         assert_eq!(te5.quota_project, None);
         assert_eq!(te5.access_token, None);
@@ -361,7 +336,7 @@ mod tests {
         // The vertex slice carries everything the vertex transport needs.
         let v = g.to_vertex();
         assert_eq!(v.project.as_deref(), Some("p"));
-        assert_eq!(v.location, "europe-west4");
+        assert_eq!(v.location.as_deref(), Some("europe-west4"));
         assert_eq!(v.quota_project.as_deref(), Some("q"));
         assert_eq!(v.access_token.as_deref(), Some("tok"));
         assert_eq!(v.max_concurrency, Some(4));

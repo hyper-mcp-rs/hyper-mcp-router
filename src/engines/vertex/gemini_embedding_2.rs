@@ -4,19 +4,19 @@
 //! directory for the surface-split rationale). `project` in
 //! `[classifier.gemini-embedding-2]` selects this engine.
 //!
-//! NOTE: unlike its `-001` sibling, this engine could not be live-verified at
-//! the time of writing — the model returned NOT_FOUND in the test project
-//! (`us-central1` and `global`), likely a rollout/allowlist gap. The wire
-//! format is the shared, live-verified Vertex `:predict` contract; treat the
-//! first production selection of this engine as the availability check (it
-//! fails fast at startup if the model is absent).
+//! Unlike its `-001` sibling this model has **no `:predict` surface** on
+//! Vertex; it is served only through `:embedContent`, and only at the `us`
+//! multi-region and `global` locations (both live-verified — regional
+//! locations return NOT_FOUND). It therefore rides the [`VertexEmbedContent`]
+//! transport flavor: one text per request, concurrent fan-out for batches.
+//! Configure `location = "us"` (or `"global"`).
 //!
 //! Privacy note: selecting this engine sends prompt text (the classification
 //! window and current turn) to the Vertex AI API.
 
 use crate::config::ClassifierConfig;
 
-use super::{VertexEmbedding, VertexSpec};
+use super::{VertexEmbedContent, VertexSpec};
 
 /// Model-specific parameters for `gemini-embedding-2` on Vertex AI.
 pub const SPEC: VertexSpec = VertexSpec {
@@ -43,8 +43,8 @@ const _: () = {
 
 /// Build the engine from the Vertex slice of its
 /// `[classifier.gemini-embedding-2]` table.
-pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<VertexEmbedding> {
-    VertexEmbedding::connect(
+pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<VertexEmbedContent> {
+    VertexEmbedContent::connect(
         &SPEC,
         &cfg.gemini_embedding_2.to_vertex(),
         cfg.image_generation_threshold,

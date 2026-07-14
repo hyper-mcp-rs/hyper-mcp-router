@@ -107,13 +107,23 @@ async fn mock_embed(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let texts: Vec<String> = body["instances"]
-        .as_array()
-        .unwrap_or(&Vec::new())
-        .iter()
-        .filter_map(|i| i["content"].as_str())
-        .map(str::to_owned)
-        .collect();
+    // Two wire flavors share this mock: `:predict` batches texts in
+    // `instances[].content`; `:embedContent` carries exactly one text in
+    // `content.parts[0].text`.
+    let texts: Vec<String> = if let Some(instances) = body["instances"].as_array() {
+        instances
+            .iter()
+            .filter_map(|i| i["content"].as_str())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        body["content"]["parts"][0]["text"]
+            .as_str()
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+    };
+    let is_embed_content = body.get("instances").is_none();
 
     state.calls.lock().unwrap().push(EmbedCall {
         path: uri.path().to_string(),
@@ -136,16 +146,19 @@ async fn mock_embed(
             .unwrap();
     }
 
-    let predictions: Vec<Value> = texts
-        .iter()
-        .map(|t| json!({"embeddings": {"values": mock_embedding(t)}}))
-        .collect();
+    let payload = if is_embed_content {
+        json!({"embedding": {"values": mock_embedding(&texts[0])}})
+    } else {
+        let predictions: Vec<Value> = texts
+            .iter()
+            .map(|t| json!({"embeddings": {"values": mock_embedding(t)}}))
+            .collect();
+        json!({"predictions": predictions})
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({"predictions": predictions})).unwrap(),
-        ))
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap()
 }
 
@@ -437,24 +450,26 @@ async fn chit_chat_routes_fast_with_zero_embed_calls() {
     );
 }
 
-/// gemini-embedding-001 with a Vertex-shaped table (`project` instead of
-/// `api_key`) builds the SEPARATE Vertex engine — same model name as the
-/// `gemini/` twin, but this endpoint layout, wire format, and auth.
-#[tokio::test]
-async fn gemini_embedding_001_on_vertex_uses_predict_endpoint() {
-    let (embed_addr, embed) = spawn_mock_vertex().await;
-    let (chat_addr, _chat) = spawn_mock_chat().await;
-    let toml = format!(
+/// Config for a gemini-embedding model on the **Vertex** surface: `project`
+/// instead of `api_key`, so the auth-driven dispatch picks the Vertex twin.
+fn gemini_twin_config_toml(
+    model: &str,
+    location: &str,
+    embed_addr: SocketAddr,
+    chat_addr: SocketAddr,
+) -> String {
+    format!(
         r#"
 [server]
 host = "127.0.0.1"
 port = 0
 
 [classifier]
-model = "gemini-embedding-001"
+model = "{model}"
 
-[classifier.gemini-embedding-001]
+[classifier.{model}]
 project = "test-project"
+location = "{location}"
 access_token = "test-vertex-token"
 base_url = "http://{embed_addr}"
 
@@ -464,14 +479,36 @@ base_url = "http://{chat_addr}"
 type = "fast"
 modalities = ["text"]
 "#
-    );
+    )
+}
+
+/// Build a gemini-embedding twin against the mock and return (engine, calls).
+async fn build_gemini_twin(
+    model: &str,
+    location: &str,
+) -> (
+    std::sync::Arc<dyn hyper_mcp_router::classifier::ClassifierEngine>,
+    Vec<EmbedCall>,
+) {
+    let (embed_addr, embed) = spawn_mock_vertex().await;
+    let (chat_addr, _chat) = spawn_mock_chat().await;
+    let toml = gemini_twin_config_toml(model, location, embed_addr, chat_addr);
     let cfg = config::parse(&toml).expect("parse config");
     let engine = engines::build(&cfg.classifier).await.expect("build engine");
+    let calls = embed.calls.lock().unwrap().clone();
+    (engine, calls)
+}
+
+/// gemini-embedding-001 with a Vertex-shaped table (`project` instead of
+/// `api_key`) builds the SEPARATE Vertex engine — same model name as the
+/// `gemini/` twin, but this endpoint layout, wire format, and auth.
+#[tokio::test]
+async fn gemini_embedding_001_on_vertex_uses_predict_endpoint() {
+    let (engine, calls) = build_gemini_twin("gemini-embedding-001", "us-central1").await;
     assert_eq!(engine.name(), "gemini-embedding-001");
     assert_eq!(engine.context_char_budget(), 6_000);
     assert_eq!(engine.current_turn_char_budget(), 2_000);
 
-    let calls = embed.calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 1, "anchor embedding call");
     assert!(
         calls[0]
@@ -481,6 +518,71 @@ modalities = ["text"]
         calls[0].path
     );
     assert_eq!(calls[0].bearer.as_deref(), Some("test-vertex-token"));
+}
+
+/// Shared assertions for gemini-embedding-2's Vertex twin at a location: the
+/// model has no `:predict` or batch surface, so anchors must FAN OUT as
+/// concurrent single-text `:embedContent` calls, each carrying auth.
+async fn assert_gemini_2_fanout_at(location: &str) {
+    let (engine, calls) = build_gemini_twin("gemini-embedding-2", location).await;
+    assert_eq!(engine.name(), "gemini-embedding-2");
+    assert_eq!(engine.context_char_budget(), 24_000);
+    assert_eq!(engine.current_turn_char_budget(), 8_000);
+
+    assert!(
+        calls.len() >= 12,
+        "anchors must fan out as one call per text, got {}",
+        calls.len()
+    );
+    let expected_path =
+        format!("/locations/{location}/publishers/google/models/gemini-embedding-2:embedContent");
+    for call in &calls {
+        assert!(
+            call.path.contains(&expected_path),
+            "unexpected endpoint path: {}",
+            call.path
+        );
+        assert_eq!(
+            call.text_count, 1,
+            "embedContent carries exactly one text per request"
+        );
+        assert_eq!(call.bearer.as_deref(), Some("test-vertex-token"));
+    }
+}
+
+/// gemini-embedding-2's Vertex twin at the `us` multi-region (the location
+/// where the model is live-verified to be served).
+#[tokio::test]
+async fn gemini_embedding_2_on_vertex_us_fans_out_embed_content() {
+    assert_gemini_2_fanout_at("us").await;
+}
+
+/// gemini-embedding-2's Vertex twin at `global` (also live-verified).
+#[tokio::test]
+async fn gemini_embedding_2_on_vertex_global_fans_out_embed_content() {
+    assert_gemini_2_fanout_at("global").await;
+}
+
+/// The location is mandatory and deliberately has NO default: it determines
+/// model availability, data residency, and the endpoint host, so a selected
+/// Vertex engine without one must fail at startup naming the options.
+#[tokio::test]
+async fn missing_location_fails_engine_build() {
+    let (embed_addr, _embed) = spawn_mock_vertex().await;
+    let (chat_addr, _chat) = spawn_mock_chat().await;
+    let toml =
+        vertex_config_toml(embed_addr, chat_addr).replace("location = \"us-central1\"\n", "");
+    let cfg = config::parse(&toml).expect("config parses without the location");
+    let msg = match engines::build(&cfg.classifier).await {
+        Ok(_) => panic!("engine build must fail without a location"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("requires a `location`")
+            && msg.contains("us-central1")
+            && msg.contains("global"),
+        "unhelpful error: {msg}"
+    );
 }
 
 /// The GCP project is mandatory: a selected Vertex engine without one must

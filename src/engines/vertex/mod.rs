@@ -1,7 +1,16 @@
 //! The Vertex AI embedding engine family: shared transport here in `mod.rs`,
 //! **one file per model** in this directory (`text_embedding_005.rs`,
 //! `gemini_embedding_001.rs`, `gemini_embedding_2.rs`), each defining a
-//! [`VertexSpec`] and delegating to the shared [`VertexEmbedding`] engine.
+//! [`VertexSpec`] and delegating to one of the two transport flavors:
+//!
+//! - [`VertexEmbedding`] — the legacy `PredictionService` flavor
+//!   (`:predict`, `instances`/`predictions`, true batching). Serves the
+//!   gecko-lineage models (`text-embedding-005`) and `gemini-embedding-001`.
+//! - [`VertexEmbedContent`] — the Gemini-API flavor (`:embedContent`,
+//!   `content.parts`/`embedding.values`, **one text per request** — batches
+//!   fan out as concurrent calls). Gemini-native models such as
+//!   `gemini-embedding-2` are served **only** through this method
+//!   (live-verified: `:predict` is 404 for them everywhere).
 //!
 //! The gemini-embedding models also exist on the Generative Language API
 //! (the `gemini/` family) — same model, **different engine**: the auth
@@ -11,8 +20,8 @@
 //! Vertex AI is a **separate API from the Gemini Developer API** used by the
 //! `gemini/` family: some embedding models (notably `text-embedding-005`) are
 //! published only on Vertex. This file owns what is Vertex-specific: the
-//! regional `publishers/google/models/<model>:predict` endpoint layout, the
-//! `instances`/`predictions` wire format, and OAuth Bearer auth.
+//! `publishers/google/models/<model>` endpoint layout (regional, multi-region
+//! and global hosts), both wire formats, and OAuth Bearer auth.
 //!
 //! The classification *method* (anchor prototypes, cosine scoring) is
 //! provider-neutral and lives in `crate::engines::embedding`.
@@ -53,6 +62,7 @@ pub mod gemini_embedding_001;
 pub mod gemini_embedding_2;
 pub mod text_embedding_005;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -158,16 +168,25 @@ pub struct VertexEmbedding {
     prototypes: Prototypes,
 }
 
-impl VertexEmbedding {
-    /// Build the engine: validate config (`project` is **required** when the
-    /// engine is selected; auth is ADC unless a static `access_token` is
-    /// set), construct the HTTP client, and embed the class anchors —
-    /// failing fast on any API problem.
-    pub async fn connect(
-        spec: &'static VertexSpec,
-        cfg: &VertexEmbeddingConfig,
-        image_gen_threshold: f32,
-    ) -> anyhow::Result<Self> {
+/// Everything both transport flavors need before their first request:
+/// validated `project`/`location`, resolved auth, the quota header, the HTTP
+/// client, and the endpoint base. One `establish` call per engine build.
+struct VertexSetup {
+    project: String,
+    location: String,
+    base: String,
+    token: TokenSource,
+    quota_project: Option<HeaderValue>,
+    http: reqwest::Client,
+    timeout: u64,
+    max_concurrency: usize,
+}
+
+impl VertexSetup {
+    /// Validate config and resolve auth (`project` and `location` are
+    /// **required** when the engine is selected; auth is ADC unless a static
+    /// `access_token` is set). Fails fast with actionable messages.
+    fn establish(spec: &'static VertexSpec, cfg: &VertexEmbeddingConfig) -> anyhow::Result<Self> {
         let project = cfg
             .project
             .as_deref()
@@ -192,21 +211,30 @@ impl VertexEmbedding {
 
         let quota_project = parse_quota_project(spec.name, cfg.quota_project.as_deref())?;
 
-        let location = cfg.location.trim();
-        if location.is_empty() {
-            anyhow::bail!(
-                "classifier engine `{}` has an empty `location` in [classifier.{}]",
-                spec.name,
-                spec.name,
-            );
-        }
+        // Deliberately no default: the location determines model
+        // availability (some models are multi-region/global-only), data
+        // residency, and the endpoint host, so the operator must choose it
+        // consciously.
+        let location = cfg
+            .location
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "classifier engine `{}` requires a `location` in [classifier.{}] \
+                     (a Vertex region such as \"us-central1\", a multi-region such as \
+                     \"us\", or \"global\")",
+                    spec.name,
+                    spec.name,
+                )
+            })?;
 
         let base = cfg
             .base_url
             .as_ref()
             .map(|u| u.as_str().trim_end_matches('/').to_string())
-            .unwrap_or_else(|| format!("https://{location}-aiplatform.googleapis.com"));
-        let url = build_predict_url(&base, project, location, spec.api_model);
+            .unwrap_or_else(|| vertex_host(location));
 
         let timeout = cfg
             .request_timeout_secs
@@ -221,13 +249,122 @@ impl VertexEmbedding {
             .unwrap_or(spec.default_max_concurrency)
             .max(1);
 
-        let mut engine = VertexEmbedding {
-            spec,
-            http,
-            url,
+        Ok(VertexSetup {
+            project: project.to_string(),
+            location: location.to_string(),
+            base,
             token,
             quota_project,
-            permits: Semaphore::new(max_concurrency),
+            http,
+            timeout,
+            max_concurrency,
+        })
+    }
+}
+
+/// The setup facts worth echoing in the startup log, retained past the point
+/// where [`VertexSetup`]'s other fields move into the engine.
+struct SetupSummary {
+    project: String,
+    location: String,
+    max_concurrency: usize,
+    timeout: u64,
+}
+
+impl VertexSetup {
+    /// Snapshot the loggable facts before the setup is consumed.
+    fn summary(&self) -> SetupSummary {
+        SetupSummary {
+            project: self.project.clone(),
+            location: self.location.clone(),
+            max_concurrency: self.max_concurrency,
+            timeout: self.timeout,
+        }
+    }
+}
+
+/// Emit the shared "engine ready" startup log (never the token).
+fn log_ready(
+    spec: &VertexSpec,
+    transport: &'static str,
+    summary: &SetupSummary,
+    auth: &'static str,
+    quota_project: Option<&HeaderValue>,
+    dims: usize,
+    anchor_count: usize,
+) {
+    tracing::info!(
+        engine = spec.name,
+        transport,
+        project = summary.project.as_str(),
+        location = summary.location.as_str(),
+        auth,
+        quota_project = quota_project
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("(unset)"),
+        embedding_dims = dims,
+        anchor_count,
+        max_concurrency = summary.max_concurrency,
+        request_timeout_secs = summary.timeout,
+        "vertex embedding engine ready"
+    );
+}
+
+/// POST an embedding request with Bearer auth and the optional quota-project
+/// header; check the status and parse the JSON body. Shared by both Vertex
+/// transport flavors. Never echoes user text into errors.
+async fn post_embed(
+    http: &reqwest::Client,
+    url: &str,
+    bearer: &str,
+    quota_project: Option<&HeaderValue>,
+    body: &Value,
+) -> anyhow::Result<Value> {
+    let mut request = http.post(url).bearer_auth(bearer).json(body);
+    if let Some(quota_project) = quota_project {
+        request = request.header(QUOTA_PROJECT_HEADER, quota_project.clone());
+    }
+    let resp = request
+        .send()
+        .await
+        .context("vertex embeddings request failed")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        // The error body is the API's, not user content; truncate anyway.
+        let detail: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect();
+        anyhow::bail!("vertex embeddings returned {status}: {detail}");
+    }
+    resp.json()
+        .await
+        .context("vertex embeddings response was not JSON")
+}
+
+impl VertexEmbedding {
+    /// Build the engine and embed the class anchors in one `:predict` batch —
+    /// failing fast on any config or API problem.
+    pub async fn connect(
+        spec: &'static VertexSpec,
+        cfg: &VertexEmbeddingConfig,
+        image_gen_threshold: f32,
+    ) -> anyhow::Result<Self> {
+        let setup = VertexSetup::establish(spec, cfg)?;
+        let summary = setup.summary();
+        let url = build_predict_url(&setup.base, &setup.project, &setup.location, spec.api_model);
+
+        let mut engine = VertexEmbedding {
+            spec,
+            http: setup.http,
+            url,
+            token: setup.token,
+            quota_project: setup.quota_project,
+            permits: Semaphore::new(setup.max_concurrency),
             image_gen_threshold,
             prototypes: Prototypes::default(),
         };
@@ -241,21 +378,14 @@ impl VertexEmbedding {
             .with_context(|| format!("embedding class anchors for `{}`", spec.name))?;
         engine.prototypes = build_prototypes(&embeddings)?;
 
-        tracing::info!(
-            engine = spec.name,
-            project,
-            location,
-            auth = engine.token.mode(),
-            quota_project = engine
-                .quota_project
-                .as_ref()
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("(unset)"),
-            embedding_dims = engine.prototypes.dims(),
-            anchor_count = anchors.len(),
-            max_concurrency,
-            request_timeout_secs = timeout,
-            "vertex embedding engine ready"
+        log_ready(
+            spec,
+            "predict",
+            &summary,
+            engine.token.mode(),
+            engine.quota_project.as_ref(),
+            engine.prototypes.dims(),
+            anchors.len(),
         );
         Ok(engine)
     }
@@ -270,34 +400,16 @@ impl VertexEmbedding {
             .await
             .map_err(|_| anyhow::anyhow!("embedding concurrency semaphore closed"))?;
 
-        let token = self.token.bearer().await?;
+        let bearer = self.token.bearer().await?;
         let body = build_predict_request(texts);
-        let mut request = self.http.post(&self.url).bearer_auth(token).json(&body);
-        if let Some(quota_project) = &self.quota_project {
-            request = request.header(QUOTA_PROJECT_HEADER, quota_project.clone());
-        }
-        let resp = request
-            .send()
-            .await
-            .context("vertex embeddings request failed")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            // The error body is the API's, not user content; truncate anyway.
-            let detail: String = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(300)
-                .collect();
-            anyhow::bail!("vertex embeddings returned {status}: {detail}");
-        }
-
-        let value: Value = resp
-            .json()
-            .await
-            .context("vertex embeddings response was not JSON")?;
+        let value = post_embed(
+            &self.http,
+            &self.url,
+            &bearer,
+            self.quota_project.as_ref(),
+            &body,
+        )
+        .await?;
         parse_embeddings(&value, texts.len())
     }
 }
@@ -348,9 +460,158 @@ impl ClassifierEngine for VertexEmbedding {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────
+// The `embedContent` transport flavor
+// ───────────────────────────────────────────────────────────────────────
+
+/// A Vertex engine for Gemini-native embedding models served **only**
+/// through the `embedContent` method (`gemini-embedding-2`): no `:predict`,
+/// no batch method — every request embeds exactly one text, and multi-text
+/// embeds (the startup anchors, the two per-request premises) fan out as
+/// concurrent calls bounded by the semaphore. Live-verified at the `us`
+/// multi-region and `global` locations.
+pub struct VertexEmbedContent {
+    spec: &'static VertexSpec,
+    http: reqwest::Client,
+    /// Full `:embedContent` URL.
+    url: String,
+    token: TokenSource,
+    /// Pre-validated `x-goog-user-project` header value, when configured.
+    quota_project: Option<HeaderValue>,
+    /// Bounds concurrent in-flight embedding requests. `Arc` because the
+    /// fan-out spawns owned tasks.
+    permits: Arc<Semaphore>,
+    /// Cosine-similarity floor for the image axis (see
+    /// `crate::engines::embedding`).
+    image_gen_threshold: f32,
+    prototypes: Prototypes,
+}
+
+impl VertexEmbedContent {
+    /// Build the engine and embed the class anchors as a concurrent fan-out
+    /// of single-text calls — failing fast on any config or API problem.
+    pub async fn connect(
+        spec: &'static VertexSpec,
+        cfg: &VertexEmbeddingConfig,
+        image_gen_threshold: f32,
+    ) -> anyhow::Result<Self> {
+        let setup = VertexSetup::establish(spec, cfg)?;
+        let summary = setup.summary();
+        let url =
+            build_embed_content_url(&setup.base, &setup.project, &setup.location, spec.api_model);
+
+        let mut engine = VertexEmbedContent {
+            spec,
+            http: setup.http,
+            url,
+            token: setup.token,
+            quota_project: setup.quota_project,
+            permits: Arc::new(Semaphore::new(setup.max_concurrency)),
+            image_gen_threshold,
+            prototypes: Prototypes::default(),
+        };
+
+        let anchors = anchor_texts();
+        let embeddings = engine
+            .embed_all(&anchors)
+            .await
+            .with_context(|| format!("embedding class anchors for `{}`", spec.name))?;
+        engine.prototypes = build_prototypes(&embeddings)?;
+
+        log_ready(
+            spec,
+            "embed-content",
+            &summary,
+            engine.token.mode(),
+            engine.quota_project.as_ref(),
+            engine.prototypes.dims(),
+            anchors.len(),
+        );
+        Ok(engine)
+    }
+
+    /// Embed every text as its own `:embedContent` call, concurrently,
+    /// bounded by the semaphore; results return in input order. The Bearer
+    /// token is resolved once per fan-out. Never echoes the texts into
+    /// errors.
+    async fn embed_all(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let bearer = self.token.bearer().await?;
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, text) in texts.iter().enumerate() {
+            let http = self.http.clone();
+            let url = self.url.clone();
+            let bearer = bearer.clone();
+            let quota_project = self.quota_project.clone();
+            let permits = Arc::clone(&self.permits);
+            let body = build_embed_content_request(text);
+            tasks.spawn(async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("embedding concurrency semaphore closed"))?;
+                let value = post_embed(&http, &url, &bearer, quota_project.as_ref(), &body).await?;
+                Ok::<_, anyhow::Error>((index, parse_embed_content(&value)?))
+            });
+        }
+
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); texts.len()];
+        while let Some(joined) = tasks.join_next().await {
+            let (index, values) = joined.context("embedding task panicked")??;
+            out[index] = values;
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl ClassifierEngine for VertexEmbedContent {
+    fn name(&self) -> &'static str {
+        self.spec.name
+    }
+
+    fn context_char_budget(&self) -> usize {
+        self.spec.context_char_budget
+    }
+
+    fn current_turn_char_budget(&self) -> usize {
+        self.spec.current_turn_char_budget
+    }
+
+    async fn classify(
+        &self,
+        complexity_premise: &str,
+        image_premise: &str,
+        lexical_image_match: bool,
+    ) -> anyhow::Result<Classification> {
+        // An empty current turn cannot carry image intent; don't send an empty
+        // text to the API (the embeddings endpoint rejects empty content).
+        let image_text = image_premise.trim();
+        let texts: Vec<&str> = if image_text.is_empty() {
+            vec![complexity_premise]
+        } else {
+            vec![complexity_premise, image_text]
+        };
+
+        let embeddings = self.embed_all(&texts).await?;
+        let image_embedding = if image_text.is_empty() {
+            None
+        } else {
+            Some(embeddings[1].as_slice())
+        };
+
+        Ok(combine_similarities(
+            &embeddings[0],
+            image_embedding,
+            &self.prototypes,
+            lexical_image_match,
+            self.image_gen_threshold,
+        ))
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // Wire format (network-free, unit-testable)
-// ───────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────
 
 /// Validate the optional quota project into a ready-to-send header value:
 /// whitespace is trimmed, empty counts as absent, and a value that cannot be
@@ -373,12 +634,58 @@ fn parse_quota_project(
         .transpose()
 }
 
+/// Default endpoint host for a Vertex location. Proper regions are always
+/// hyphenated (`us-central1`, `europe-west4`) and get the prefixed regional
+/// host; multi-region (`us`, `eu`) and `global` locations are served from
+/// the bare host — prefixed hosts like `us-aiplatform.googleapis.com` do not
+/// exist (the API answers `Invalid hostname`; verified live).
+fn vertex_host(location: &str) -> String {
+    if location.contains('-') {
+        format!("https://{location}-aiplatform.googleapis.com")
+    } else {
+        "https://aiplatform.googleapis.com".to_string()
+    }
+}
+
 /// Assemble the regional `:predict` endpoint URL. `base` is already trimmed of
 /// any trailing slash.
 fn build_predict_url(base: &str, project: &str, location: &str, api_model: &str) -> String {
     format!(
         "{base}/v1/projects/{project}/locations/{location}/publishers/google/models/{api_model}:predict"
     )
+}
+
+/// Assemble the `:embedContent` endpoint URL (v1beta1 — the version the
+/// Gemini-native embedding models answer on; live-verified).
+fn build_embed_content_url(base: &str, project: &str, location: &str, api_model: &str) -> String {
+    format!(
+        "{base}/v1beta1/projects/{project}/locations/{location}/publishers/google/models/{api_model}:embedContent"
+    )
+}
+
+/// Build one `:embedContent` request body — exactly one text per request
+/// (the method has no batch form for these models).
+fn build_embed_content_request(text: &str) -> Value {
+    json!({
+        "content": { "parts": [{ "text": text }] },
+        "taskType": TASK_TYPE,
+    })
+}
+
+/// Extract the single embedding vector from an `:embedContent` response.
+fn parse_embed_content(value: &Value) -> anyhow::Result<Vec<f32>> {
+    let values = value
+        .get("embedding")
+        .and_then(|e| e.get("values"))
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("vertex response missing `embedding.values`"))?;
+    if values.is_empty() {
+        anyhow::bail!("vertex returned an empty embedding vector");
+    }
+    Ok(values
+        .iter()
+        .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+        .collect())
 }
 
 /// Build the `:predict` request body. An `instances` array batches every text
@@ -461,6 +768,24 @@ mod tests {
     }
 
     #[test]
+    fn vertex_host_maps_regions_multiregions_and_global() {
+        // Hyphenated regions get the prefixed regional host.
+        assert_eq!(
+            vertex_host("us-central1"),
+            "https://us-central1-aiplatform.googleapis.com"
+        );
+        assert_eq!(
+            vertex_host("europe-west4"),
+            "https://europe-west4-aiplatform.googleapis.com"
+        );
+        // Multi-region and global locations live on the bare host (their
+        // prefixed hosts do not exist — live-verified `Invalid hostname`).
+        assert_eq!(vertex_host("us"), "https://aiplatform.googleapis.com");
+        assert_eq!(vertex_host("eu"), "https://aiplatform.googleapis.com");
+        assert_eq!(vertex_host("global"), "https://aiplatform.googleapis.com");
+    }
+
+    #[test]
     fn predict_url_is_the_regional_publisher_path() {
         let url = build_predict_url(
             "https://us-central1-aiplatform.googleapis.com",
@@ -484,6 +809,35 @@ mod tests {
         assert_eq!(instances[1]["content"], "b");
         assert_eq!(instances[0]["task_type"], "SEMANTIC_SIMILARITY");
         assert_eq!(body["parameters"]["autoTruncate"], true);
+    }
+
+    #[test]
+    fn embed_content_url_and_request_shape() {
+        let url = build_embed_content_url(
+            "https://aiplatform.googleapis.com",
+            "my-proj",
+            "us",
+            "gemini-embedding-2",
+        );
+        assert_eq!(
+            url,
+            "https://aiplatform.googleapis.com/v1beta1/projects/my-proj/locations/us/\
+             publishers/google/models/gemini-embedding-2:embedContent"
+        );
+
+        let body = build_embed_content_request("hello");
+        assert_eq!(body["content"]["parts"][0]["text"], "hello");
+        assert_eq!(body["taskType"], "SEMANTIC_SIMILARITY");
+    }
+
+    #[test]
+    fn parse_embed_content_happy_path_and_errors() {
+        let ok = serde_json::json!({"embedding": {"values": [1.0, 2.0]}, "usageMetadata": {}});
+        assert_eq!(parse_embed_content(&ok).unwrap(), vec![1.0, 2.0]);
+        // Missing and empty vectors are loud errors.
+        assert!(parse_embed_content(&serde_json::json!({})).is_err());
+        let empty = serde_json::json!({"embedding": {"values": []}});
+        assert!(parse_embed_content(&empty).is_err());
     }
 
     #[test]

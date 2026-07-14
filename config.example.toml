@@ -63,9 +63,9 @@ trivial_max_words = 6
 #   api_key  -> Generative Language API (generativelanguage.googleapis.com);
 #               resolves like a routed model's key (plaintext, env-var
 #               expansion, or a keyring table)
-#   project  -> Vertex AI (regional aiplatform endpoint); auth via ADC by
-#               default, or a static access_token override; location,
-#               quota_project as for text-embedding-005 below
+#   project  -> Vertex AI; auth via ADC by default, or a static access_token
+#               override; location is then REQUIRED (a region, or "global"),
+#               quota_project optional — as for text-embedding-005 below
 # Setting both (or neither) fails fast at startup.
 # (The ":-" empty default below keeps config loading working when the env
 # var is unset — env expansion runs over the whole file, comments included;
@@ -73,7 +73,7 @@ trivial_max_words = 6
 #[classifier.gemini-embedding-001]
 #api_key = "${GEMINI_API_KEY:-}"   # Generative Language API…
 ##project = "my-gcp-project"       # …OR Vertex AI (never both)
-##location = "us-central1"
+##location = "us-central1"         # REQUIRED with project (a region/"global")
 #base_url = "https://generativelanguage.googleapis.com"  # optional override
 #max_concurrency = 32          # concurrent embed calls (the "session pool")
 #request_timeout_secs = 10     # per embed call
@@ -82,21 +82,24 @@ trivial_max_words = 6
 #api_key = "${GEMINI_API_KEY:-}"
 
 # text-embedding-005 is published only on Vertex AI (a different API), so it
-# takes a GCP project and a region instead of an api_key. location defaults
-# to "us-central1" and also picks the regional endpoint host. Auth defaults
-# to Application Default Credentials — a service-account key file
-# (GOOGLE_APPLICATION_CREDENTIALS), `gcloud auth application-default login`,
-# or the GCE/Cloud Run metadata server — with token refresh handled
-# automatically. Set access_token only to pin a STATIC token instead (e.g.
-# `gcloud auth print-access-token` for a quick test; expires ~1h, never
-# refreshed).
+# takes a GCP project and a location instead of an api_key. location is
+# REQUIRED with no default — it determines model availability (some of the
+# newest models are served only at multi-region "us"/"eu" or "global"), data
+# residency, and the endpoint host: a hyphenated region like "us-central1"
+# maps to https://us-central1-aiplatform.googleapis.com, while multi-region
+# ("us", "eu") and "global" map to https://aiplatform.googleapis.com. Auth defaults to Application Default
+# Credentials — a service-account key file (GOOGLE_APPLICATION_CREDENTIALS),
+# `gcloud auth application-default login`, or the GCE/Cloud Run metadata
+# server — with token refresh handled automatically. Set access_token only
+# to pin a STATIC token instead (e.g. `gcloud auth print-access-token` for a
+# quick test; expires ~1h, never refreshed).
 # quota_project (optional) attributes API-call quota/billing to a chosen
 # project (sent as the x-goog-user-project header). Mostly relevant with
 # user-credential ADC or cross-project billing; the principal needs
 # serviceusage.services.use on that project.
 #[classifier.text-embedding-005]
 #project = "my-gcp-project"
-#location = "us-central1"
+#location = "us-central1"                   # REQUIRED: a region, or "global"
 #quota_project = "my-billing-project"       # optional quota/billing project
 #access_token = "${GOOGLE_ACCESS_TOKEN:-}"  # optional static override of ADC
 #base_url = "https://us-central1-aiplatform.googleapis.com"  # optional override
