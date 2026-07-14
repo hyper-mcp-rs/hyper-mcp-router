@@ -245,8 +245,10 @@ struct RouteResolution {
 /// None` records the skip, logged honestly rather than as a fabricated tier.
 async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
     let mut required = detect_required_modalities(body);
+    // How much of the current turn the classifier (and the lexical prefilter)
+    // sees is model-specific — the engine declares its budget.
     let current_turn = extract_prompt(body)
-        .map(|p| truncate_prompt(&p))
+        .map(|p| truncate_prompt(&p, state.classifier.current_turn_char_budget()))
         .unwrap_or_default();
     let lexical_image = looks_like_image_generation(&current_turn);
     let mut image_source: Option<&'static str> = if required.contains(Modality::ImageOutput) {

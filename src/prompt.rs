@@ -10,9 +10,6 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-/// Prompt-length guard, in **characters** (never bytes — see [`truncate_prompt`]).
-const PROMPT_CHAR_LIMIT: usize = 400;
-
 /// Default upper word count for the trivial fast-path (see [`looks_trivial`]).
 /// Overridable via the `--trivial-max-words` CLI flag or the
 /// `[classifier] trivial_max_words` config setting. Keeps the short-circuit
@@ -212,12 +209,17 @@ pub fn build_classification_window(
     Some(collected.join("\n"))
 }
 
-/// Truncate the prompt to [`PROMPT_CHAR_LIMIT`] **characters** (never byte
-/// slicing, which would panic on a multi-byte UTF-8 boundary). A conservative
-/// guard for small classifier context windows; the full request JSON is always
-/// forwarded unchanged to the backend.
-pub fn truncate_prompt(prompt: &str) -> String {
-    prompt.chars().take(PROMPT_CHAR_LIMIT).collect()
+/// Truncate the prompt to `max_chars` **characters** (never byte slicing,
+/// which would panic on a multi-byte UTF-8 boundary).
+///
+/// The budget is **model-specific**: each engine declares how much of the
+/// current turn it wants to see via
+/// `ClassifierEngine::current_turn_char_budget` (400 for the small embedded
+/// zero-shot model; a remote embedding engine with a large context window may
+/// choose far more). This only bounds what the *classifier* sees — the full
+/// request JSON is always forwarded unchanged to the backend.
+pub fn truncate_prompt(prompt: &str, max_chars: usize) -> String {
+    prompt.chars().take(max_chars).collect()
 }
 
 #[cfg(test)]
@@ -489,18 +491,21 @@ mod tests {
         assert!(extract_prompt(&body).is_none());
     }
 
-    // ── truncate_prompt ─────────────────────────────────────────────────────
+    // ── truncate_prompt ─────────────────────────────────────────────
     #[test]
-    fn truncate_takes_400_chars() {
+    fn truncate_respects_the_given_budget() {
         let long = "a".repeat(1000);
-        assert_eq!(truncate_prompt(&long).chars().count(), 400);
+        assert_eq!(truncate_prompt(&long, 400).chars().count(), 400);
+        assert_eq!(truncate_prompt(&long, 8000).chars().count(), 1000);
+        assert_eq!(truncate_prompt(&long, 0).chars().count(), 0);
     }
 
     #[test]
     fn truncate_handles_multibyte_utf8_without_panicking() {
-        // Each '😀' is 4 bytes; byte slicing at 400 would panic on a boundary.
+        // Each '😀' is 4 bytes; byte slicing at a 400-char budget would panic
+        // on a boundary.
         let s = "😀".repeat(500);
-        let truncated = truncate_prompt(&s);
+        let truncated = truncate_prompt(&s, 400);
         assert_eq!(truncated.chars().count(), 400);
     }
 }

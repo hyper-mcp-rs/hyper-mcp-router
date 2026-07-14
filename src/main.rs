@@ -52,6 +52,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     tracing::info!(
         engine = classifier.name(),
         context_char_budget = classifier.context_char_budget(),
+        current_turn_char_budget = classifier.current_turn_char_budget(),
         "classifier engine ready"
     );
 

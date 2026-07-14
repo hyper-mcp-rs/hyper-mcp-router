@@ -36,6 +36,15 @@ const MODEL_MAX_TOKENS: usize = 512;
 /// truncation is the hard backstop.
 const CLASSIFICATION_CHAR_BUDGET: usize = 1000;
 
+/// Character budget for the current turn (the image premise / lexical
+/// prefilter input). Tight for three model-specific reasons: (1) 400 chars
+/// ≈ 100–130 tokens, comfortably inside the 512-token ceiling alongside a
+/// hypothesis; (2) all rows of the NLI batch pad to the longest row, so a
+/// short image row keeps the whole pass cheap; (3) image-generation intent
+/// is a front-of-prompt property for prompts this small model can judge at
+/// all. Engines with larger context windows are free to choose much more.
+const CURRENT_TURN_CHAR_BUDGET: usize = 400;
+
 /// Which axis (and which value on that axis) a given hypothesis string informs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HypothesisKind {
@@ -296,6 +305,10 @@ impl ClassifierEngine for ZeroShot {
 
     fn context_char_budget(&self) -> usize {
         CLASSIFICATION_CHAR_BUDGET
+    }
+
+    fn current_turn_char_budget(&self) -> usize {
+        CURRENT_TURN_CHAR_BUDGET
     }
 
     /// Categorise in a single batched forward pass, then combine the

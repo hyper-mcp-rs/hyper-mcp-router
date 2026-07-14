@@ -101,6 +101,17 @@ pub trait ClassifierEngine: Send + Sync {
     /// `prompt::build_classification_window`.
     fn context_char_budget(&self) -> usize;
 
+    /// Character budget for the **current turn** as the classifier sees it.
+    /// The truncated turn serves as the image premise passed to
+    /// [`classify`](Self::classify) and as the input to the lexical image
+    /// prefilter. Model-specific: a small local model keeps this tight (the
+    /// zero-shot engine uses 400, sized to its 512-token ceiling), while an
+    /// engine backed by a large-context embedding model may choose far more —
+    /// image intent expressed deep in a long prompt is only visible within
+    /// this budget. Bounds classifier input only; the forwarded request is
+    /// never truncated.
+    fn current_turn_char_budget(&self) -> usize;
+
     /// Resolve complexity and image-generation intent.
     ///
     /// `complexity_premise` is the windowed recent user context;

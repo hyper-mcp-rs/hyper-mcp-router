@@ -686,6 +686,38 @@ async fn image_generation_routes_to_image_gen_backend() {
     assert_eq!(h.last_call()["model"], "image-gen");
 }
 
+/// The classifier sees at most `current_turn_char_budget()` chars of the
+/// current turn (engine-specific; 400 for zero-shot): an image request within
+/// the budget routes to the image backend, while the same phrase buried past
+/// it is invisible to the image axis and the request degrades to a text route.
+#[tokio::test]
+async fn image_intent_visibility_follows_engine_current_turn_budget() {
+    let h = Harness::start().await;
+    // Neutral filler: no image verbs/nouns, no complexity markers.
+    let filler = "The meeting notes from last week are attached below for reference. ";
+    let phrase = "Please draw a picture of a cat.";
+
+    // ~268 chars of filler + phrase => fully within the 400-char budget.
+    let within = format!("{}{phrase}", filler.repeat(4));
+    let resp = h.chat(&text_request(&within)).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        h.last_call()["model"],
+        "image-gen",
+        "image phrase within the premise budget must be seen"
+    );
+
+    // ~469 chars of filler first => the phrase starts beyond the budget.
+    let beyond = format!("{}{phrase}", filler.repeat(7));
+    let resp = h.chat(&text_request(&beyond)).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_ne!(
+        h.last_call()["model"],
+        "image-gen",
+        "image phrase beyond the premise budget is invisible to the image axis"
+    );
+}
+
 /// An explicit `modalities: ["image"]` request field is a deterministic,
 /// hard image-output requirement — no lexical/NLI inference needed.
 #[tokio::test]

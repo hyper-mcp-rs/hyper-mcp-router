@@ -137,9 +137,15 @@ proxy, window construction, filler pruning, the lexical image prefilter, the
 classification-skip optimisation, and the failure fallback are engine-agnostic
 and never change when an engine is added.
 
-| Model | File | Interaction | Sessions | Context budget |
+| Model | File | Interaction | Sessions | Context budgets (window / current turn) |
 |---|---|---|---|---|
-| `zero-shot` (default) | `engines/zero_shot.rs` | embedded ONNX NLI, fully local | ORT session pool, auto-sized by CPU + memory | 1000 chars (512-token model) |
+| `zero-shot` (default) | `engines/zero_shot.rs` | embedded ONNX NLI, fully local | ORT session pool, auto-sized by CPU + memory | 1000 / 400 chars (512-token model) |
+
+Both budgets are trait methods (`context_char_budget`,
+`current_turn_char_budget`), so an engine backed by a large-context model can
+raise them — e.g. to see image-generation intent expressed deep in a long
+prompt — without touching the routing core. They bound classifier input only;
+forwarded requests are never truncated.
 
 Adding an engine = one new file in `engines/`, one `ClassifierModel` variant,
 and one `match` arm in `engines::build`. Nothing else changes.
