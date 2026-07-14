@@ -38,7 +38,7 @@ max_body_bytes = 33554432
 #   "deberta-v3-xsmall-zeroshot"  embedded NLI model; fully local (default)
 #   "gemini-embedding-001"        remote Gemini embeddings; requires api_key
 #   "gemini-embedding-2"          as above, much larger context window
-#   "text-embedding-005"          remote Gemini embeddings; smaller/cheaper
+#   "text-embedding-005"          remote Vertex AI embeddings; needs project + token
 #   "text-embedding-3-small"      remote OpenAI embeddings; cheap, 8k window
 #   "text-embedding-3-large"      remote OpenAI embeddings; higher-dimensional
 # NOTE: the remote engines send prompt text (the classification window and
@@ -59,11 +59,12 @@ trivial_max_words = 6
 #inference_pool_size = 4
 #intra_op_threads = 2
 
-# Settings for the remote embedding engines (Gemini and OpenAI families — all
-# tables share the same shape). Ignored unless selected above. api_key is
+# Settings for the remote embedding engines. Ignored unless selected above.
+# The Gemini and OpenAI families (below) share the same shape: api_key is
 # REQUIRED when the engine is selected (startup fails without it) and
 # resolves exactly like a routed model's key: plaintext, env-var expansion,
 # or { source = "keyring", service = "...", user = "..." }.
+# (text-embedding-005 is Vertex-AI-only and has its own shape — see below.)
 # (The ":-" empty default below keeps config loading working when the env
 # var is unset — env expansion runs over the whole file, comments included;
 # a selected engine with an empty key still fails fast with a clear error.)
@@ -76,8 +77,19 @@ trivial_max_words = 6
 #[classifier.gemini-embedding-2]
 #api_key = "${GEMINI_API_KEY:-}"
 
+# text-embedding-005 is published only on Vertex AI (a different API), so it
+# takes a GCP project, a region, and an OAuth Bearer access_token instead of
+# an api_key. location defaults to "us-central1" and also picks the regional
+# endpoint host. access_token is a STATIC token today (Option 1): tokens from
+# `gcloud auth print-access-token` expire (~1h), so a long-running process
+# needs an externally refreshed value; ADC auto-refresh is a planned follow-up.
 #[classifier.text-embedding-005]
-#api_key = "${GEMINI_API_KEY:-}"
+#project = "my-gcp-project"
+#location = "us-central1"
+#access_token = "${GOOGLE_ACCESS_TOKEN:-}"
+#base_url = "https://us-central1-aiplatform.googleapis.com"  # optional override
+#max_concurrency = 32
+#request_timeout_secs = 10
 
 # OpenAI engines append /v1/embeddings to base_url, so an override must NOT
 # include the /v1 suffix (unlike routed models' base_url above).

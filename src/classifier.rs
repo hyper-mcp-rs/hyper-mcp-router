@@ -78,8 +78,9 @@ pub enum ClassifierModel {
     #[serde(rename = "gemini-embedding-2")]
     GeminiEmbedding2,
     /// Google `text-embedding-005` — remote anchor-prototype embedding
-    /// classification on the smaller/cheaper text-embedding model. Requires
-    /// an API key; prompt text is sent to the Gemini API.
+    /// classification on **Vertex AI** (this model is not published on the
+    /// Gemini Developer API). Requires a GCP `project` and OAuth
+    /// `access_token`; prompt text is sent to the Vertex AI API.
     #[serde(rename = "text-embedding-005")]
     TextEmbedding005,
     /// OpenAI `text-embedding-3-small` — remote anchor-prototype embedding

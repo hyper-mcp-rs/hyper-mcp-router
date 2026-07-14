@@ -124,9 +124,11 @@ pub struct ClassifierConfig {
     #[serde(default, rename = "gemini-embedding-2")]
     pub gemini_embedding_2: RemoteEmbeddingConfig,
     /// Settings for the `text-embedding-005` engine
-    /// (`[classifier.text-embedding-005]`). Ignored unless selected.
+    /// (`[classifier.text-embedding-005]`). Ignored unless selected. Uses the
+    /// Vertex-specific shape (this model is Vertex-AI-only), not the shared
+    /// [`RemoteEmbeddingConfig`] the Gemini/OpenAI families use.
     #[serde(default, rename = "text-embedding-005")]
-    pub text_embedding_005: RemoteEmbeddingConfig,
+    pub text_embedding_005: VertexEmbeddingConfig,
     /// Settings for the `text-embedding-3-small` engine
     /// (`[classifier.text-embedding-3-small]`). Ignored unless selected.
     #[serde(default, rename = "text-embedding-3-small")]
@@ -146,7 +148,7 @@ impl Default for ClassifierConfig {
             deberta_v3_xsmall_zeroshot: DebertaV3XsmallZeroshotConfig::default(),
             gemini_embedding_001: RemoteEmbeddingConfig::default(),
             gemini_embedding_2: RemoteEmbeddingConfig::default(),
-            text_embedding_005: RemoteEmbeddingConfig::default(),
+            text_embedding_005: VertexEmbeddingConfig::default(),
             text_embedding_3_small: RemoteEmbeddingConfig::default(),
             text_embedding_3_large: RemoteEmbeddingConfig::default(),
         }
@@ -179,6 +181,64 @@ pub struct RemoteEmbeddingConfig {
     /// Per-call total timeout, seconds. Omit for the model's default.
     #[serde(default)]
     pub request_timeout_secs: Option<u64>,
+}
+
+/// Settings for the `text-embedding-005` engine
+/// (`[classifier.text-embedding-005]`), which targets **Vertex AI** rather
+/// than the Gemini Developer API: `text-embedding-005` is published only on
+/// Vertex, so it needs a GCP `project`, a `location`, and an OAuth Bearer
+/// `access_token` instead of a plain `api_key`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VertexEmbeddingConfig {
+    /// GCP project id. **Required when the engine is selected** (engine
+    /// construction fails at startup without it).
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Vertex AI region, e.g. `us-central1`. Also selects the default regional
+    /// endpoint host (`https://{location}-aiplatform.googleapis.com`) when
+    /// `base_url` is not overridden.
+    #[serde(default = "default_vertex_location")]
+    pub location: String,
+    /// OAuth 2.0 Bearer access token for the Vertex AI API. **Required when the
+    /// engine is selected.** Resolves exactly like a routed model's `api_key`
+    /// (a plaintext/env-expanded string or a keyring table); an empty resolved
+    /// value counts as absent. Never logged.
+    ///
+    /// NOTE (Option 1): this is a *static* token. `gcloud`-printed tokens
+    /// expire (~1h), so a long-running process needs an externally refreshed
+    /// token; auto-refreshing Application Default Credentials is a planned
+    /// follow-up.
+    #[serde(default, deserialize_with = "resolve_api_key")]
+    pub access_token: Option<String>,
+    /// Endpoint override (e.g. a proxy/gateway, or a mock in tests). Must be
+    /// http/https. Defaults to the regional Vertex host derived from
+    /// `location`.
+    #[serde(default, deserialize_with = "deserialize_opt_http_url")]
+    pub base_url: Option<Url>,
+    /// Maximum concurrent embedding requests in flight (this engine's
+    /// "session pool"). Omit for the model's default.
+    #[serde(default)]
+    pub max_concurrency: Option<usize>,
+    /// Per-call total timeout, seconds. Omit for the model's default.
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
+}
+
+impl Default for VertexEmbeddingConfig {
+    fn default() -> Self {
+        VertexEmbeddingConfig {
+            project: None,
+            location: default_vertex_location(),
+            access_token: None,
+            base_url: None,
+            max_concurrency: None,
+            request_timeout_secs: None,
+        }
+    }
+}
+
+fn default_vertex_location() -> String {
+    "us-central1".to_string()
 }
 
 /// `[classifier.deberta-v3-xsmall-zeroshot]`: settings that only make sense
@@ -701,16 +761,34 @@ mod tests {
         let cfg = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n\
              [classifier]\nmodel=\"text-embedding-005\"\n\
-             [classifier.text-embedding-005]\napi_key=\"te5-key\"\nmax_concurrency=16\n\
+             [classifier.text-embedding-005]\nproject=\"my-proj\"\nlocation=\"us-east1\"\n\
+             access_token=\"te5-token\"\nmax_concurrency=16\n\
              [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
         )
         .unwrap();
         assert_eq!(cfg.classifier.model, ClassifierModel::TextEmbedding005);
-        assert_eq!(
-            cfg.classifier.text_embedding_005.api_key.as_deref(),
-            Some("te5-key")
-        );
-        assert_eq!(cfg.classifier.text_embedding_005.max_concurrency, Some(16));
+        let te5 = &cfg.classifier.text_embedding_005;
+        assert_eq!(te5.project.as_deref(), Some("my-proj"));
+        assert_eq!(te5.location, "us-east1");
+        assert_eq!(te5.access_token.as_deref(), Some("te5-token"));
+        assert_eq!(te5.max_concurrency, Some(16));
+    }
+
+    #[test]
+    fn text_embedding_005_defaults_location_and_empty_token_is_none() {
+        // Omitted table: location defaults, project/token absent, and an empty
+        // access_token counts as absent (the engine then fails fast).
+        let cfg = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n\
+             [classifier.text-embedding-005]\naccess_token=\"\"\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap();
+        let te5 = &cfg.classifier.text_embedding_005;
+        assert_eq!(te5.location, "us-central1");
+        assert_eq!(te5.project, None);
+        assert_eq!(te5.access_token, None);
+        assert_eq!(te5.base_url, None);
     }
 
     #[test]

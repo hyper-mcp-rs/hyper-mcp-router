@@ -1,24 +1,28 @@
 //! The `text-embedding-005` engine: remote anchor-prototype embedding
-//! classification against Google's `text-embedding-005` model (see this
-//! directory's `mod.rs` for the shared method).
+//! classification against Google's `text-embedding-005` model on **Vertex AI**
+//! (see this directory's `mod.rs` for the transport, `engines/embedding.rs`
+//! for the method).
 //!
-//! Model-specific facts owned by this file: the API model path and the
-//! context budgets — like `gemini-embedding-001` it accepts 2048 input
-//! tokens, so the budgets match; it is a smaller/cheaper embedding model,
-//! which makes it attractive for high-throughput deployments. Requires
-//! `[classifier.text-embedding-005] api_key`.
+//! `text-embedding-005` is published only on Vertex AI, not the Gemini
+//! Developer API — hence the Vertex family rather than the `gemini/` family.
+//!
+//! Model-specific facts owned by this file: the publisher model id and the
+//! context budgets — the model accepts 2048 input tokens (and emits up to
+//! 768-dim vectors specialised for English and code), so the budgets match
+//! the 2048-token siblings. Requires `[classifier.text-embedding-005]`
+//! `project` and `access_token`.
 //!
 //! Privacy note: selecting this engine sends prompt text (the classification
-//! window and current turn) to the Gemini API.
+//! window and current turn) to the Vertex AI API.
 
 use crate::config::ClassifierConfig;
 
-use super::{GeminiEmbedding, GeminiSpec};
+use super::{VertexEmbedding, VertexSpec};
 
 /// Model-specific parameters for `text-embedding-005`.
-pub const SPEC: GeminiSpec = GeminiSpec {
+pub const SPEC: VertexSpec = VertexSpec {
     name: "text-embedding-005",
-    api_model: "models/text-embedding-005",
+    api_model: "text-embedding-005",
     // 2048-token input limit; ~4 chars/token with headroom.
     context_char_budget: 6000,
     current_turn_char_budget: 2000,
@@ -36,8 +40,8 @@ const _: () = {
 };
 
 /// Build the engine from its `[classifier.text-embedding-005]` table.
-pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<GeminiEmbedding> {
-    GeminiEmbedding::connect(
+pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<VertexEmbedding> {
+    VertexEmbedding::connect(
         &SPEC,
         &cfg.text_embedding_005,
         cfg.image_generation_threshold,

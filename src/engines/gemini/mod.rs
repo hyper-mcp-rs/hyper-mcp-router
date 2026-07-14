@@ -1,7 +1,10 @@
-//! The Gemini engine family: shared transport here in `mod.rs`, **one file per
-//! model** in this directory (`embedding_001.rs`, `embedding_2.rs`,
-//! `text_embedding_005.rs`), each defining a [`GeminiSpec`] and delegating to
-//! the shared [`GeminiEmbedding`] engine.
+//! The Gemini Developer API engine family: shared transport here in `mod.rs`,
+//! **one file per model** in this directory (`embedding_001.rs`,
+//! `embedding_2.rs`), each defining a [`GeminiSpec`] and delegating to the
+//! shared [`GeminiEmbedding`] engine.
+//!
+//! Note: `text-embedding-005` is **not** here — it is published only on
+//! Vertex AI (a different API), so it lives in the `vertex/` family.
 //!
 //! The classification *method* (anchor prototypes, cosine scoring) is
 //! provider-neutral and lives in `crate::engines::embedding`; this file owns
@@ -20,7 +23,6 @@
 
 pub mod embedding_001;
 pub mod embedding_2;
-pub mod text_embedding_005;
 
 use std::time::Duration;
 
