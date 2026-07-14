@@ -28,8 +28,9 @@ No external state, no database, no runtime model downloads.
   filler skips the model and routes to Fast (see
   [Performance & tuning](#performance--tuning)). No brittle history heuristic.
 - **Adaptive inference concurrency** — the classifier auto-sizes a pool of
-  inference sessions to the host's core count (container-aware), scaling
-  throughput across cores with no configuration.
+  inference sessions to the host's core count **and memory budget** (both
+  container-aware: CPU quotas and cgroup memory limits), scaling throughput
+  across cores with no configuration and without risking an OOM kill.
 
 ## ⚠️ Binary size
 
@@ -192,15 +193,31 @@ Consequences:
 
 `ort`'s `Session::run` requires exclusive access, so the classifier holds a
 **pool** of independent sessions and leases one per request, allowing up to
-`pool_size` inferences to run at once. At startup the router detects the cores
-available to the process — honoring container CPU limits (cgroup quotas) as well
-as CPU affinity — and sizes the pool and per-session thread count to match. The
-startup log reports `detected_cores`, `pool_size`, and `intra_op_threads`.
+`pool_size` inferences to run at once. At startup the router detects the
+resources available to the process and sizes the pool to fit **both**:
+
+- **CPU** — cores from `available_parallelism()`, honoring container CPU
+  limits (cgroup quotas) and CPU affinity: pool `cores / 2`.
+- **Memory** — the budget from the **cgroup memory limit** when present
+  (what Cloud Run gen2 / Kubernetes / Docker actually enforce — inside a
+  container `/proc/meminfo` reports the *host's* memory, which would
+  over-provision and get the instance OOM-killed), falling back to the
+  host/VM total elsewhere: pool = whatever fits in 90% of the budget after
+  the measured fixed baseline (~420 MB) at ~200 MB per session (see
+  [Memory](#memory) below).
+
+The plan takes the **minimum** of the two, min 1. The startup log reports
+`detected_cores`, `memory_budget_mb`, `pool_size`, and `intra_op_threads`.
+Explicit settings (CLI or config) are always honored — but a configuration
+the host can't handle (thread oversubscription, or estimated memory above
+the detected budget) logs a **warning** at startup instead of failing.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--inference-pool-size <N>` | auto (`cores / 2`, min 1) | Concurrent inference sessions. Each is an independent in-memory copy of the model. |
+| `--inference-pool-size <N>` | auto (min of `cores / 2` and what fits in memory; min 1) | Concurrent inference sessions. Each is an independent in-memory copy of the model. |
 | `--intra-op-threads <N>` | auto (`2`) | ONNX Runtime intra-op threads per session (`0` = runtime default). Keep `pool_size × intra_op_threads` near the core count to avoid oversubscription. |
+
+#### Memory
 
 Because each session is a full in-memory copy of the embedded ~87 MB model, a
 larger pool uses proportionally more memory. Measured
@@ -208,9 +225,11 @@ larger pool uses proportionally more memory. Measured
 session at startup** (weights), growing to **~190 MB per session under
 sustained max-length load** — ONNX Runtime's arena allocator retains the
 worst-case activation memory it has seen. Both scale linearly with pool size,
-so budget `pool_size × ~190 MB` (e.g. the auto-plan on an 18-core host builds
-9 sessions ≈ 1.7 GB under load). Cap `--inference-pool-size` on
-memory-constrained hosts.
+so budget `pool_size × ~190 MB` plus a ~420 MB fixed baseline. These measured
+constants are exactly what the memory-aware auto-plan uses
+(`planning::SESSION_MEMORY_BYTES` / `planning::BASELINE_MEMORY_BYTES`), so an
+unconfigured router already fits its memory budget; an explicit
+`--inference-pool-size` beyond it logs a startup warning.
 
 Measured on an 18-core host — per-request latency ~15 ms, essentially unchanged
 by pool size — throughput scales with the pool until the CPU saturates:

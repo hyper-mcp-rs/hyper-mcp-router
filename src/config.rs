@@ -102,8 +102,9 @@ pub struct ClassifierConfig {
     #[serde(default = "default_trivial_max_words")]
     pub trivial_max_words: usize,
     /// Concurrent inference sessions. Omit for auto-sizing from the detected
-    /// core count (see `classifier::plan_inference`). The
-    /// `--inference-pool-size` CLI flag overrides this.
+    /// core count and memory budget (see `planning::plan_inference`). The
+    /// `--inference-pool-size` CLI flag overrides this. An explicit value
+    /// larger than the host can handle is honored but logs a warning.
     #[serde(default)]
     pub inference_pool_size: Option<usize>,
     /// ONNX Runtime intra-op threads per session (`0` = runtime default). Omit

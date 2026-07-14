@@ -30,6 +30,7 @@ regex      = "1"
 reqwest    = { version = "0.13", features = ["stream", "json"] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tokenizers = "0.23"
 tokio      = { version = "1", features = ["full"] }
 tracing    = "0.1"

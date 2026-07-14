@@ -6,10 +6,11 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 
-use hyper_mcp_router::classifier::{plan_inference, Classifier};
+use hyper_mcp_router::classifier::Classifier;
 use hyper_mcp_router::cli::{Cli, Command, ServeArgs};
 use hyper_mcp_router::config;
 use hyper_mcp_router::logging;
+use hyper_mcp_router::planning::{detect_memory_budget, overcommit_warnings, plan_inference};
 use hyper_mcp_router::proxy::{build_router, AppState};
 
 #[tokio::main]
@@ -33,12 +34,15 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     // 3. Initialise the classifier from the embedded model bytes. Size the
     //    inference pool + intra-op threads from the detected core count
-    //    (container-aware since Rust 1.64); config-file settings override the
-    //    auto-plan, and CLI flags override both.
+    //    (container-aware since Rust 1.64) AND the detected memory budget
+    //    (cgroup-limit aware); config-file settings override the auto-plan,
+    //    and CLI flags override both. Explicit settings are respected but
+    //    never silently: an over-committed configuration logs a warning.
     let detected_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let plan = plan_inference(detected_cores);
+    let memory_budget = detect_memory_budget();
+    let plan = plan_inference(detected_cores, memory_budget);
     let pool_size = args
         .inference_pool_size
         .or(cfg.classifier.inference_pool_size)
@@ -50,6 +54,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let trivial_max_words = args
         .trivial_max_words
         .unwrap_or(cfg.classifier.trivial_max_words);
+    for warning in overcommit_warnings(pool_size, intra_op_threads, detected_cores, memory_budget) {
+        tracing::warn!("{warning}");
+    }
     let classifier = Classifier::new(
         cfg.classifier.image_generation_threshold,
         trivial_max_words,
@@ -59,6 +66,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     .context("initialising classifier")?;
     tracing::info!(
         detected_cores,
+        memory_budget_mb = memory_budget.map(|b| b / (1024 * 1024)),
         pool_size,
         intra_op_threads,
         "inference parallelism configured"

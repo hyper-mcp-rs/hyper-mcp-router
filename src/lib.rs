@@ -13,6 +13,7 @@ pub mod cli;
 pub mod config;
 pub mod logging;
 pub mod modality;
+pub mod planning;
 pub mod proxy;
 
 /// The quantized ONNX NLI model, embedded at build time (see `build.rs`).

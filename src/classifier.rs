@@ -83,36 +83,7 @@ pub enum HypothesisKind {
     ImageGeneration,
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Inference parallelism planning
-// ───────────────────────────────────────────────────────────────────────────
-
-/// How to split the host's available cores between concurrent inference
-/// sessions (`pool_size`) and intra-op threads per session (`intra_op_threads`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InferencePlan {
-    /// Number of independent [`Session`]s (max concurrent inferences).
-    pub pool_size: usize,
-    /// ORT intra-op threads per session (0 = let the runtime decide).
-    pub intra_op_threads: usize,
-}
-
-/// Derive an [`InferencePlan`] from the number of available cores. The embedded
-/// NLI model is small and scales poorly per-inference, so we favor concurrency:
-/// cap intra-op parallelism at 2 and give each session ~2 cores. Always yields
-/// at least one (single-threaded) session, and never budgets more threads than
-/// cores (`pool_size * intra_op_threads <= cores`).
-pub fn plan_inference(available_cores: usize) -> InferencePlan {
-    let cores = available_cores.max(1);
-    let intra_op_threads = if cores >= 2 { 2 } else { 1 };
-    let pool_size = (cores / intra_op_threads).max(1);
-    InferencePlan {
-        pool_size,
-        intra_op_threads,
-    }
-}
-
-// ───────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────
 // Session pool
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -225,8 +196,9 @@ impl Classifier {
     /// can run concurrently (see [`SessionPool`]); it is clamped to at least 1.
     /// `intra_op_threads` sets ORT intra-op parallelism per session (0 = runtime
     /// default). Size the two together so `pool_size * intra_op_threads` stays
-    /// near the core count (see [`plan_inference`]); otherwise sessions
-    /// oversubscribe the CPU.
+    /// near the core count and the pool fits in memory (see
+    /// [`crate::planning::plan_inference`]); otherwise sessions oversubscribe
+    /// the CPU or risk an OOM kill.
     pub fn new(
         image_gen_threshold: f32,
         trivial_max_words: usize,
@@ -780,38 +752,6 @@ mod tests {
         ] {
             assert!(!looks_like_image_generation(p), "should NOT match: {p:?}");
         }
-    }
-
-    // ── plan_inference ──────────────────────────────────────────────────────
-    #[test]
-    fn inference_plan_stays_within_core_budget() {
-        for cores in [1usize, 2, 3, 4, 8, 16, 18, 32, 64] {
-            let p = plan_inference(cores);
-            assert!(p.pool_size >= 1, "pool_size >= 1 for {cores}");
-            assert!(p.intra_op_threads >= 1, "intra_op >= 1 for {cores}");
-            assert!(
-                p.pool_size * p.intra_op_threads <= cores.max(1),
-                "budget exceeded for {cores}: {p:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn inference_plan_degenerate_cores() {
-        // Zero/one core collapses to a single single-threaded session.
-        let one = InferencePlan {
-            pool_size: 1,
-            intra_op_threads: 1,
-        };
-        assert_eq!(plan_inference(0), one);
-        assert_eq!(plan_inference(1), one);
-    }
-
-    #[test]
-    fn inference_plan_pool_grows_with_cores() {
-        assert!(plan_inference(4).pool_size <= plan_inference(8).pool_size);
-        assert!(plan_inference(8).pool_size <= plan_inference(18).pool_size);
-        assert_eq!(plan_inference(18).pool_size, 9);
     }
 
     // ── looks_trivial ─────────────────────────────────────────────────────────

@@ -40,9 +40,11 @@ pub struct ServeArgs {
     pub trivial_max_words: Option<usize>,
 
     /// Number of concurrent classifier inference sessions (pool size). Each is
-    /// an independent copy of the embedded model. Overrides the `[classifier]
-    /// inference_pool_size` config setting; omit both to auto-size from the
-    /// detected core count (see `classifier::plan_inference`).
+    /// an independent copy of the embedded model (~200 MB under load). Overrides
+    /// the `[classifier] inference_pool_size` config setting; omit both to
+    /// auto-size from the detected core count and memory budget (see
+    /// `planning::plan_inference`). An explicit value larger than the host can
+    /// handle is honored but logs a warning at startup.
     #[arg(long)]
     pub inference_pool_size: Option<usize>,
 
