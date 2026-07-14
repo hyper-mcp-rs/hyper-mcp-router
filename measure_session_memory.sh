@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Measure per-inference-session memory empirically.
 #
-# Starts the router with different --inference-pool-size values, records RSS
-# after startup (weights materialized) and again after a burst of max-length
-# classification requests (activation arenas grown), then divides the deltas
-# by the pool-size difference. Fixed costs (binary, embedded model bytes,
-# tokio runtime) cancel out in the subtraction.
+# Starts the router with different [classifier.zero-shot] inference_pool_size
+# values (generating a config per run), records RSS after startup (weights
+# materialized) and again after a burst of max-length classification requests
+# (activation arenas grown), then divides the deltas by the pool-size
+# difference. Fixed costs (binary, embedded model bytes, tokio runtime) cancel
+# out in the subtraction.
 #
 # The generated config declares TWO text tiers so complexity classification
 # actually runs (with <= 1 candidate the router skips inference entirely and
@@ -52,13 +53,20 @@ cleanup() {
 trap cleanup EXIT
 
 # Two text tiers => classification runs. Dead upstream => fast refusal after
-# the (already-measured) inference.
-cat >"$TMP/config.toml" <<EOF
+# the (already-measured) inference. Pool size is config-only, so a config is
+# generated per pool value.
+write_config() {
+  local pool=$1
+  cat >"$TMP/config.toml" <<EOF
 [server]
 host = "127.0.0.1"
 port = $PORT
 connect_timeout_secs = 1
 request_timeout_secs = 5
+
+[classifier.zero-shot]
+inference_pool_size = $pool
+intra_op_threads = 2
 
 [[models]]
 name = "fast"
@@ -72,6 +80,7 @@ base_url = "http://127.0.0.1:1"
 type = "frontier"
 modalities = ["text"]
 EOF
+}
 
 # A dense prompt well past the 1000-char window budget, so every request
 # pushes the tokenizer to the model's 512-token ceiling (worst-case arena).
@@ -95,9 +104,9 @@ STARTUP_KB=()
 LOADED_KB=()
 
 for pool in "${POOLS[@]}"; do
-  echo "── pool_size=$pool ──────────────────────────────" >&2
-  "$BIN" serve --config "$TMP/config.toml" --log-stdout \
-    --inference-pool-size "$pool" --intra-op-threads 2 >/dev/null 2>&1 &
+  echo "── pool_size=$pool ──────────────────────────────────" >&2
+  write_config "$pool"
+  "$BIN" serve --config "$TMP/config.toml" --log-stdout >/dev/null 2>&1 &
   ROUTER_PID=$!
   wait_healthy
   sleep 1 # let allocations settle

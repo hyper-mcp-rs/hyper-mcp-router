@@ -17,8 +17,9 @@ No external state, no database, no runtime model downloads.
   fine-tuning and no telemetry, and classification is fully local.
   Operational logs contain routing metadata only, never user content.
 - **Pluggable classification** — the classifier is a trait; models live one
-  file per engine under `src/engines/` and are selected with
-  `--classifier-model` (see [Classifier engines](#classifier-engines)).
+  file per engine under `src/engines/` and are selected with the
+  `[classifier] model` config setting (see
+  [Classifier engines](#classifier-engines)).
 - **Client-agnostic** — any OpenAI Chat Completions client works unmodified.
 - **Correct SSE streaming** — raw byte passthrough, no buffering or re-parsing.
   Upstream response headers (request ids, rate-limit metadata) pass through on
@@ -57,30 +58,19 @@ cargo build --release
 ## Running
 
 ```sh
-hyper-mcp-router serve [--config <path>] [--log-stdout] [--classifier-model <MODEL>] \
-    [--trivial-max-words <N>] [--inference-pool-size <N>] [--intra-op-threads <N>]
+hyper-mcp-router serve [--config <path>] [--log-stdout]
 ```
 
 - `--config <path>` — explicit config file. If given it is used verbatim; a
   missing or unparseable file is fatal (no fallback).
 - `--log-stdout` — write structured JSON logs to stdout instead of the
   well-known rolling file location (use this for Cloud Run / containers).
-- `--classifier-model <MODEL>` — which classification model to run (exactly
-  one per process; overrides the `[classifier] model` config setting).
-  Currently available: `zero-shot` (the embedded NLI model, default). See
-  [Classifier engines](#classifier-engines).
-- `--trivial-max-words <N>` — length ceiling for pruning filler turns from the
-  complexity window (default `6`; `0` disables pruning). See
-  [Performance & tuning](#performance--tuning).
-- `--inference-pool-size <N>` — concurrent inference sessions (default: auto,
-  from the detected core count).
-- `--intra-op-threads <N>` — ONNX Runtime intra-op threads per session
-  (default: auto; `0` = runtime default).
 
-The performance flags are optional overrides — omit them and the router sizes
-itself to the machine. Each may also be set in the config file's `[classifier]`
-section (`trivial_max_words`, `inference_pool_size`, `intra_op_threads`); a CLI
-flag overrides the config value. See
+That is the whole CLI, deliberately: everything else — including which
+classifier model runs and its model-specific tuning — lives in the config
+file. Different classifier models bring different configuration
+(`[classifier.<model>]` tables), so the config file is the single source of
+truth; see [Classifier engines](#classifier-engines) and
 [Performance & tuning](#performance--tuning).
 
 The server drains gracefully: on SIGTERM/SIGINT it stops accepting new
@@ -130,10 +120,15 @@ Request handling notes:
 
 Classification is pluggable behind the `ClassifierEngine` trait
 (`src/classifier.rs`); concrete engines live in `src/engines/`, **one file
-per model**. Everything model-specific is owned by the engine's file — how it
-is invoked (local inference vs. a remote API), how many concurrent "sessions"
-it runs and how they are sized, and how large its context window is. The
-proxy, window construction, filler pruning, the lexical image prefilter, the
+per model**. The active model is selected by the `[classifier] model` config
+setting — **config-only, no CLI flag**: each model brings its own settings in
+a `[classifier.<model>]` table (e.g. `[classifier.zero-shot]` holds
+`inference_pool_size` / `intra_op_threads`, which are meaningless for other
+engines), so the config file is the single source of truth. Everything
+model-specific is owned by the engine's file — how it is invoked (local
+inference vs. a remote API), how many concurrent "sessions" it runs and how
+they are sized, and how large its context window is. The proxy, window
+construction, filler pruning, the lexical image prefilter, the
 classification-skip optimisation, and the failure fallback are engine-agnostic
 and never change when an engine is added.
 
@@ -217,8 +212,8 @@ Consequences:
 - Image-generation intent is judged on the **current turn only**, so an old
   "draw a cat" turn in the window can't misroute a later, unrelated request.
 
-`--trivial-max-words <N>` (default `6`) sets the filler-pruning length ceiling;
-`0` disables pruning.
+`[classifier] trivial_max_words` (default `6`) sets the filler-pruning length
+ceiling; `0` disables pruning.
 
 ### Adaptive inference concurrency (session pool)
 
@@ -239,14 +234,15 @@ resources available to the process and sizes the pool to fit **both**:
 
 The plan takes the **minimum** of the two, min 1. The startup log reports
 `detected_cores`, `memory_budget_mb`, `pool_size`, and `intra_op_threads`.
-Explicit settings (CLI or config) are always honored — but a configuration
-the host can't handle (thread oversubscription, or estimated memory above
-the detected budget) logs a **warning** at startup instead of failing.
+Explicit `[classifier.zero-shot]` settings are always honored — but a
+configuration the host can't handle (thread oversubscription, or estimated
+memory above the detected budget) logs a **warning** at startup instead of
+failing.
 
-| Flag | Default | Meaning |
+| `[classifier.zero-shot]` setting | Default | Meaning |
 |---|---|---|
-| `--inference-pool-size <N>` | auto (min of `cores / 2` and what fits in memory; min 1) | Concurrent inference sessions. Each is an independent in-memory copy of the model. |
-| `--intra-op-threads <N>` | auto (`2`) | ONNX Runtime intra-op threads per session (`0` = runtime default). Keep `pool_size × intra_op_threads` near the core count to avoid oversubscription. |
+| `inference_pool_size` | auto (min of `cores / 2` and what fits in memory; min 1) | Concurrent inference sessions. Each is an independent in-memory copy of the model. |
+| `intra_op_threads` | auto (`2`) | ONNX Runtime intra-op threads per session (`0` = runtime default). Keep `pool_size × intra_op_threads` near the core count to avoid oversubscription. |
 
 #### Memory
 
@@ -260,7 +256,8 @@ so budget `pool_size × ~190 MB` plus a ~420 MB fixed baseline. These measured
 constants are exactly what the memory-aware auto-plan uses
 (`planning::SESSION_MEMORY_BYTES` / `planning::BASELINE_MEMORY_BYTES`), so an
 unconfigured router already fits its memory budget; an explicit
-`--inference-pool-size` beyond it logs a startup warning.
+`inference_pool_size` beyond it logs a startup warning. Cap it in
+`[classifier.zero-shot]` on memory-constrained hosts.
 
 Measured on an 18-core host — per-request latency ~15 ms, essentially unchanged
 by pool size — throughput scales with the pool until the CPU saturates:

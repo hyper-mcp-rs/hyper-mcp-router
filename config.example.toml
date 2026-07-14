@@ -29,20 +29,25 @@ stream_idle_timeout_secs = 300
 # image/audio/file payloads are large; raise this if yours are larger.
 max_body_bytes = 33554432
 
-# Optional classifier tuning. All fields have sensible defaults.
+# Optional classifier tuning. All fields have sensible defaults. Classifier
+# behaviour is config-only — there are no CLI overrides, because each model
+# brings its own configuration (a [classifier.<model>] table); different
+# classifier models mean different config files.
 [classifier]
 # Which classification model to run (exactly one per process). Currently
 # available: "zero-shot" (the embedded NLI model — fully local, the default).
-# The --classifier-model CLI flag overrides this.
 model = "zero-shot"
 # Image-generation modality decision (score floor; scale is engine-specific —
 # P(entailment) for the zero-shot engine; default 0.5).
 image_generation_threshold = 0.5
-# Word ceiling for the trivial fast-path (0 disables; default 6). The
-# --trivial-max-words CLI flag overrides this.
+# Word ceiling for the trivial fast-path (0 disables; default 6).
 trivial_max_words = 6
-# Inference parallelism. Omit for auto-sizing from the detected core count;
-# CLI flags (--inference-pool-size / --intra-op-threads) override both.
+
+# Settings specific to the zero-shot engine (local ORT inference sessions).
+# Ignored unless model = "zero-shot". Omit either field for auto-sizing from
+# the detected core count and memory budget; explicit values the host can't
+# handle are honored but log a startup warning.
+[classifier.zero-shot]
 #inference_pool_size = 4
 #intra_op_threads = 2
 

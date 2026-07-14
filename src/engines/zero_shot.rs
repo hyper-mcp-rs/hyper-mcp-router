@@ -21,7 +21,6 @@ use tokenizers::{
 
 use crate::classifier::{Classification, ClassifierEngine, ModelTier};
 use crate::config::ClassifierConfig;
-use crate::engines::EngineOverrides;
 use crate::planning::{detect_memory_budget, overcommit_warnings, plan_inference};
 use crate::{MODEL_BYTES, TOKENIZER_BYTES};
 
@@ -158,21 +157,22 @@ struct Inner {
 }
 
 impl ZeroShot {
-    /// Construct from config + operator overrides, owning the model-specific
-    /// sizing: detect cores and the memory budget, derive the CPU/memory plan
-    /// (see [`crate::planning`]), apply overrides, and warn — never clamp — on
-    /// an overcommitted explicit configuration.
-    pub fn from_config(
-        cfg: &ClassifierConfig,
-        overrides: &EngineOverrides,
-    ) -> anyhow::Result<Self> {
+    /// Construct from config, owning the model-specific sizing: detect cores
+    /// and the memory budget, derive the CPU/memory plan (see
+    /// [`crate::planning`]), apply the engine's own `[classifier.zero-shot]`
+    /// settings, and warn — never clamp — on an overcommitted explicit
+    /// configuration.
+    pub fn from_config(cfg: &ClassifierConfig) -> anyhow::Result<Self> {
         let detected_cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
         let memory_budget = detect_memory_budget();
         let plan = plan_inference(detected_cores, memory_budget);
-        let pool_size = overrides.inference_pool_size.unwrap_or(plan.pool_size);
-        let intra_op_threads = overrides.intra_op_threads.unwrap_or(plan.intra_op_threads);
+        let pool_size = cfg.zero_shot.inference_pool_size.unwrap_or(plan.pool_size);
+        let intra_op_threads = cfg
+            .zero_shot
+            .intra_op_threads
+            .unwrap_or(plan.intra_op_threads);
         for warning in
             overcommit_warnings(pool_size, intra_op_threads, detected_cores, memory_budget)
         {

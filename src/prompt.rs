@@ -11,10 +11,9 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 /// Default upper word count for the trivial fast-path (see [`looks_trivial`]).
-/// Overridable via the `--trivial-max-words` CLI flag or the
-/// `[classifier] trivial_max_words` config setting. Keeps the short-circuit
-/// to genuinely terse turns; longer text always reaches the model. A value of 0
-/// disables the fast path entirely.
+/// Overridable via the `[classifier] trivial_max_words` config setting. Keeps
+/// the short-circuit to genuinely terse turns; longer text always reaches the
+/// model. A value of 0 disables the fast path entirely.
 pub const DEFAULT_TRIVIAL_MAX_WORDS: usize = 6;
 
 /// High-precision lexical prefilter for image *generation* intent. Requires an

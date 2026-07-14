@@ -96,28 +96,24 @@ fn default_max_body_bytes() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClassifierConfig {
     /// Which classification model to run (exactly one per process; see
-    /// `classifier::ClassifierModel`). The `--classifier-model` CLI flag
-    /// overrides this. Defaults to the embedded zero-shot model.
+    /// `classifier::ClassifierModel`). **Config-only** — there is no CLI
+    /// override, because each model brings its own configuration; different
+    /// models mean different config files. Defaults to the embedded
+    /// zero-shot model.
     #[serde(default)]
     pub model: ClassifierModel,
     /// Score floor for the image-generation axis (scale is engine-specific;
     /// P(entailment) for the zero-shot engine).
     #[serde(default = "default_image_gen_threshold")]
     pub image_generation_threshold: f32,
-    /// Word ceiling for the trivial fast-path (`0` disables). The
-    /// `--trivial-max-words` CLI flag overrides this.
+    /// Word ceiling for the trivial fast-path (`0` disables).
     #[serde(default = "default_trivial_max_words")]
     pub trivial_max_words: usize,
-    /// Concurrent inference sessions. Omit for auto-sizing from the detected
-    /// core count and memory budget (see `planning::plan_inference`). The
-    /// `--inference-pool-size` CLI flag overrides this. An explicit value
-    /// larger than the host can handle is honored but logs a warning.
-    #[serde(default)]
-    pub inference_pool_size: Option<usize>,
-    /// ONNX Runtime intra-op threads per session (`0` = runtime default). Omit
-    /// for auto-sizing. The `--intra-op-threads` CLI flag overrides this.
-    #[serde(default)]
-    pub intra_op_threads: Option<usize>,
+    /// Settings specific to the `zero-shot` engine (`[classifier.zero-shot]`).
+    /// Ignored unless `model = "zero-shot"`. Engine-specific settings live in
+    /// per-engine tables; a new engine adds its own table here.
+    #[serde(default, rename = "zero-shot")]
+    pub zero_shot: ZeroShotConfig,
 }
 
 impl Default for ClassifierConfig {
@@ -126,10 +122,26 @@ impl Default for ClassifierConfig {
             model: ClassifierModel::default(),
             image_generation_threshold: default_image_gen_threshold(),
             trivial_max_words: default_trivial_max_words(),
-            inference_pool_size: None,
-            intra_op_threads: None,
+            zero_shot: ZeroShotConfig::default(),
         }
     }
+}
+
+/// `[classifier.zero-shot]`: settings that only make sense for the embedded
+/// zero-shot engine (local ORT sessions). Other engines have their own
+/// concurrency models and their own tables.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ZeroShotConfig {
+    /// Concurrent ORT inference sessions. Omit for auto-sizing from the
+    /// detected core count and memory budget (see
+    /// `planning::plan_inference`). An explicit value larger than the host
+    /// can handle is honored but logs a warning.
+    #[serde(default)]
+    pub inference_pool_size: Option<usize>,
+    /// ONNX Runtime intra-op threads per session (`0` = runtime default).
+    /// Omit for auto-sizing.
+    #[serde(default)]
+    pub intra_op_threads: Option<usize>,
 }
 
 fn default_image_gen_threshold() -> f32 {
@@ -527,8 +539,8 @@ mod tests {
         assert_eq!(cfg.server.max_body_bytes, 32 * 1024 * 1024);
         assert_eq!(cfg.classifier.model, ClassifierModel::ZeroShot);
         assert_eq!(cfg.classifier.trivial_max_words, DEFAULT_TRIVIAL_MAX_WORDS);
-        assert_eq!(cfg.classifier.inference_pool_size, None);
-        assert_eq!(cfg.classifier.intra_op_threads, None);
+        assert_eq!(cfg.classifier.zero_shot.inference_pool_size, None);
+        assert_eq!(cfg.classifier.zero_shot.intra_op_threads, None);
     }
 
     #[test]
@@ -552,15 +564,16 @@ mod tests {
     fn server_and_classifier_tuning_fields_parse() {
         let cfg = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\nstream_idle_timeout_secs=42\nmax_body_bytes=1024\n\
-             [classifier]\ntrivial_max_words=3\ninference_pool_size=4\nintra_op_threads=1\n\
+             [classifier]\ntrivial_max_words=3\n\
+             [classifier.zero-shot]\ninference_pool_size=4\nintra_op_threads=1\n\
              [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
         )
         .unwrap();
         assert_eq!(cfg.server.stream_idle_timeout_secs, 42);
         assert_eq!(cfg.server.max_body_bytes, 1024);
         assert_eq!(cfg.classifier.trivial_max_words, 3);
-        assert_eq!(cfg.classifier.inference_pool_size, Some(4));
-        assert_eq!(cfg.classifier.intra_op_threads, Some(1));
+        assert_eq!(cfg.classifier.zero_shot.inference_pool_size, Some(4));
+        assert_eq!(cfg.classifier.zero_shot.intra_op_threads, Some(1));
     }
 
     // ── ApiKey resolution ───────────────────────────────────────────────────────────

@@ -55,11 +55,12 @@ impl Classification {
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Which classification model the router runs. **Exactly one is active per
-/// process**: selected by the `--classifier-model` CLI flag, which overrides
-/// the `[classifier] model` config setting; the kebab-case variant name is the
-/// value in both places. Each variant maps to one file in `crate::engines`
-/// (see `engines::build`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+/// process**, selected by the `[classifier] model` config setting —
+/// config-only, no CLI override: each model brings its own configuration
+/// (typically a whole `[classifier.<model>]` table), so different models mean
+/// different config files. The kebab-case variant name is the config value.
+/// Each variant maps to one file in `crate::engines` (see `engines::build`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClassifierModel {
     /// The embedded zero-shot NLI model (`deberta-v3-xsmall-zeroshot`) —
@@ -69,7 +70,7 @@ pub enum ClassifierModel {
 }
 
 impl ClassifierModel {
-    /// Kebab-case wire name (matches both the CLI value and the config value).
+    /// Kebab-case wire name (the `[classifier] model` config value).
     pub fn as_str(self) -> &'static str {
         match self {
             ClassifierModel::ZeroShot => "zero-shot",
@@ -148,15 +149,5 @@ mod tests {
         assert_eq!(m, ClassifierModel::ZeroShot);
         // Unknown model ids must fail loudly, not fall back silently.
         assert!(serde_json::from_str::<ClassifierModel>("\"not-a-model\"").is_err());
-    }
-
-    #[test]
-    fn classifier_model_cli_value_matches_wire_name() {
-        use clap::ValueEnum;
-        let values: Vec<String> = ClassifierModel::value_variants()
-            .iter()
-            .map(|v| v.to_possible_value().unwrap().get_name().to_string())
-            .collect();
-        assert_eq!(values, vec!["zero-shot"]);
     }
 }

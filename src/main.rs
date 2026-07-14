@@ -8,7 +8,7 @@ use clap::Parser;
 
 use hyper_mcp_router::cli::{Cli, Command, ServeArgs};
 use hyper_mcp_router::config;
-use hyper_mcp_router::engines::{self, EngineOverrides};
+use hyper_mcp_router::engines;
 use hyper_mcp_router::logging;
 use hyper_mcp_router::proxy::{build_router, AppState};
 
@@ -31,24 +31,18 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     // (config::load runs field + startup coverage validation internally.)
 
-    // 3. Build the selected classifier engine (exactly one per process; CLI
-    //    flag overrides the config setting). All model-specific sizing —
+    // 3. Build the classifier engine selected by `[classifier] model`
+    //    (config-only; exactly one per process). All model-specific sizing —
     //    session pools, thread counts, memory planning, overcommit warnings —
-    //    is owned by the engine itself (see `engines/`); the operator
-    //    overrides are merged by precedence (CLI over config) here and passed
-    //    through.
-    let model = args.classifier_model.unwrap_or(cfg.classifier.model);
-    let overrides = EngineOverrides {
-        inference_pool_size: args
-            .inference_pool_size
-            .or(cfg.classifier.inference_pool_size),
-        intra_op_threads: args.intra_op_threads.or(cfg.classifier.intra_op_threads),
-    };
-    let classifier = engines::build(model, &cfg.classifier, &overrides)
-        .with_context(|| format!("initialising classifier engine `{}`", model.as_str()))?;
-    let trivial_max_words = args
-        .trivial_max_words
-        .unwrap_or(cfg.classifier.trivial_max_words);
+    //    is owned by the engine itself, configured via its own
+    //    `[classifier.<model>]` table (see `engines/`).
+    let classifier = engines::build(&cfg.classifier).with_context(|| {
+        format!(
+            "initialising classifier engine `{}`",
+            cfg.classifier.model.as_str()
+        )
+    })?;
+    let trivial_max_words = cfg.classifier.trivial_max_words;
     tracing::info!(
         engine = classifier.name(),
         context_char_budget = classifier.context_char_budget(),
