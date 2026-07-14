@@ -1,11 +1,14 @@
-//! The `gemini-embedding-001` engine: remote anchor-prototype embedding
-//! classification against Google's `gemini-embedding-001` model (see this
-//! directory's `mod.rs` for the shared method).
+//! The `gemini-embedding-001` engine **on the Generative Language API** (see
+//! this directory's `mod.rs` for the shared method). The same model is also
+//! served by a completely separate engine on Vertex AI
+//! (`engines/vertex/gemini_embedding_001.rs`); the auth fields of
+//! `[classifier.gemini-embedding-001]` pick which one runs — `api_key`
+//! selects this engine (see `config::GoogleEmbeddingConfig::surface`).
 //!
 //! Model-specific facts owned by this file: the API model path, the context
 //! budgets (the model accepts 2048 input tokens, so the window budget stays
 //! conservatively under that at ~4 chars/token), and the concurrency/timeout
-//! defaults. Requires `[classifier.gemini-embedding-001] api_key`.
+//! defaults.
 //!
 //! Privacy note: selecting this engine sends prompt text (the classification
 //! window and current turn) to the Gemini API.
@@ -35,11 +38,12 @@ const _: () = {
     assert!(SPEC.default_max_concurrency >= 1);
 };
 
-/// Build the engine from its `[classifier.gemini-embedding-001]` table.
+/// Build the engine from the Generative-Language slice of its
+/// `[classifier.gemini-embedding-001]` table.
 pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<GeminiEmbedding> {
     GeminiEmbedding::connect(
         &SPEC,
-        &cfg.gemini_embedding_001,
+        &cfg.gemini_embedding_001.to_generative_language(),
         cfg.image_generation_threshold,
     )
     .await

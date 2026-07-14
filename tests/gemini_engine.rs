@@ -420,21 +420,45 @@ async fn gemini_embedding_2_uses_own_endpoint_and_budgets() {
     assert_eq!(h.routed_model(), "balanced-text");
 }
 
-/// The API key is mandatory: a selected Gemini engine without one must fail
-/// at startup with an actionable message (never limp along).
+/// Credentials are mandatory and they pick the API surface: a selected
+/// gemini-embedding engine with neither `api_key` (Generative Language) nor
+/// `project` (Vertex) must fail at startup naming both options.
 #[tokio::test]
-async fn missing_api_key_fails_engine_build() {
+async fn missing_credentials_fail_engine_build_naming_both_surfaces() {
     let (embed_addr, _embed) = spawn_mock_gemini().await;
     let (chat_addr, _chat) = spawn_mock_chat().await;
     let toml = gemini_config_toml("gemini-embedding-001", embed_addr, chat_addr)
         .replace("api_key = \"test-gemini-key\"\n", "");
     let cfg = config::parse(&toml).expect("config parses without the key");
     let msg = match engines::build(&cfg.classifier).await {
-        Ok(_) => panic!("engine build must fail without an API key"),
+        Ok(_) => panic!("engine build must fail without credentials"),
         Err(e) => e.to_string(),
     };
     assert!(
-        msg.contains("requires an API key") && msg.contains("gemini-embedding-001"),
+        msg.contains("requires either `api_key`")
+            && msg.contains("`project`")
+            && msg.contains("gemini-embedding-001"),
+        "unhelpful error: {msg}"
+    );
+}
+
+/// Setting BOTH `api_key` and `project` is ambiguous — the surface must be
+/// chosen explicitly, never guessed.
+#[tokio::test]
+async fn both_surfaces_configured_fails_engine_build() {
+    let (embed_addr, _embed) = spawn_mock_gemini().await;
+    let (chat_addr, _chat) = spawn_mock_chat().await;
+    let toml = gemini_config_toml("gemini-embedding-001", embed_addr, chat_addr).replace(
+        "api_key = \"test-gemini-key\"\n",
+        "api_key = \"test-gemini-key\"\nproject = \"some-project\"\n",
+    );
+    let cfg = config::parse(&toml).expect("config parses with both fields");
+    let msg = match engines::build(&cfg.classifier).await {
+        Ok(_) => panic!("engine build must fail when both surfaces are configured"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("sets both `api_key`") && msg.contains("exactly one"),
         "unhelpful error: {msg}"
     );
 }

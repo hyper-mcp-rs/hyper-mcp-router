@@ -37,22 +37,39 @@ pub mod vertex;
 use std::sync::Arc;
 
 use crate::classifier::{ClassifierEngine, ClassifierModel};
-use crate::config::ClassifierConfig;
+use crate::config::{ClassifierConfig, GoogleApi};
 
 /// Construct the engine selected by `cfg.model`. This is the **only** place
 /// that maps a [`ClassifierModel`] to a concrete engine type. Async because
 /// remote engines do startup work over the network (anchor embedding);
-/// misconfiguration — including a missing required API key — fails here,
-/// at boot.
+/// misconfiguration — including missing or ambiguous credentials — fails
+/// here, at boot.
+///
+/// The gemini-embedding models are published on **two** Google API surfaces;
+/// the auth fields of the engine's config table pick the concrete engine
+/// (`api_key` ⇒ `gemini/`, `project` ⇒ `vertex/` — see
+/// [`crate::config::GoogleEmbeddingConfig::surface`]).
 pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<Arc<dyn ClassifierEngine>> {
     match cfg.model {
         ClassifierModel::DebertaV3XsmallZeroshot => Ok(Arc::new(
             deberta_v3_xsmall_zeroshot::DebertaV3XsmallZeroshot::from_config(cfg)?,
         )),
         ClassifierModel::GeminiEmbedding001 => {
-            Ok(Arc::new(gemini::embedding_001::build(cfg).await?))
+            match cfg.gemini_embedding_001.surface("gemini-embedding-001")? {
+                GoogleApi::GenerativeLanguage => {
+                    Ok(Arc::new(gemini::embedding_001::build(cfg).await?))
+                }
+                GoogleApi::Vertex => Ok(Arc::new(vertex::gemini_embedding_001::build(cfg).await?)),
+            }
         }
-        ClassifierModel::GeminiEmbedding2 => Ok(Arc::new(gemini::embedding_2::build(cfg).await?)),
+        ClassifierModel::GeminiEmbedding2 => {
+            match cfg.gemini_embedding_2.surface("gemini-embedding-2")? {
+                GoogleApi::GenerativeLanguage => {
+                    Ok(Arc::new(gemini::embedding_2::build(cfg).await?))
+                }
+                GoogleApi::Vertex => Ok(Arc::new(vertex::gemini_embedding_2::build(cfg).await?)),
+            }
+        }
         ClassifierModel::TextEmbedding005 => {
             Ok(Arc::new(vertex::text_embedding_005::build(cfg).await?))
         }

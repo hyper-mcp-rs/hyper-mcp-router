@@ -437,6 +437,52 @@ async fn chit_chat_routes_fast_with_zero_embed_calls() {
     );
 }
 
+/// gemini-embedding-001 with a Vertex-shaped table (`project` instead of
+/// `api_key`) builds the SEPARATE Vertex engine — same model name as the
+/// `gemini/` twin, but this endpoint layout, wire format, and auth.
+#[tokio::test]
+async fn gemini_embedding_001_on_vertex_uses_predict_endpoint() {
+    let (embed_addr, embed) = spawn_mock_vertex().await;
+    let (chat_addr, _chat) = spawn_mock_chat().await;
+    let toml = format!(
+        r#"
+[server]
+host = "127.0.0.1"
+port = 0
+
+[classifier]
+model = "gemini-embedding-001"
+
+[classifier.gemini-embedding-001]
+project = "test-project"
+access_token = "test-vertex-token"
+base_url = "http://{embed_addr}"
+
+[[models]]
+name = "m"
+base_url = "http://{chat_addr}"
+type = "fast"
+modalities = ["text"]
+"#
+    );
+    let cfg = config::parse(&toml).expect("parse config");
+    let engine = engines::build(&cfg.classifier).await.expect("build engine");
+    assert_eq!(engine.name(), "gemini-embedding-001");
+    assert_eq!(engine.context_char_budget(), 6_000);
+    assert_eq!(engine.current_turn_char_budget(), 2_000);
+
+    let calls = embed.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "anchor embedding call");
+    assert!(
+        calls[0]
+            .path
+            .contains("publishers/google/models/gemini-embedding-001:predict"),
+        "unexpected endpoint path: {}",
+        calls[0].path
+    );
+    assert_eq!(calls[0].bearer.as_deref(), Some("test-vertex-token"));
+}
+
 /// The GCP project is mandatory: a selected Vertex engine without one must
 /// fail at startup with an actionable message (never limp along).
 #[tokio::test]

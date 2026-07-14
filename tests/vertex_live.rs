@@ -11,7 +11,7 @@
 //! token instead.
 
 use hyper_mcp_router::classifier::{ClassifierModel, ModelTier};
-use hyper_mcp_router::config::{ClassifierConfig, VertexEmbeddingConfig};
+use hyper_mcp_router::config::{ClassifierConfig, GoogleEmbeddingConfig, VertexEmbeddingConfig};
 
 #[tokio::test]
 #[ignore = "hits the live Vertex AI API; needs TE005_PROJECT (+ ADC or GOOGLE_ACCESS_TOKEN)"]
@@ -80,6 +80,51 @@ async fn vertex_text_embedding_005_classifies_live() {
         hard.complexity >= ModelTier::Balanced,
         "hard prompt should be balanced+"
     );
+    assert!(
+        image.image_generation,
+        "image premise should set image_generation"
+    );
+}
+
+/// gemini-embedding-001 on the **Vertex** surface (project set, no api_key):
+/// the auth-driven dispatch must build the vertex twin and classify live.
+#[tokio::test]
+#[ignore = "hits the live Vertex AI API; needs TE005_PROJECT (+ ADC or GOOGLE_ACCESS_TOKEN)"]
+async fn gemini_embedding_001_on_vertex_classifies_live() {
+    let Ok(project) = std::env::var("TE005_PROJECT") else {
+        panic!("set TE005_PROJECT to run this test");
+    };
+    let access_token = std::env::var("GOOGLE_ACCESS_TOKEN").ok();
+
+    let cfg = ClassifierConfig {
+        model: ClassifierModel::GeminiEmbedding001,
+        gemini_embedding_001: GoogleEmbeddingConfig {
+            project: Some(project),
+            access_token,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let engine = hyper_mcp_router::engines::build(&cfg)
+        .await
+        .expect("auth-driven dispatch must build the vertex twin");
+    assert_eq!(engine.name(), "gemini-embedding-001");
+
+    let simple = engine
+        .classify("What is the capital of France?", "", false)
+        .await
+        .expect("simple classify");
+    let image = engine
+        .classify(
+            "here is my request",
+            "Draw a picture of a cat wearing a hat.",
+            false,
+        )
+        .await
+        .expect("image classify");
+    println!("simple -> {simple:?}");
+    println!("image  -> {image:?}");
     assert!(
         image.image_generation,
         "image premise should set image_generation"

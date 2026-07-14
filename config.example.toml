@@ -58,16 +58,22 @@ trivial_max_words = 6
 #intra_op_threads = 2
 
 # Settings for the remote embedding engines. Ignored unless selected above.
-# The Gemini family (below) shares the same shape: api_key is
-# REQUIRED when the engine is selected (startup fails without it) and
-# resolves exactly like a routed model's key: plaintext, env-var expansion,
-# or { source = "keyring", service = "...", user = "..." }.
-# (text-embedding-005 is Vertex-AI-only and has its own shape — see below.)
+# The gemini-embedding models are published on TWO Google API surfaces, and
+# the auth fields choose which engine runs — set EXACTLY ONE of:
+#   api_key  -> Generative Language API (generativelanguage.googleapis.com);
+#               resolves like a routed model's key (plaintext, env-var
+#               expansion, or a keyring table)
+#   project  -> Vertex AI (regional aiplatform endpoint); auth via ADC by
+#               default, or a static access_token override; location,
+#               quota_project as for text-embedding-005 below
+# Setting both (or neither) fails fast at startup.
 # (The ":-" empty default below keeps config loading working when the env
 # var is unset — env expansion runs over the whole file, comments included;
 # a selected engine with an empty key still fails fast with a clear error.)
 #[classifier.gemini-embedding-001]
-#api_key = "${GEMINI_API_KEY:-}"
+#api_key = "${GEMINI_API_KEY:-}"   # Generative Language API…
+##project = "my-gcp-project"       # …OR Vertex AI (never both)
+##location = "us-central1"
 #base_url = "https://generativelanguage.googleapis.com"  # optional override
 #max_concurrency = 32          # concurrent embed calls (the "session pool")
 #request_timeout_secs = 10     # per embed call

@@ -1,7 +1,12 @@
 //! The Vertex AI embedding engine family: shared transport here in `mod.rs`,
-//! **one file per model** in this directory (`text_embedding_005.rs`), each
-//! defining a [`VertexSpec`] and delegating to the shared [`VertexEmbedding`]
-//! engine.
+//! **one file per model** in this directory (`text_embedding_005.rs`,
+//! `gemini_embedding_001.rs`, `gemini_embedding_2.rs`), each defining a
+//! [`VertexSpec`] and delegating to the shared [`VertexEmbedding`] engine.
+//!
+//! The gemini-embedding models also exist on the Generative Language API
+//! (the `gemini/` family) — same model, **different engine**: the auth
+//! fields of the engine's config table pick which one runs (see
+//! `config::GoogleEmbeddingConfig::surface`).
 //!
 //! Vertex AI is a **separate API from the Gemini Developer API** used by the
 //! `gemini/` family: some embedding models (notably `text-embedding-005`) are
@@ -44,6 +49,8 @@
 //! proxy, as with every engine. Error messages never echo user content, and
 //! the access token is never logged.
 
+pub mod gemini_embedding_001;
+pub mod gemini_embedding_2;
 pub mod text_embedding_005;
 
 use std::time::Duration;

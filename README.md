@@ -140,8 +140,8 @@ and never change when an engine is added.
 | Model | File | Interaction | Sessions | Context budgets (window / current turn) |
 |---|---|---|---|---|
 | `deberta-v3-xsmall-zeroshot` (default) | `engines/deberta_v3_xsmall_zeroshot.rs` | embedded ONNX NLI, fully local | ORT session pool, auto-sized by CPU + memory | 1000 / 400 chars (512-token model) |
-| `gemini-embedding-001` | `engines/gemini/embedding_001.rs` | remote anchor-prototype embeddings (Gemini API) | concurrent embed calls (default 32) | 6000 / 2000 chars (2048-token model) |
-| `gemini-embedding-2` | `engines/gemini/embedding_2.rs` | remote anchor-prototype embeddings (Gemini API) | concurrent embed calls (default 32) | 24000 / 8000 chars (8192-token model) |
+| `gemini-embedding-001` | `engines/gemini/embedding_001.rs` · `engines/vertex/gemini_embedding_001.rs` | remote anchor-prototype embeddings (Gemini API **or** Vertex AI — auth-selected) | concurrent embed calls (default 32) | 6000 / 2000 chars (2048-token model) |
+| `gemini-embedding-2` | `engines/gemini/embedding_2.rs` · `engines/vertex/gemini_embedding_2.rs` | remote anchor-prototype embeddings (Gemini API **or** Vertex AI — auth-selected) | concurrent embed calls (default 32) | 24000 / 8000 chars (8192-token model) |
 | `text-embedding-005` | `engines/vertex/text_embedding_005.rs` | remote anchor-prototype embeddings (Vertex AI) | concurrent embed calls (default 32) | 6000 / 2000 chars (2048-token model) |
 
 Both budgets are trait methods (`context_char_budget`,
@@ -156,15 +156,20 @@ The remote engines (Gemini and Vertex AI families) classify by
 class (one batched call, failing fast on a bad credential or unreachable
 endpoint), mean-pool them into prototype vectors, and per request cosine-score
 the window and current turn against those prototypes. Each family's `mod.rs`
-owns only its transport — wire format, auth, endpoint layout. The Gemini
-family takes a **required** `api_key` (plaintext / `${ENV_VAR}` / OS keyring);
-`text-embedding-005` is published only on **Vertex AI**, so its `vertex/`
-family instead takes a GCP `project` and `location` (plus an optional
-`quota_project` for quota/billing attribution), authenticating via
-**Application Default Credentials** (service-account key file, `gcloud auth
-application-default login`, or the GCE/Cloud Run metadata server — token
-refresh handled by `google-cloud-auth`), with an optional static
-`access_token` override for quick tests. Per-request API failures degrade to
+owns only its transport — wire format, auth, endpoint layout. The
+`gemini-embedding` models are published on **both** Google surfaces; the
+router treats these as two separate engines per model that happen to share a
+name, and **the auth fields of the engine's config table pick which one
+runs**: `api_key` (plaintext / `${ENV_VAR}` / OS keyring) selects the
+Generative Language engine in `gemini/`, while `project` selects the Vertex
+AI engine in `vertex/` (setting both is a startup error).
+`text-embedding-005` is published only on **Vertex AI**. The `vertex/` family
+takes a GCP `project` and `location` (plus an optional `quota_project` for
+quota/billing attribution), authenticating via **Application Default
+Credentials** (service-account key file, `gcloud auth application-default
+login`, or the GCE/Cloud Run metadata server — token refresh handled by
+`google-cloud-auth`), with an optional static `access_token` override for
+quick tests. Per-request API failures degrade to
 the balanced default like any engine failure.
 
 **Privacy caveat**: the remote engines send prompt text (the classification
