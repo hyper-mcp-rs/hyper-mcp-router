@@ -3,14 +3,15 @@
 //! Requests and responses are handled as raw `serde_json::Value` throughout —
 //! the router never deserialises into typed OpenAI structs, guaranteeing
 //! byte-for-byte passthrough of every field the client sends. Only `messages`,
-//! `model`, `stream`, and `n` are ever read or mutated.
+//! `model`, `stream`, and `n` are ever read; only `model` is rewritten
+//! (`n > 1` is rejected up front rather than silently altered).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
     body::{Body, Bytes},
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -19,15 +20,17 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::classifier::{
-    build_classification_window, detect_required_modalities, extract_prompt,
-    looks_like_image_generation, truncate_prompt, Classification, Classifier, Modality,
-    ModalitySet, ModelTier, CLASSIFICATION_CHAR_BUDGET,
+    build_classification_window, extract_prompt, has_nonempty_user_text,
+    looks_like_image_generation, truncate_prompt, Classification, Classifier, ModelTier,
+    CLASSIFICATION_CHAR_BUDGET,
 };
 use crate::config::RouterConfig;
+use crate::modality::{detect_required_modalities, Modality, ModalitySet};
 
-/// Shared, cloneable server state. `Classifier` holds an unsynchronised
-/// `Session` (ORT supports concurrent `run(&self)`); everything here is
-/// `Send + Sync`.
+/// Shared, cloneable server state. The `Classifier` synchronises its ORT
+/// sessions internally (a pool of independent sessions — see
+/// `classifier::SessionPool`), so everything here is `Send + Sync` and cheap
+/// to clone.
 #[derive(Clone)]
 pub struct AppState {
     pub classifier: Arc<Classifier>,
@@ -37,13 +40,21 @@ pub struct AppState {
 
 impl AppState {
     /// Build the shared state, constructing the upstream HTTP client with the
-    /// configured connect/request timeouts. **No retries** are configured — a
-    /// retry could trigger duplicate, billable generations.
+    /// configured connect/idle timeouts. The **total** request timeout is
+    /// applied per-request, and only to non-streaming requests — a client-wide
+    /// total timeout would sever long-lived SSE streams mid-flight. **No
+    /// retries** are configured — a retry could trigger duplicate, billable
+    /// generations.
     pub fn new(classifier: Arc<Classifier>, config: Arc<RouterConfig>) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(config.server.connect_timeout_secs))
-            .timeout(Duration::from_secs(config.server.request_timeout_secs))
-            .build()?;
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(config.server.connect_timeout_secs));
+        // Idle guard: abort when no bytes arrive for this long. This is what
+        // bounds a stalled stream, since streams have no total deadline.
+        if config.server.stream_idle_timeout_secs > 0 {
+            builder =
+                builder.read_timeout(Duration::from_secs(config.server.stream_idle_timeout_secs));
+        }
+        let http = builder.build()?;
         Ok(AppState {
             classifier,
             config,
@@ -53,12 +64,16 @@ impl AppState {
 }
 
 /// Build the axum router. `/health` is a liveness probe that touches no
-/// backend; anything unmatched returns 404.
+/// backend; anything unmatched returns 404. The body limit is raised from
+/// axum's 2 MB default — base64 image/audio/file payloads are far larger — to
+/// the configured `server.max_body_bytes`.
 pub fn build_router(state: AppState) -> Router {
+    let max_body_bytes = state.config.server.max_body_bytes;
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
 
@@ -70,8 +85,10 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({ "status": "ok" })))
 }
 
-/// The single virtual model id advertised to clients. The router deliberately
-/// never exposes its configured backend models.
+/// The single virtual model id advertised to clients. The router never
+/// *advertises* its configured backend models; note however that upstream
+/// response bodies pass through verbatim, so the `model` field of a completion
+/// does name the backend that produced it.
 pub const ADVERTISED_MODEL: &str = "hyper-mcp-router";
 
 /// `GET /v1/models`: advertises the single virtual model, never the backends.
@@ -100,94 +117,67 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
         _ => return bad_request("request body must be a JSON object"),
     };
 
-    // 2. Resolve the required modality set deterministically — no model needed.
-    //    `image-output` is the only inferred modality; its cheap lexical signal
-    //    is applied here so the full required set is known before we decide
-    //    whether classification is even necessary.
-    let mut required = detect_required_modalities(&body);
-    let current_turn = extract_prompt(&body)
-        .map(|p| truncate_prompt(&p))
-        .unwrap_or_default();
-    let lexical_image = looks_like_image_generation(&current_turn);
-    if lexical_image {
-        required.insert(Modality::ImageOutput);
+    // 2. Reject multi-choice requests up front. The router serves exactly one
+    //    completion per request; silently honoring only one of `n` requested
+    //    choices would be a contract violation, so it is an explicit error
+    //    instead of a silent mutation.
+    if requests_multiple_choices(&body) {
+        return bad_request("`n` > 1 is not supported; send one request per completion");
     }
 
-    let prompt_len = current_turn.chars().count();
+    // 3/4. Resolve the required modality set and (when it can affect the
+    //      choice) the complexity tier — see [`resolve_route`].
+    let route = resolve_route(&state, &body).await;
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
-    // 3. Classify complexity ONLY when it can affect the choice. With <= 1 model
-    //    able to serve the required set there is nothing to rank, so skip the
-    //    (serialized) NLI pass entirely and route directly — single-model or
-    //    single-candidate deployments then run zero inference. When >= 2
-    //    candidates exist we classify, and the NLI image-generation signal may
-    //    further constrain the set.
-    // `None` records that classification was skipped (logged honestly rather
-    // than as a fabricated tier).
-    let classified: Option<ModelTier>;
-    let image_source;
-    if state.config.candidate_count(&required) <= 1 {
-        classified = None;
-        image_source = if lexical_image { Some("lexical") } else { None };
-    } else {
-        let classification = classify_or_default(&state.classifier, &body).await;
-        if classification.image_generation {
-            required.insert(Modality::ImageOutput);
-        }
-        classified = Some(classification.complexity);
-        image_source = if classification.image_generation {
-            if lexical_image {
-                Some("lexical")
-            } else {
-                Some("nli-threshold")
-            }
-        } else {
-            None
-        };
-    }
     // The tier only ranks among >= 2 candidates; when skipped, any value selects
     // the sole (or zero) candidate.
-    let complexity = classified.unwrap_or(ModelTier::Balanced);
+    let complexity = route.classified.unwrap_or(ModelTier::Balanced);
 
-    let backend = match state.config.select_model(&required, complexity) {
+    let backend = match state.config.select_model(&route.required, complexity) {
         Some(m) => m,
         None => {
             tracing::info!(
-                modalities = ?required.to_kebab_vec(),
-                complexity = ?classified,
-                status = 415u16,
+                modalities = ?route.required.to_kebab_vec(),
+                complexity = ?route.classified,
+                status = 422u16,
                 streaming,
-                prompt_chars = prompt_len,
+                prompt_chars = route.prompt_chars,
                 "no backend covers the required modality set"
             );
-            return unsupported_modality_error(&required);
+            return unsupported_modality_error(&route.required);
         }
     };
 
-    // 3. Rewrite the model field to the selected backend's configured name.
+    // 5. Rewrite the model field to the selected backend's configured name.
+    //    Everything else is forwarded untouched.
     body["model"] = Value::String(backend.name.clone());
-
-    // 4. Sanitise: drop `n` unconditionally; forward everything else untouched.
-    sanitise(&mut body);
 
     // Metadata-only routing log (no user content).
     tracing::info!(
-        modalities = ?required.to_kebab_vec(),
-        image_output_source = image_source,
-        complexity = ?classified,
+        modalities = ?route.required.to_kebab_vec(),
+        image_output_source = route.image_source,
+        complexity = ?route.classified,
         model = %backend.name,
         streaming,
-        prompt_chars = prompt_len,
+        prompt_chars = route.prompt_chars,
         "routing request"
     );
 
-    // 5. Forward to `{base_url}/chat/completions`.
+    // 6. Forward to `{base_url}/chat/completions`. The total request timeout
+    //    applies only to non-streaming requests; streams are bounded by the
+    //    client-level idle (read) timeout instead.
     let url = format!(
         "{}/chat/completions",
         backend.base_url.as_str().trim_end_matches('/')
     );
     // Keyless backends (no configured `api_key`) get no `Authorization` header.
     let mut request = state.http.post(&url).json(&body);
+    if !streaming {
+        request = request.timeout(Duration::from_secs(
+            state.config.server.request_timeout_secs,
+        ));
+    }
     if let Some(api_key) = &backend.api_key {
         request = request.bearer_auth(api_key);
     }
@@ -216,7 +206,7 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
         "upstream responded"
     );
 
-    // 6/7. Stream SSE bytes on success; otherwise forward the full body.
+    // 7. Stream SSE bytes on success; otherwise forward the full body.
     if streaming && status.is_success() {
         stream_passthrough(resp)
     } else {
@@ -224,17 +214,130 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
     }
 }
 
+/// One request's routing decision: the resolved modality set, the complexity
+/// tier (`None` when classification was skipped), and metadata for honest
+/// logging.
+struct RouteResolution {
+    required: ModalitySet,
+    classified: Option<ModelTier>,
+    image_source: Option<&'static str>,
+    prompt_chars: usize,
+}
+
+/// Resolve a request's route along both axes.
+///
+/// The modality set is read deterministically first — `image-output` may
+/// already be present (explicit `modalities` field); otherwise it is
+/// *inferred* (lexical, then NLI) and applied as a soft preference: never at
+/// the cost of making the request unroutable.
+///
+/// Complexity is classified ONLY when it can affect the choice. With <= 1
+/// model able to serve the required set there is nothing to rank, so the
+/// (serialized) NLI pass is skipped entirely — single-model or
+/// single-candidate deployments run zero inference. (That also skips the NLI
+/// image-generation signal; the lexical signal still applies.) `classified:
+/// None` records the skip, logged honestly rather than as a fabricated tier.
+async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
+    let mut required = detect_required_modalities(body);
+    let current_turn = extract_prompt(body)
+        .map(|p| truncate_prompt(&p))
+        .unwrap_or_default();
+    let lexical_image = looks_like_image_generation(&current_turn);
+    let mut image_source: Option<&'static str> = if required.contains(Modality::ImageOutput) {
+        Some("explicit")
+    } else {
+        None
+    };
+    // Set once an inferred image intent proves unsatisfiable, so the NLI signal
+    // doesn't retry (and re-log) the same dead end.
+    let mut image_intent_dropped = false;
+    if lexical_image && image_source.is_none() {
+        if try_require_image_output(&state.config, &mut required) {
+            image_source = Some("lexical");
+        } else {
+            image_intent_dropped = true;
+        }
+    }
+
+    let classified: Option<ModelTier> = if state.config.candidate_count(&required) <= 1 {
+        None
+    } else {
+        let classification =
+            classify_or_default(&state.classifier, body, &current_turn, lexical_image).await;
+        if classification.image_generation
+            && !required.contains(Modality::ImageOutput)
+            && !image_intent_dropped
+        {
+            if try_require_image_output(&state.config, &mut required) {
+                image_source = Some(if lexical_image {
+                    "lexical"
+                } else {
+                    "nli-threshold"
+                });
+            } else {
+                image_intent_dropped = true;
+            }
+        }
+        Some(classification.complexity)
+    };
+    if image_intent_dropped {
+        tracing::info!(
+            modalities = ?required.to_kebab_vec(),
+            "inferred image-generation intent, but no backend covers image-output; routing without it"
+        );
+    }
+
+    RouteResolution {
+        required,
+        classified,
+        image_source,
+        prompt_chars: current_turn.chars().count(),
+    }
+}
+
+/// Whether the request asks for more than one choice (`n > 1`). A non-numeric
+/// `n` is left for the upstream to reject.
+fn requests_multiple_choices(body: &Value) -> bool {
+    body.get("n")
+        .and_then(Value::as_f64)
+        .is_some_and(|n| n > 1.0)
+}
+
+/// Soft-insert the **inferred** `image-output` modality: apply it only if some
+/// configured model can still serve the request afterwards. Deterministic
+/// modalities are hard constraints (422 when uncovered), but image intent is
+/// probabilistic — degrading to a text route beats rejecting a servable
+/// request over an inference. Returns whether it was applied.
+fn try_require_image_output(config: &RouterConfig, required: &mut ModalitySet) -> bool {
+    let mut with_image = *required;
+    with_image.insert(Modality::ImageOutput);
+    if config.candidate_count(&with_image) > 0 {
+        *required = with_image;
+        true
+    } else {
+        false
+    }
+}
+
 /// Classify a request's complexity from a **window of recent substantive user
 /// turns** (see [`build_classification_window`]), mapping any model failure to
 /// the balanced default.
 ///
-/// - No user message at all → balanced default (unchanged).
-/// - User turns exist but all are trivial (pure chit-chat) → the window is empty,
-///   so route the baseline `Fast` *without* running the model.
-/// - Otherwise classify the window once. The current turn (last user message)
-///   drives the image-generation axis so an old image request in the window
-///   can't misroute the present one.
-async fn classify_or_default(classifier: &Arc<Classifier>, body: &Value) -> Classification {
+/// - No usable user text at all (no user messages, or only empty/attachment-only
+///   content) → balanced default: there is nothing to judge, so don't pretend
+///   it's chit-chat.
+/// - Non-empty user text exists but all of it is trivial (pure chit-chat) → the
+///   window is empty, so route the baseline `Fast` *without* running the model.
+/// - Otherwise classify the window once. The current turn (`current_turn`, the
+///   last user message, already truncated) drives the image-generation axis so
+///   an old image request in the window can't misroute the present one;
+///   `lexical_image` is its precomputed lexical signal.
+async fn classify_or_default(
+    classifier: &Arc<Classifier>,
+    body: &Value,
+    current_turn: &str,
+    lexical_image: bool,
+) -> Classification {
     let window = build_classification_window(
         body,
         classifier.trivial_max_words(),
@@ -242,8 +345,9 @@ async fn classify_or_default(classifier: &Arc<Classifier>, body: &Value) -> Clas
     );
     let Some(window) = window else {
         // Nothing substantive to classify.
-        return if extract_prompt(body).is_some() {
-            // A user message exists but was trivial: pure chit-chat → Fast.
+        return if has_nonempty_user_text(body) {
+            // The user did say something, but all of it was trivial: pure
+            // chit-chat → Fast.
             Classification {
                 complexity: ModelTier::Fast,
                 image_generation: false,
@@ -253,15 +357,15 @@ async fn classify_or_default(classifier: &Arc<Classifier>, body: &Value) -> Clas
         };
     };
 
-    // Image-generation intent is a property of the *current* turn only.
-    let current_turn = extract_prompt(body)
-        .map(|p| truncate_prompt(&p))
-        .unwrap_or_default();
-
     // Inference is CPU-bound (one batched forward pass): run it on the blocking
     // pool so it never stalls an async worker.
     let classifier = Arc::clone(classifier);
-    match tokio::task::spawn_blocking(move || classifier.classify(&window, &current_turn)).await {
+    let current_turn = current_turn.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        classifier.classify(&window, &current_turn, lexical_image)
+    })
+    .await
+    {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             tracing::error!(error = %e, "classification failed; using balanced default");
@@ -274,46 +378,80 @@ async fn classify_or_default(classifier: &Arc<Classifier>, body: &Value) -> Clas
     }
 }
 
-/// Remove `body["n"]` unconditionally. This is the only field the router
-/// strips; all others pass through untouched.
-fn sanitise(body: &mut Value) {
-    if let Value::Object(map) = body {
-        map.remove("n");
-    }
-}
-
 // ───────────────────────────────────────────────────────────────────────────
 // Response construction
 // ───────────────────────────────────────────────────────────────────────────
 
+/// Whether an upstream response header may be forwarded to the client.
+/// Hop-by-hop headers (RFC 9110 §7.6.1) describe the upstream connection, not
+/// the payload; payload-framing headers (`content-length`,
+/// `transfer-encoding`) are recomputed by axum for the response we build.
+/// Everything else — `x-request-id`, rate-limit headers, `retry-after`, … —
+/// passes through so clients can implement backoff and tracing.
+fn is_end_to_end_header(name: &header::HeaderName) -> bool {
+    !matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+    )
+}
+
+/// Copy every end-to-end header from `src` into `dst` (preserving repeats).
+fn copy_end_to_end_headers(src: &header::HeaderMap, dst: &mut header::HeaderMap) {
+    for (name, value) in src {
+        if is_end_to_end_header(name) {
+            dst.append(name.clone(), value.clone());
+        }
+    }
+}
+
 /// Pipe raw upstream SSE bytes straight to the client. No parsing, buffering,
-/// or model-field rewriting.
+/// or model-field rewriting; upstream end-to-end headers are preserved, with
+/// SSE defaults filled in only when the upstream omitted them.
 fn stream_passthrough(resp: reqwest::Response) -> Response {
     let status = resp.status();
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
+    let upstream_headers = resp.headers().clone();
+    let mut builder = Response::builder().status(status);
+    if let Some(dst) = builder.headers_mut() {
+        copy_end_to_end_headers(&upstream_headers, dst);
+    }
+    if !upstream_headers.contains_key(header::CONTENT_TYPE) {
+        builder = builder.header(header::CONTENT_TYPE, "text/event-stream");
+    }
+    if !upstream_headers.contains_key(header::CACHE_CONTROL) {
+        builder = builder.header(header::CACHE_CONTROL, "no-cache");
+    }
+    builder
         .body(Body::from_stream(resp.bytes_stream()))
         .expect("valid streaming response")
 }
 
 /// Forward a non-streaming (or error) upstream response verbatim: same status,
-/// same body, preserved content type.
+/// same body, preserved end-to-end headers.
 async fn buffered_passthrough(resp: reqwest::Response) -> Response {
     let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .cloned()
-        .unwrap_or_else(|| header::HeaderValue::from_static("application/json"));
+    let upstream_headers = resp.headers().clone();
 
     match resp.bytes().await {
-        Ok(bytes) => Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, content_type)
-            .body(Body::from(bytes))
-            .expect("valid buffered response"),
+        Ok(bytes) => {
+            let mut builder = Response::builder().status(status);
+            if let Some(dst) = builder.headers_mut() {
+                copy_end_to_end_headers(&upstream_headers, dst);
+            }
+            if !upstream_headers.contains_key(header::CONTENT_TYPE) {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+            }
+            builder
+                .body(Body::from(bytes))
+                .expect("valid buffered response")
+        }
         Err(e) => {
             tracing::warn!(error = %e, "failed to read upstream response body");
             upstream_error(StatusCode::BAD_GATEWAY, "upstream_body_error")
@@ -329,11 +467,13 @@ fn bad_request(message: &str) -> Response {
         .into_response()
 }
 
-/// 415 with a minimal JSON body naming the unsatisfiable modality set.
+/// 422 with a minimal JSON body naming the unsatisfiable modality set. (422
+/// Unprocessable Content, not 415: the request *media type* is fine — it is
+/// the required capability combination no configured backend can serve.)
 fn unsupported_modality_error(required: &ModalitySet) -> Response {
     let mods = required.to_kebab_vec();
     (
-        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        StatusCode::UNPROCESSABLE_ENTITY,
         Json(json!({
             "error": {
                 "message": format!("no configured model supports the required modality set: {mods:?}"),
@@ -427,22 +567,82 @@ mod tests {
         assert!(before.contains(Modality::ImageInput));
     }
 
-    // ── sanitise ──────────────────────────────────────────────────────────
+    // ── n validation ──────────────────────────────────────────────────
     #[test]
-    fn sanitise_removes_n_only() {
-        let mut body = json!({
-            "model": "x",
-            "n": 4,
-            "messages": [],
-            "logprobs": true,
-            "top_logprobs": 5,
-            "custom_unknown_key": {"nested": [1, 2, 3]},
-        });
-        sanitise(&mut body);
-        assert!(body.get("n").is_none());
-        assert_eq!(body["logprobs"], true);
-        assert_eq!(body["top_logprobs"], 5);
-        assert_eq!(body["custom_unknown_key"]["nested"][2], 3);
-        assert_eq!(body["model"], "x");
+    fn multiple_choices_detected_only_above_one() {
+        assert!(!requests_multiple_choices(&json!({"messages": []})));
+        assert!(!requests_multiple_choices(&json!({"n": 1, "messages": []})));
+        assert!(requests_multiple_choices(&json!({"n": 2, "messages": []})));
+        assert!(requests_multiple_choices(
+            &json!({"n": 4.0, "messages": []})
+        ));
+        // Non-numeric `n` is not ours to police — the upstream rejects it.
+        assert!(!requests_multiple_choices(
+            &json!({"n": "4", "messages": []})
+        ));
+    }
+
+    // ── header passthrough ───────────────────────────────────────────
+    #[test]
+    fn end_to_end_headers_forwarded_hop_by_hop_dropped() {
+        let mut src = header::HeaderMap::new();
+        src.insert("x-request-id", "abc-123".parse().unwrap());
+        src.insert("x-ratelimit-remaining-tokens", "99".parse().unwrap());
+        src.insert(header::RETRY_AFTER, "5".parse().unwrap());
+        src.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        src.insert(header::CONNECTION, "keep-alive".parse().unwrap());
+        src.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        src.insert(header::CONTENT_LENGTH, "42".parse().unwrap());
+
+        let mut dst = header::HeaderMap::new();
+        copy_end_to_end_headers(&src, &mut dst);
+
+        assert_eq!(dst.get("x-request-id").unwrap(), "abc-123");
+        assert_eq!(dst.get("x-ratelimit-remaining-tokens").unwrap(), "99");
+        assert_eq!(dst.get(header::RETRY_AFTER).unwrap(), "5");
+        assert_eq!(dst.get(header::CONTENT_TYPE).unwrap(), "application/json");
+        assert!(dst.get(header::CONNECTION).is_none());
+        assert!(dst.get(header::TRANSFER_ENCODING).is_none());
+        assert!(dst.get(header::CONTENT_LENGTH).is_none());
+    }
+
+    // ── inferred image-output soft insertion ─────────────────────────────
+    fn config_with(models: Vec<crate::config::ModelConfig>) -> RouterConfig {
+        RouterConfig {
+            server: Default::default(),
+            classifier: Default::default(),
+            models,
+        }
+    }
+
+    fn model(name: &str, mods: &[Modality]) -> crate::config::ModelConfig {
+        crate::config::ModelConfig {
+            name: name.to_string(),
+            base_url: url::Url::parse("http://x").unwrap(),
+            api_key: None,
+            tier: ModelTier::Balanced,
+            modalities: mods.to_vec(),
+        }
+    }
+
+    #[test]
+    fn inferred_image_output_applied_when_covered() {
+        let cfg = config_with(vec![
+            model("text", &[Modality::Text]),
+            model("image", &[Modality::Text, Modality::ImageOutput]),
+        ]);
+        let mut required: ModalitySet = [Modality::Text].into_iter().collect();
+        assert!(try_require_image_output(&cfg, &mut required));
+        assert!(required.contains(Modality::ImageOutput));
+    }
+
+    #[test]
+    fn inferred_image_output_dropped_when_uncovered() {
+        // No image-capable backend: the inferred intent must degrade, keeping
+        // the request routable, rather than turn into a 422.
+        let cfg = config_with(vec![model("text", &[Modality::Text])]);
+        let mut required: ModalitySet = [Modality::Text].into_iter().collect();
+        assert!(!try_require_image_output(&cfg, &mut required));
+        assert!(!required.contains(Modality::ImageOutput));
     }
 }

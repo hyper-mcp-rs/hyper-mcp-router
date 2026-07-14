@@ -81,6 +81,8 @@ async fn spawn_mock_backend() -> (SocketAddr, Calls) {
     let calls: Calls = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
         .route("/chat/completions", post(mock_chat))
+        // The router accepts large multimodal bodies; the mock must too.
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(calls.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -118,6 +120,7 @@ async fn mock_chat(
         Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
+            .header("x-mock-request-id", "mock-123")
             .body(Body::from(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
             ))
@@ -131,6 +134,7 @@ async fn mock_chat(
         Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
+            .header("x-mock-request-id", "mock-123")
             .body(Body::from(serde_json::to_vec(&resp).unwrap()))
             .unwrap()
     }
@@ -276,6 +280,37 @@ base_url = "{base}"
 api_key = "test-key"
 type = "balanced"
 modalities = ["text", "image-input", "audio-input", "file-input", "audio-output", "image-output", "tools"]
+"#
+    )
+}
+
+/// Text-only tiers: no image-output (or any other extra modality) anywhere.
+/// Used to verify that *inferred* image intent degrades instead of 422-ing.
+fn text_only_config_toml(addr: SocketAddr) -> String {
+    let base = format!("http://{addr}");
+    format!(
+        r#"
+[server]
+host = "127.0.0.1"
+port = 0
+
+[[models]]
+name = "fast-text"
+base_url = "{base}"
+type = "fast"
+modalities = ["text"]
+
+[[models]]
+name = "balanced-text"
+base_url = "{base}"
+type = "balanced"
+modalities = ["text"]
+
+[[models]]
+name = "frontier-text"
+base_url = "{base}"
+type = "frontier"
+modalities = ["text"]
 "#
     )
 }
@@ -653,6 +688,40 @@ async fn image_generation_routes_to_image_gen_backend() {
     assert_eq!(h.last_call()["model"], "image-gen");
 }
 
+/// An explicit `modalities: ["image"]` request field is a deterministic,
+/// hard image-output requirement — no lexical/NLI inference needed.
+#[tokio::test]
+async fn explicit_image_modalities_field_routes_to_image_backend() {
+    let h = Harness::start().await;
+    let body = json!({
+        "model": ADVERTISED_MODEL,
+        "modalities": ["text", "image"],
+        // Deliberately phrased to evade the lexical image signal.
+        "messages": [{"role": "user", "content": "A cozy cabin in the woods at dusk."}],
+    });
+    let resp = h.chat(&body).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(h.last_call()["model"], "image-gen");
+}
+
+/// *Inferred* image-generation intent is a soft preference: when no backend
+/// covers image-output, the request degrades to a text route instead of 422.
+#[tokio::test]
+async fn inferred_image_intent_degrades_gracefully_when_uncovered() {
+    let h = Harness::start_with(CLASSIFIER.clone(), text_only_config_toml).await;
+    let resp = h.chat(&text_request("draw a picture of a cat")).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "an inferred (probabilistic) modality must never make a request unroutable"
+    );
+    let model = h.last_call()["model"].as_str().unwrap().to_string();
+    assert!(
+        TEXT_BACKENDS.contains(&model.as_str()),
+        "expected a text-tier backend, got {model:?}"
+    );
+}
+
 /// A request that offers `tools` must route to a tool-capable backend, whatever
 /// the complexity tier resolves to.
 #[tokio::test]
@@ -673,6 +742,67 @@ async fn tools_request_routes_to_tool_capable_backend() {
     assert_eq!(h.last_call()["model"], "agent");
 }
 
+/// A tool-loop continuation (transcript carrying `tool_calls` and a
+/// `role: "tool"` result) must route to a tool-capable backend even when the
+/// follow-up request omits the `tools` field.
+#[tokio::test]
+async fn tool_role_continuation_routes_to_tool_capable_backend() {
+    let h = Harness::start().await;
+    let body = json!({
+        "model": ADVERTISED_MODEL,
+        "messages": [
+            {"role": "user", "content": "What is the weather in Paris?"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp_c\": 21}"},
+        ],
+    });
+
+    let resp = h.chat(&body).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(h.last_call()["model"], "agent");
+}
+
+/// A large multimodal body (over axum's 2 MB default limit, under the router's
+/// configured ceiling) is accepted and routed — base64 attachments are exactly
+/// the requests the modality router exists to serve.
+#[tokio::test]
+async fn large_multimodal_body_is_accepted() {
+    let h = Harness::start().await;
+    // ~3 MB of base64 payload.
+    let data_url = format!("data:image/png;base64,{}", "A".repeat(3 * 1024 * 1024));
+    let body = json!({
+        "model": ADVERTISED_MODEL,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "What is in this image?"},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]}],
+    });
+
+    let resp = h.chat(&body).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(h.last_call()["model"], "vision");
+}
+
+/// Upstream end-to-end response headers (request ids, rate-limit metadata)
+/// reach the client.
+#[tokio::test]
+async fn upstream_headers_pass_through_to_client() {
+    let h = Harness::start().await;
+    let resp = h.chat(&text_request("Say hello.")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-mock-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("mock-123"),
+        "upstream response headers must pass through"
+    );
+}
+
 /// With a single model covering every modality, every request has exactly one
 /// candidate, so classification is skipped and everything routes to it —
 /// regardless of complexity or (lexical) image-generation intent.
@@ -690,10 +820,10 @@ async fn single_model_deployment_routes_everything() {
     }
 }
 
-/// A request whose combined modalities no single backend covers must yield 415
+/// A request whose combined modalities no single backend covers must yield 422
 /// and must never reach a backend.
 #[tokio::test]
-async fn uncovered_modality_combination_returns_415_and_makes_no_call() {
+async fn uncovered_modality_combination_returns_422_and_makes_no_call() {
     let h = Harness::start().await;
     // Needs image-input AND audio-input together — no single backend has both.
     let body = json!({
@@ -705,7 +835,7 @@ async fn uncovered_modality_combination_returns_415_and_makes_no_call() {
     });
 
     let resp = h.chat(&body).await;
-    assert_eq!(resp.status(), reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         h.call_count(),
         0,
@@ -713,14 +843,14 @@ async fn uncovered_modality_combination_returns_415_and_makes_no_call() {
     );
 }
 
-/// Passthrough fidelity: `n` is stripped, the model is rewritten, and every
-/// other field (including unknown ones) is forwarded untouched.
+/// Passthrough fidelity: the model is rewritten, and every other field
+/// (including unknown ones, and an innocuous `n = 1`) is forwarded untouched.
 #[tokio::test]
-async fn request_fields_pass_through_except_n_and_model() {
+async fn request_fields_pass_through_except_model() {
     let h = Harness::start().await;
     let body = json!({
         "model": ADVERTISED_MODEL,
-        "n": 4,
+        "n": 1,
         "temperature": 0.7,
         "top_logprobs": 5,
         "custom_unknown_key": {"nested": [1, 2, 3]},
@@ -731,7 +861,7 @@ async fn request_fields_pass_through_except_n_and_model() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     let forwarded = h.last_call();
-    assert!(forwarded.get("n").is_none(), "`n` must be stripped");
+    assert_eq!(forwarded["n"], 1, "`n` = 1 passes through untouched");
     assert_ne!(
         forwarded["model"], ADVERTISED_MODEL,
         "model must be rewritten"
@@ -740,6 +870,22 @@ async fn request_fields_pass_through_except_n_and_model() {
     assert_eq!(forwarded["temperature"], 0.7);
     assert_eq!(forwarded["top_logprobs"], 5);
     assert_eq!(forwarded["custom_unknown_key"]["nested"][2], 3);
+}
+
+/// A multi-choice request (`n > 1`) is rejected with 400 rather than silently
+/// altered — the router serves exactly one completion per request.
+#[tokio::test]
+async fn multi_choice_request_is_rejected_with_400() {
+    let h = Harness::start().await;
+    let mut body = text_request("Say hello.");
+    body["n"] = json!(4);
+    let resp = h.chat(&body).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        h.call_count(),
+        0,
+        "a rejected request must not be forwarded"
+    );
 }
 
 /// A configured `api_key` is forwarded upstream as a bearer token.
@@ -787,6 +933,15 @@ async fn streaming_request_is_passed_through_as_sse() {
     assert!(
         content_type.contains("text/event-stream"),
         "expected SSE content type, got {content_type:?}"
+    );
+
+    // Upstream headers survive the streaming path too.
+    assert_eq!(
+        resp.headers()
+            .get("x-mock-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("mock-123"),
+        "upstream headers must pass through on the streaming path"
     );
 
     let text = resp.text().await.expect("stream body");

@@ -31,21 +31,24 @@ pub struct ServeArgs {
     pub log_stdout: bool,
 
     /// Word ceiling for the trivial-prompt fast path. A user turn at or below
-    /// this length that looks like an acknowledgement/greeting (and carries no
-    /// reasoning cues) skips the classifier and routes as the Fast tier. Set to
-    /// 0 to disable the fast path entirely. Default mirrors
-    /// `classifier::DEFAULT_TRIVIAL_MAX_WORDS`.
-    #[arg(long, default_value_t = 6)]
-    pub trivial_max_words: usize,
+    /// this length that consists entirely of acknowledgement/greeting filler
+    /// (and carries no reasoning cues) skips the classifier and routes as the
+    /// Fast tier. Set to 0 to disable the fast path entirely. Overrides the
+    /// `[classifier] trivial_max_words` config setting (default
+    /// `classifier::DEFAULT_TRIVIAL_MAX_WORDS`).
+    #[arg(long)]
+    pub trivial_max_words: Option<usize>,
 
     /// Number of concurrent classifier inference sessions (pool size). Each is
-    /// an independent copy of the embedded model. Omit to auto-size from the
+    /// an independent copy of the embedded model. Overrides the `[classifier]
+    /// inference_pool_size` config setting; omit both to auto-size from the
     /// detected core count (see `classifier::plan_inference`).
     #[arg(long)]
     pub inference_pool_size: Option<usize>,
 
     /// ONNX Runtime intra-op threads per inference session (0 = runtime
-    /// default). Omit to auto-size from the detected core count. Keep
+    /// default). Overrides the `[classifier] intra_op_threads` config setting;
+    /// omit both to auto-size from the detected core count. Keep
     /// `pool_size * intra_op_threads` near the core count to avoid
     /// oversubscription.
     #[arg(long)]

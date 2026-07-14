@@ -15,7 +15,8 @@ use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
 use url::Url;
 
-use crate::classifier::{Modality, ModalitySet, ModelTier, DEFAULT_IMAGE_GEN_THRESHOLD};
+use crate::classifier::{ModelTier, DEFAULT_IMAGE_GEN_THRESHOLD, DEFAULT_TRIVIAL_MAX_WORDS};
+use crate::modality::{Modality, ModalitySet};
 
 /// Application identifier used for OS config/log directory discovery.
 const APP_NAME: &str = "hyper-mcp-router";
@@ -41,9 +42,21 @@ pub struct ServerConfig {
     /// Upstream connect timeout, seconds.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
-    /// Upstream total request timeout, seconds.
+    /// Upstream total request timeout for **non-streaming** requests, seconds.
+    /// Streaming responses have no total deadline (an SSE stream may
+    /// legitimately outlive any fixed budget); they are guarded by
+    /// `stream_idle_timeout_secs` instead.
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+    /// Upstream idle (per-read) timeout, seconds: abort when no bytes arrive
+    /// for this long. This is what bounds a stalled streaming response.
+    /// `0` disables the idle guard.
+    #[serde(default = "default_stream_idle_timeout")]
+    pub stream_idle_timeout_secs: u64,
+    /// Maximum accepted request body size, bytes. Base64-encoded image/audio/
+    /// file payloads are large; the default (32 MiB) comfortably covers them.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
 }
 
 impl Default for ServerConfig {
@@ -53,6 +66,8 @@ impl Default for ServerConfig {
             port: default_port(),
             connect_timeout_secs: default_connect_timeout(),
             request_timeout_secs: default_request_timeout(),
+            stream_idle_timeout_secs: default_stream_idle_timeout(),
+            max_body_bytes: default_max_body_bytes(),
         }
     }
 }
@@ -70,24 +85,49 @@ fn default_connect_timeout() -> u64 {
 fn default_request_timeout() -> u64 {
     600
 }
+fn default_stream_idle_timeout() -> u64 {
+    300
+}
+fn default_max_body_bytes() -> usize {
+    32 * 1024 * 1024
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClassifierConfig {
     /// Absolute P(entailment) floor for the image-generation axis.
     #[serde(default = "default_image_gen_threshold")]
     pub image_generation_threshold: f32,
+    /// Word ceiling for the trivial fast-path (`0` disables). The
+    /// `--trivial-max-words` CLI flag overrides this.
+    #[serde(default = "default_trivial_max_words")]
+    pub trivial_max_words: usize,
+    /// Concurrent inference sessions. Omit for auto-sizing from the detected
+    /// core count (see `classifier::plan_inference`). The
+    /// `--inference-pool-size` CLI flag overrides this.
+    #[serde(default)]
+    pub inference_pool_size: Option<usize>,
+    /// ONNX Runtime intra-op threads per session (`0` = runtime default). Omit
+    /// for auto-sizing. The `--intra-op-threads` CLI flag overrides this.
+    #[serde(default)]
+    pub intra_op_threads: Option<usize>,
 }
 
 impl Default for ClassifierConfig {
     fn default() -> Self {
         ClassifierConfig {
             image_generation_threshold: default_image_gen_threshold(),
+            trivial_max_words: default_trivial_max_words(),
+            inference_pool_size: None,
+            intra_op_threads: None,
         }
     }
 }
 
 fn default_image_gen_threshold() -> f32 {
     DEFAULT_IMAGE_GEN_THRESHOLD
+}
+fn default_trivial_max_words() -> usize {
+    DEFAULT_TRIVIAL_MAX_WORDS
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -358,7 +398,7 @@ impl RouterConfig {
     /// with no special modality is plain text, so the **only** requirement is
     /// that at least one model (in any tier) is text-capable. Every other
     /// modality is best-effort — a request that requires an uncovered modality
-    /// is answered with a `415` at request time, not rejected at startup.
+    /// is answered with a `422` at request time, not rejected at startup.
     pub fn validate_coverage(&self) -> anyhow::Result<()> {
         let text_covered = self
             .models
@@ -374,7 +414,7 @@ impl RouterConfig {
 
     /// Pick the model whose declared modalities are a **superset** of
     /// `required`, preferring `complexity`. Returns `None` when no single model
-    /// covers the whole set (the proxy then returns 415).
+    /// covers the whole set (the proxy then returns 422).
     ///
     /// Ranking among survivors: exact type match → nearest higher type
     /// (escalation) → highest lower type. Ties break toward the first-declared
@@ -467,7 +507,36 @@ mod tests {
         assert!(msg.contains("ROUTER_TEST_MISS_2"));
     }
 
-    // ── ApiKey resolution ─────────────────────────────────────────────────────
+    // ── server / classifier tuning fields ─────────────────────────────
+    #[test]
+    fn server_tuning_fields_default_when_omitted() {
+        let cfg = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.server.stream_idle_timeout_secs, 300);
+        assert_eq!(cfg.server.max_body_bytes, 32 * 1024 * 1024);
+        assert_eq!(cfg.classifier.trivial_max_words, DEFAULT_TRIVIAL_MAX_WORDS);
+        assert_eq!(cfg.classifier.inference_pool_size, None);
+        assert_eq!(cfg.classifier.intra_op_threads, None);
+    }
+
+    #[test]
+    fn server_and_classifier_tuning_fields_parse() {
+        let cfg = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\nstream_idle_timeout_secs=42\nmax_body_bytes=1024\n\
+             [classifier]\ntrivial_max_words=3\ninference_pool_size=4\nintra_op_threads=1\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.server.stream_idle_timeout_secs, 42);
+        assert_eq!(cfg.server.max_body_bytes, 1024);
+        assert_eq!(cfg.classifier.trivial_max_words, 3);
+        assert_eq!(cfg.classifier.inference_pool_size, Some(4));
+        assert_eq!(cfg.classifier.intra_op_threads, Some(1));
+    }
+
+    // ── ApiKey resolution ───────────────────────────────────────────────────────────
     fn parse_single_model(toml: &str) -> RouterConfig {
         parse(toml).expect("config should parse")
     }
@@ -781,7 +850,7 @@ port = 8080
     #[test]
     fn coverage_allows_uncovered_non_text_modalities() {
         // No audio/image/file/tools model anywhere: still valid. Such requests
-        // get a 415 at request time (see `select_uncovered_combination_...`).
+        // get a 422 at request time (see `select_uncovered_combination_...`).
         let cfg = catalogue(vec![
             model("fast", ModelTier::Fast, &[Modality::Text]),
             model("frontier", ModelTier::Frontier, &[Modality::Text]),

@@ -18,6 +18,8 @@ No external state, no database, no runtime model downloads.
   content.
 - **Client-agnostic** — any OpenAI Chat Completions client works unmodified.
 - **Correct SSE streaming** — raw byte passthrough, no buffering or re-parsing.
+  Upstream response headers (request ids, rate-limit metadata) pass through on
+  both the streaming and buffered paths.
 - **Modality-aware routing** — each request is sent to a backend that supports
   every modality it requires (including tool calling), independent of
   complexity.
@@ -40,7 +42,9 @@ or split.
 
 `build.rs` downloads the model and tokenizer from HuggingFace into `OUT_DIR` on
 the first build (network access required once); subsequent builds reuse the
-cached files.
+cached files. Artifacts are fetched from a **pinned revision** and verified
+against pinned SHA-256 digests — on download and on every cache hit — so a
+partial download or upstream change can never be silently embedded.
 
 ```sh
 cargo build --release
@@ -66,7 +70,13 @@ hyper-mcp-router serve [--config <path>] [--log-stdout] \
   (default: auto; `0` = runtime default).
 
 The performance flags are optional overrides — omit them and the router sizes
-itself to the machine. See [Performance & tuning](#performance--tuning).
+itself to the machine. Each may also be set in the config file's `[classifier]`
+section (`trivial_max_words`, `inference_pool_size`, `intra_op_threads`); a CLI
+flag overrides the config value. See
+[Performance & tuning](#performance--tuning).
+
+The server drains gracefully: on SIGTERM/SIGINT it stops accepting new
+requests and lets in-flight ones (including open SSE streams) finish.
 
 ### Config discovery
 
@@ -88,8 +98,25 @@ API keys.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Classify, route, and proxy a chat request |
-| `GET` | `/v1/models` | Advertise the single virtual model `hyper-mcp-router` (backends are never exposed) |
+| `GET` | `/v1/models` | Advertise the single virtual model `hyper-mcp-router` (backends are never *listed*; see note) |
 | `GET` | `/health` | Liveness probe (`200 {"status":"ok"}`) |
+
+Note on backend visibility: `/v1/models` only ever lists the virtual model, but
+upstream response bodies pass through verbatim — so the `model` field of a
+completion (and of every SSE chunk) names the backend that actually produced
+it. The backend signs its work; treat backend names as visible to clients.
+
+Request handling notes:
+
+- `n > 1` (multiple choices) is rejected with `400` — the router serves exactly
+  one completion per request and will not silently alter what you asked for.
+  Everything else passes through byte-for-byte; only `model` is rewritten.
+- Request bodies up to `server.max_body_bytes` (default 32 MiB) are accepted,
+  comfortably covering base64 image/audio/file payloads.
+- `server.request_timeout_secs` bounds **non-streaming** requests only;
+  streaming responses have no total deadline and are guarded by the
+  `server.stream_idle_timeout_secs` idle timeout instead, so long generations
+  are never severed mid-stream.
 
 ## How routing works
 
@@ -97,9 +124,16 @@ Each request resolves two axes:
 
 - **Modality set** (hard constraint) — read deterministically from the request
   JSON: content-part types (image/audio/file input), the `modalities` field
-  (audio output), and the `tools`/`functions` fields (tool calling).
-  `image-output` is the only inferred modality, via a hardened
-  lexical-OR-NLI-threshold signal.
+  (`"audio"` → audio output, `"image"` → image output), and tool signals — the
+  `tools`/`functions` fields, or tool artifacts already in the transcript
+  (`role: "tool"` messages, assistant `tool_calls`), so a tool-loop
+  continuation stays on a tool-capable backend even if the follow-up omits
+  `tools`.
+- **Image-generation intent** (soft constraint) — when the request doesn't say
+  `modalities: ["image"]` explicitly, image-output is *inferred* via a hardened
+  lexical-OR-NLI-threshold signal. Because it is probabilistic, it is applied
+  only if an image-capable backend exists — an inferred intent never makes a
+  request unroutable; it degrades to a text route instead.
 - **Complexity type** (preference) — the argmax of three complexity hypotheses,
   classified over a **window of recent substantive user turns** (see
   [Performance & tuning](#performance--tuning)), so a terse follow-up inherits
@@ -108,12 +142,14 @@ Each request resolves two axes:
 The router selects the configured model whose declared modalities are a
 **superset** of the required set, preferring the resolved complexity type
 (exact → nearest higher → highest lower). If no single model covers the required
-set it returns `415`.
+set it returns `422`.
 
 Complexity is only used to *rank among* candidates, so when at most one model can
 serve the required modality set (e.g. a single-model deployment, or a request
 for a modality only one backend provides) the router **skips classification
-entirely** and routes directly — zero inference.
+entirely** and routes directly — zero inference. (The NLI image-generation
+signal is skipped along with it; the lexical signal and the explicit
+`modalities` field still apply.)
 
 ## Performance & tuning
 
@@ -166,8 +202,10 @@ startup log reports `detected_cores`, `pool_size`, and `intra_op_threads`.
 | `--inference-pool-size <N>` | auto (`cores / 2`, min 1) | Concurrent inference sessions. Each is an independent in-memory copy of the model. |
 | `--intra-op-threads <N>` | auto (`2`) | ONNX Runtime intra-op threads per session (`0` = runtime default). Keep `pool_size × intra_op_threads` near the core count to avoid oversubscription. |
 
-Because each session is a full copy of the embedded model, a larger pool uses
-proportionally more memory (the model is small, so this is usually negligible).
+Because each session is a full in-memory copy of the embedded ~87 MB model, a
+larger pool uses proportionally more memory — budget roughly
+`pool_size × 90 MB` (e.g. the auto-plan on an 18-core host builds 9 sessions,
+≈ 800 MB). Cap `--inference-pool-size` on memory-constrained hosts.
 
 Measured on an 18-core host — per-request latency ~15 ms, essentially unchanged
 by pool size — throughput scales with the pool until the CPU saturates:

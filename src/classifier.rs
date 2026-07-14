@@ -42,8 +42,8 @@ pub const DEFAULT_TRIVIAL_MAX_WORDS: usize = 6;
 /// hypothesis alone is enough to route to the image modality.
 pub const DEFAULT_IMAGE_GEN_THRESHOLD: f32 = 0.5;
 
-// ───────────────────────────────────────────────────────────────────────────
-// Type & modality axes
+// ───────────────────────────────────────────────────────────────────────
+// Complexity axis (the modality axis lives in `crate::modality`)
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Complexity axis ("type"). `Ord` is intentional — it enforces complexity
@@ -54,119 +54,6 @@ pub enum ModelTier {
     Fast,
     Balanced,
     Frontier,
-}
-
-/// Modality axis — the full Chat Completions v1 surface. A model declares the
-/// set it supports; a request requires a (possibly multi-element) subset.
-/// Direction is explicit for image/audio (asymmetric support); text is one
-/// token. Deliberately **not** ordered: modality is a capability match, never
-/// escalated against complexity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Modality {
-    /// Text in/out (the baseline; every chat model has it).
-    Text,
-    /// `image_url` content part (vision / image analysis).
-    ImageInput,
-    /// `input_audio` content part (speech-to-text style).
-    AudioInput,
-    /// `file` content part (documents, e.g. PDFs).
-    FileInput,
-    /// Request `modalities` contains `"audio"` (text-to-speech style).
-    AudioOutput,
-    /// Image generation / creation (inferred; no native protocol field).
-    ImageOutput,
-    /// Tool / function calling: the request offers `tools`, so it must route to
-    /// a model that can emit tool calls. A capability constraint only — it never
-    /// affects the complexity tier.
-    Tools,
-}
-
-impl Modality {
-    /// Kebab-case wire name, used for logging and 415 error bodies.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Modality::Text => "text",
-            Modality::ImageInput => "image-input",
-            Modality::AudioInput => "audio-input",
-            Modality::FileInput => "file-input",
-            Modality::AudioOutput => "audio-output",
-            Modality::ImageOutput => "image-output",
-            Modality::Tools => "tools",
-        }
-    }
-
-    /// Single-bit mask for the [`ModalitySet`] bitset.
-    fn bit(self) -> u8 {
-        match self {
-            Modality::Text => 1 << 0,
-            Modality::ImageInput => 1 << 1,
-            Modality::AudioInput => 1 << 2,
-            Modality::FileInput => 1 << 3,
-            Modality::AudioOutput => 1 << 4,
-            Modality::ImageOutput => 1 << 5,
-            Modality::Tools => 1 << 6,
-        }
-    }
-
-    /// All modalities, in a stable order for iteration/logging.
-    const ALL: [Modality; 7] = [
-        Modality::Text,
-        Modality::ImageInput,
-        Modality::AudioInput,
-        Modality::FileInput,
-        Modality::AudioOutput,
-        Modality::ImageOutput,
-        Modality::Tools,
-    ];
-}
-
-/// A small set of [`Modality`] values, backed by a bitset. Used for the
-/// superset matching that drives model selection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct ModalitySet(u8);
-
-impl ModalitySet {
-    /// An empty set.
-    pub fn new() -> Self {
-        ModalitySet(0)
-    }
-
-    /// Add a modality to the set.
-    pub fn insert(&mut self, m: Modality) {
-        self.0 |= m.bit();
-    }
-
-    /// Whether the set contains `m`.
-    pub fn contains(&self, m: Modality) -> bool {
-        self.0 & m.bit() != 0
-    }
-
-    /// Whether `self` covers every modality in `required` (i.e. `required` is a
-    /// subset of `self`).
-    pub fn is_superset(&self, required: &ModalitySet) -> bool {
-        self.0 & required.0 == required.0
-    }
-
-    /// Kebab-case names of the contained modalities, in stable order — for
-    /// logging and 415 error bodies. Never includes user content.
-    pub fn to_kebab_vec(&self) -> Vec<&'static str> {
-        Modality::ALL
-            .iter()
-            .filter(|m| self.contains(**m))
-            .map(|m| m.as_str())
-            .collect()
-    }
-}
-
-impl FromIterator<Modality> for ModalitySet {
-    fn from_iter<I: IntoIterator<Item = Modality>>(iter: I) -> Self {
-        let mut set = ModalitySet::new();
-        for m in iter {
-            set.insert(m);
-        }
-        set
-    }
 }
 
 /// What the text classifier resolves to. `complexity` (the tier axis) is always
@@ -440,12 +327,17 @@ impl Classifier {
     ///
     /// CPU-bound: callers should invoke this on a blocking thread (the proxy
     /// does so via `spawn_blocking`) rather than on an async worker.
+    ///
+    /// `lexical_image_match` is the (precomputed) result of
+    /// [`looks_like_image_generation`] on `image_premise` — the proxy already
+    /// needs it before deciding whether to classify at all, so it is passed in
+    /// rather than recomputed here.
     pub fn classify(
         &self,
         complexity_premise: &str,
         image_premise: &str,
+        lexical_image_match: bool,
     ) -> anyhow::Result<Classification> {
-        let lexical_image_match = looks_like_image_generation(image_premise);
         let scores = self.score_hypotheses(complexity_premise, image_premise)?;
         Ok(combine(
             &scores,
@@ -603,7 +495,10 @@ pub fn looks_like_image_generation(prompt: &str) -> bool {
 ///    disables the fast path (nothing is ever trivial).
 /// 2. **No reasoning cues** — none of the complexity markers below (guards
 ///    against "ok, now derive the formula").
-/// 3. **Looks like filler** — matches the acknowledgement/greeting set.
+/// 3. **Is filler, entirely** — the whole (trimmed) turn must consist of
+///    acknowledgement/greeting phrases and punctuation. A matching *prefix* is
+///    not enough: "ok tell me about quantum computing" starts with an ack but
+///    carries a substantive request, so it must reach the model.
 ///
 /// It only ever routes *down* to Fast; history escalation still applies on top,
 /// so a terse turn on a deep/agentic thread is unaffected.
@@ -621,26 +516,30 @@ pub fn looks_trivial(prompt: &str, max_words: usize) -> bool {
         .expect("valid complexity-marker regex")
     });
 
-    /// Acknowledgement / greeting / short-confirmation phrases, anchored at the
-    /// start of the (trimmed) prompt.
+    /// Acknowledgement / greeting / short-confirmation phrases. The **entire**
+    /// trimmed prompt must be a punctuation-separated sequence of these — an
+    /// end anchor, not a prefix match — so an ack-prefixed substantive turn
+    /// ("ok tell me about X") is never mistaken for filler.
     static ACK_PHRASES: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"(?ix)^\s*(?:
-                 hi|hey|hello|yo|sup
+        /// One filler phrase.
+        const PHRASE: &str = r"(?:
+                 (?:hi|hey|hello)(?:\s+there)?|yo|sup
                | ok(?:ay)?|k
                | ye(?:s|ah|p)|yup
                | no|nope|nah
                | thanks|thank\s+you|thx|ty|ta
+               | please
                | sure|cool|great|nice|awesome|perfect|excellent
                | got\s+it|gotcha|understood|makes\s+sense|sounds\s+good|will\s+do
                | continue|go\s+on|carry\s+on|keep\s+going|proceed
-               | please\s+continue
                | good\s+(?:morning|afternoon|evening|night)
                | bye|goodbye|see\s+you|cheers
                | no\s+problem|np
                | how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|whats\s+up
-             )\b",
-        )
+             )";
+        Regex::new(&format!(
+            r#"(?ix)^\s*{PHRASE}(?:[\s,.;:!?'"()-]+{PHRASE})*[\s,.;:!?'"()-]*$"#
+        ))
         .expect("valid acknowledgement regex")
     });
 
@@ -689,6 +588,22 @@ pub fn extract_prompt(body: &serde_json::Value) -> Option<String> {
     message_text(last_user)
 }
 
+/// Whether any user message carries non-empty text. Distinguishes "the user
+/// actually said something (however trivial)" from "there is no usable user
+/// text at all" (no user messages, or only empty/attachment-only content) —
+/// the former can honestly route as chit-chat, the latter falls back to the
+/// balanced default.
+pub fn has_nonempty_user_text(body: &serde_json::Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+        return false;
+    };
+    messages
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .filter_map(message_text)
+        .any(|t| !t.trim().is_empty())
+}
+
 /// Build the complexity-classification premise by walking the conversation's
 /// **user** turns newest→oldest, skipping trivially-simple ones ([`looks_trivial`]),
 /// and accumulating substantive turns until the conversation start or
@@ -702,6 +617,11 @@ pub fn extract_prompt(body: &serde_json::Value) -> Option<String> {
 /// responses (usually the longest messages) are skipped, so the budget stretches
 /// across many turns of actual intent. Filler is pruned, so the window ages by
 /// *substantive* turns, not by chit-chat.
+///
+/// **System messages are deliberately excluded.** They are usually static
+/// deployment boilerplate ("You are a helpful assistant…") that would consume
+/// budget and skew every conversation toward the same tier; the user's own
+/// turns are the signal for how hard *this* request is.
 pub fn build_classification_window(
     body: &serde_json::Value,
     trivial_max_words: usize,
@@ -744,57 +664,6 @@ pub fn build_classification_window(
 /// forwarded unchanged to the backend.
 pub fn truncate_prompt(prompt: &str) -> String {
     prompt.chars().take(PROMPT_CHAR_LIMIT).collect()
-}
-
-/// Deterministic modalities required by a request, from content-part types
-/// (input), the `modalities` request field (output), and the `tools`/`functions`
-/// fields (tool calling). `ImageOutput` is **not** decided here — it has no
-/// protocol field and is inferred by the classifier.
-///
-/// This function must not call the classifier: it is metadata-only.
-pub fn detect_required_modalities(body: &serde_json::Value) -> ModalitySet {
-    let mut set = ModalitySet::new();
-    // Text I/O is always in play for chat/completions.
-    set.insert(Modality::Text);
-
-    // --- Input: scan message content parts ---
-    for msg in body["messages"].as_array().into_iter().flatten() {
-        for part in msg
-            .get("content")
-            .and_then(|c| c.as_array())
-            .into_iter()
-            .flatten()
-        {
-            match part.get("type").and_then(|t| t.as_str()) {
-                // "input_image" tolerated as a newer alias for robustness.
-                Some("image_url") | Some("input_image") => set.insert(Modality::ImageInput),
-                Some("input_audio") => set.insert(Modality::AudioInput),
-                Some("file") => set.insert(Modality::FileInput),
-                _ => {}
-            }
-        }
-    }
-
-    // --- Output: the `modalities` request field (defaults to ["text"]) ---
-    if let Some(mods) = body.get("modalities").and_then(|m| m.as_array()) {
-        if mods.iter().any(|m| m.as_str() == Some("audio")) {
-            set.insert(Modality::AudioOutput);
-        }
-    }
-
-    // --- Tool calling: a request offering tools must route to a tool-capable
-    // model. Both the current `tools` array and the deprecated `functions`
-    // array count; an empty array does not.
-    let offers = |field: &str| {
-        body.get(field)
-            .and_then(|v| v.as_array())
-            .is_some_and(|a| !a.is_empty())
-    };
-    if offers("tools") || offers("functions") {
-        set.insert(Modality::Tools);
-    }
-
-    set
 }
 
 #[cfg(test)]
@@ -988,6 +857,12 @@ mod tests {
             "ok, now prove the theorem",
             "sure, please derive the formula",
             "yes, analyze these results",
+            // filler-prefixed, short, no reasoning cue — must still reach the
+            // model (the ack match is whole-string, not prefix)
+            "ok tell me about quantum computing",
+            "no rewrite it in Rust",
+            "yes but why is the sky blue",
+            "thanks, what about France?",
             // too long
             "thanks so much for the detailed and very thorough breakdown you gave",
             // short but technical (short != simple)
@@ -1019,6 +894,21 @@ mod tests {
         // "ok sure thanks" is 3 words: trivial at ceiling 3, not at ceiling 2.
         assert!(looks_trivial("ok sure thanks", 3));
         assert!(!looks_trivial("ok sure thanks", 2));
+    }
+
+    #[test]
+    fn trivial_accepts_multi_phrase_filler_with_punctuation() {
+        for p in [
+            "ok, thanks!",
+            "yes please",
+            "great, sounds good!!",
+            "ok... continue",
+        ] {
+            assert!(
+                looks_trivial(p, DEFAULT_TRIVIAL_MAX_WORDS),
+                "should be trivial: {p:?}"
+            );
+        }
     }
 
     // ── build_classification_window ───────────────────────────────────────────
@@ -1105,96 +995,6 @@ mod tests {
         );
     }
 
-    // ── detect_required_modalities ──────────────────────────────────────────
-    #[test]
-    fn modality_text_always_present() {
-        let body = json!({"messages": [{"role": "user", "content": "hi"}]});
-        let set = detect_required_modalities(&body);
-        assert!(set.contains(Modality::Text));
-    }
-
-    #[test]
-    fn modality_absent_messages_still_text() {
-        let body = json!({});
-        let set = detect_required_modalities(&body);
-        assert_eq!(set.to_kebab_vec(), vec!["text"]);
-    }
-
-    #[test]
-    fn modality_content_part_types_map_correctly() {
-        let body = json!({"messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "x"}},
-            {"type": "input_audio", "input_audio": {}},
-            {"type": "file", "file": {}},
-            {"type": "text", "text": "describe"},
-        ]}]});
-        let set = detect_required_modalities(&body);
-        assert!(set.contains(Modality::ImageInput));
-        assert!(set.contains(Modality::AudioInput));
-        assert!(set.contains(Modality::FileInput));
-        assert!(set.contains(Modality::Text));
-        assert!(!set.contains(Modality::AudioOutput));
-    }
-
-    #[test]
-    fn modality_input_image_alias() {
-        let body = json!({"messages": [{"role": "user", "content": [
-            {"type": "input_image", "image_url": {"url": "x"}},
-        ]}]});
-        assert!(detect_required_modalities(&body).contains(Modality::ImageInput));
-    }
-
-    #[test]
-    fn modality_audio_output_from_request_field() {
-        let body = json!({
-            "messages": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {}}]}],
-            "modalities": ["text", "audio"],
-        });
-        let set = detect_required_modalities(&body);
-        assert!(set.contains(Modality::AudioInput));
-        assert!(set.contains(Modality::AudioOutput));
-    }
-
-    #[test]
-    fn modality_string_content_handled() {
-        let body = json!({"messages": [{"role": "user", "content": "just text"}]});
-        let set = detect_required_modalities(&body);
-        assert_eq!(set.to_kebab_vec(), vec!["text"]);
-    }
-
-    #[test]
-    fn modality_tools_kebab_name() {
-        assert_eq!(Modality::Tools.as_str(), "tools");
-    }
-
-    #[test]
-    fn modality_tools_detected_from_tools_array() {
-        let body = json!({
-            "messages": [{"role": "user", "content": "what's the weather?"}],
-            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
-        });
-        assert!(detect_required_modalities(&body).contains(Modality::Tools));
-    }
-
-    #[test]
-    fn modality_tools_detected_from_legacy_functions_array() {
-        let body = json!({
-            "messages": [{"role": "user", "content": "hi"}],
-            "functions": [{"name": "get_weather"}],
-        });
-        assert!(detect_required_modalities(&body).contains(Modality::Tools));
-    }
-
-    #[test]
-    fn modality_tools_absent_or_empty_not_detected() {
-        // No tools field at all.
-        let none = json!({"messages": [{"role": "user", "content": "hi"}]});
-        assert!(!detect_required_modalities(&none).contains(Modality::Tools));
-        // Empty tools array does not require the capability.
-        let empty = json!({"messages": [{"role": "user", "content": "hi"}], "tools": []});
-        assert!(!detect_required_modalities(&empty).contains(Modality::Tools));
-    }
-
     // ── extract_prompt ──────────────────────────────────────────────────────
     #[test]
     fn extract_last_user_message_wins() {
@@ -1214,6 +1014,31 @@ mod tests {
             {"type": "text", "text": "world"},
         ]}]});
         assert_eq!(extract_prompt(&body).as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn user_text_presence_detected() {
+        // Non-empty user text → true.
+        let body = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(has_nonempty_user_text(&body));
+        // Empty string content → false.
+        let body = json!({"messages": [{"role": "user", "content": ""}]});
+        assert!(!has_nonempty_user_text(&body));
+        // Attachment-only multi-part content (no text parts) → false.
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "x"}},
+        ]}]});
+        assert!(!has_nonempty_user_text(&body));
+        // No user messages at all → false.
+        let body = json!({"messages": [{"role": "system", "content": "sys"}]});
+        assert!(!has_nonempty_user_text(&body));
+        // An earlier user turn with text counts even if the last is empty.
+        let body = json!({"messages": [
+            {"role": "user", "content": "real question"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": ""},
+        ]});
+        assert!(has_nonempty_user_text(&body));
     }
 
     #[test]
@@ -1245,33 +1070,16 @@ mod tests {
     fn routing_directionality_guard() {
         let clf =
             Classifier::new(DEFAULT_IMAGE_GEN_THRESHOLD, DEFAULT_TRIVIAL_MAX_WORDS, 1, 1).unwrap();
-        let simple = clf.classify("hi", "hi").unwrap();
+        let simple = clf.classify("hi", "hi", false).unwrap();
         let complex_text = "Derive and rigorously prove the asymptotic time complexity of \
              red-black tree rebalancing across a sequence of insertions and deletions, \
              with a formal amortized analysis.";
-        let complex = clf.classify(complex_text, complex_text).unwrap();
+        let complex = clf.classify(complex_text, complex_text, false).unwrap();
         assert!(
             simple.complexity <= complex.complexity,
             "trivial prompt ({:?}) should route no higher than a complex one ({:?})",
             simple.complexity,
             complex.complexity
         );
-    }
-
-    // ── ModalitySet ─────────────────────────────────────────────────────────
-    #[test]
-    fn modality_set_superset_logic() {
-        let mut caps = ModalitySet::new();
-        caps.insert(Modality::Text);
-        caps.insert(Modality::AudioInput);
-        caps.insert(Modality::AudioOutput);
-
-        let mut req = ModalitySet::new();
-        req.insert(Modality::Text);
-        req.insert(Modality::AudioInput);
-        assert!(caps.is_superset(&req));
-
-        req.insert(Modality::ImageInput);
-        assert!(!caps.is_superset(&req));
     }
 }

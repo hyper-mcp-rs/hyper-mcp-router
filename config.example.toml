@@ -14,15 +14,32 @@
 host = "0.0.0.0"
 port = 8080
 # GET /v1/models always advertises the single virtual model "hyper-mcp-router";
-# the configured backends are never exposed.
+# the configured backends are never listed there. (Upstream response bodies
+# pass through verbatim, so a completion's `model` field does name the backend
+# that produced it.)
 # Upstream timeouts (seconds). No retries are ever performed.
 connect_timeout_secs = 10
+# Total deadline for NON-streaming requests only. Streaming responses have no
+# total deadline (an SSE stream may legitimately run long)…
 request_timeout_secs = 600
+# …they are bounded by this idle guard instead: abort when no bytes arrive for
+# this long (0 disables).
+stream_idle_timeout_secs = 300
+# Maximum accepted request body size in bytes (default 32 MiB). Base64-encoded
+# image/audio/file payloads are large; raise this if yours are larger.
+max_body_bytes = 33554432
 
-# Optional. Tunes the image-generation modality decision (absolute
-# P(entailment) floor; default 0.5).
+# Optional classifier tuning. All fields have sensible defaults.
 [classifier]
+# Image-generation modality decision (absolute P(entailment) floor; default 0.5).
 image_generation_threshold = 0.5
+# Word ceiling for the trivial fast-path (0 disables; default 6). The
+# --trivial-max-words CLI flag overrides this.
+trivial_max_words = 6
+# Inference parallelism. Omit for auto-sizing from the detected core count;
+# CLI flags (--inference-pool-size / --intra-op-threads) override both.
+#inference_pool_size = 4
+#intra_op_threads = 2
 
 # `api_key` resolves three ways (below), or may be omitted entirely for a
 # keyless backend (e.g. a local Ollama / vLLM / LM Studio server, or a gateway
@@ -34,7 +51,9 @@ image_generation_threshold = 0.5
 # models (it does not affect the complexity tier). Only `text` coverage is
 # mandatory (it is the fallback baseline; at least one model, any tier, must
 # declare it). Every other modality is optional — a request that requires an
-# uncovered modality is answered with a 415 at request time.
+# uncovered modality is answered with a 422 at request time. (Exception:
+# *inferred* image-generation intent is soft — if no model declares
+# "image-output", such requests degrade to a text route instead of failing.)
 
 # 1. Plaintext key directly in the file.
 [[models]]

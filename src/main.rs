@@ -31,18 +31,28 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     // (config::load runs field + startup coverage validation internally.)
 
-    // 4. Initialise the classifier from the embedded model bytes. Size the
+    // 3. Initialise the classifier from the embedded model bytes. Size the
     //    inference pool + intra-op threads from the detected core count
-    //    (container-aware since Rust 1.64), overridable via CLI flags.
+    //    (container-aware since Rust 1.64); config-file settings override the
+    //    auto-plan, and CLI flags override both.
     let detected_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     let plan = plan_inference(detected_cores);
-    let pool_size = args.inference_pool_size.unwrap_or(plan.pool_size);
-    let intra_op_threads = args.intra_op_threads.unwrap_or(plan.intra_op_threads);
+    let pool_size = args
+        .inference_pool_size
+        .or(cfg.classifier.inference_pool_size)
+        .unwrap_or(plan.pool_size);
+    let intra_op_threads = args
+        .intra_op_threads
+        .or(cfg.classifier.intra_op_threads)
+        .unwrap_or(plan.intra_op_threads);
+    let trivial_max_words = args
+        .trivial_max_words
+        .unwrap_or(cfg.classifier.trivial_max_words);
     let classifier = Classifier::new(
         cfg.classifier.image_generation_threshold,
-        args.trivial_max_words,
+        trivial_max_words,
         pool_size,
         intra_op_threads,
     )
@@ -54,14 +64,14 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         "inference parallelism configured"
     );
 
-    // 5. Log the resolved configuration — names, types, modalities, base URLs.
+    // 4. Log the resolved configuration — names, types, modalities, base URLs.
     //    Never API keys.
     tracing::info!(
         config_path = %config_path.display(),
         advertised_model = hyper_mcp_router::proxy::ADVERTISED_MODEL,
         model_count = cfg.models.len(),
         image_generation_threshold = cfg.classifier.image_generation_threshold,
-        trivial_max_words = args.trivial_max_words,
+        trivial_max_words,
         "configuration loaded"
     );
     for m in &cfg.models {
@@ -74,7 +84,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         );
     }
 
-    // 6. Bind the server and begin accepting requests.
+    // 5. Bind the server and accept requests until a shutdown signal arrives;
+    //    then stop accepting and drain in-flight requests (including open SSE
+    //    streams) instead of severing them.
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let state = AppState::new(Arc::new(classifier), Arc::new(cfg))?;
     let app = build_router(state);
@@ -83,7 +95,36 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding to {addr}"))?;
     tracing::info!(%addr, "hyper-mcp-router listening");
-    axum::serve(listener, app).await.context("server error")?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")?;
 
     Ok(())
+}
+
+/// Resolve when the process receives a shutdown signal: Ctrl+C (SIGINT)
+/// anywhere, or SIGTERM on Unix (what container orchestrators send first).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received; draining in-flight requests");
 }

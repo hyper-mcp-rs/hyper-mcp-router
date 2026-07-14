@@ -38,4 +38,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url        = "2.5"
 
 [build-dependencies]
+sha2 = "0.10"
 ureq = "3.3"
