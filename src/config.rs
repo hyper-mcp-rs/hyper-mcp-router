@@ -15,8 +15,9 @@ use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
 use url::Url;
 
-use crate::classifier::{ModelTier, DEFAULT_IMAGE_GEN_THRESHOLD, DEFAULT_TRIVIAL_MAX_WORDS};
+use crate::classifier::{ClassifierModel, ModelTier, DEFAULT_IMAGE_GEN_THRESHOLD};
 use crate::modality::{Modality, ModalitySet};
+use crate::prompt::DEFAULT_TRIVIAL_MAX_WORDS;
 
 /// Application identifier used for OS config/log directory discovery.
 const APP_NAME: &str = "hyper-mcp-router";
@@ -94,7 +95,13 @@ fn default_max_body_bytes() -> usize {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClassifierConfig {
-    /// Absolute P(entailment) floor for the image-generation axis.
+    /// Which classification model to run (exactly one per process; see
+    /// `classifier::ClassifierModel`). The `--classifier-model` CLI flag
+    /// overrides this. Defaults to the embedded zero-shot model.
+    #[serde(default)]
+    pub model: ClassifierModel,
+    /// Score floor for the image-generation axis (scale is engine-specific;
+    /// P(entailment) for the zero-shot engine).
     #[serde(default = "default_image_gen_threshold")]
     pub image_generation_threshold: f32,
     /// Word ceiling for the trivial fast-path (`0` disables). The
@@ -116,6 +123,7 @@ pub struct ClassifierConfig {
 impl Default for ClassifierConfig {
     fn default() -> Self {
         ClassifierConfig {
+            model: ClassifierModel::default(),
             image_generation_threshold: default_image_gen_threshold(),
             trivial_max_words: default_trivial_max_words(),
             inference_pool_size: None,
@@ -517,9 +525,27 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.server.stream_idle_timeout_secs, 300);
         assert_eq!(cfg.server.max_body_bytes, 32 * 1024 * 1024);
+        assert_eq!(cfg.classifier.model, ClassifierModel::ZeroShot);
         assert_eq!(cfg.classifier.trivial_max_words, DEFAULT_TRIVIAL_MAX_WORDS);
         assert_eq!(cfg.classifier.inference_pool_size, None);
         assert_eq!(cfg.classifier.intra_op_threads, None);
+    }
+
+    #[test]
+    fn classifier_model_parses_and_rejects_unknown() {
+        let cfg = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n[classifier]\nmodel=\"zero-shot\"\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.classifier.model, ClassifierModel::ZeroShot);
+
+        // An unknown model id must be a loud config error, never a silent default.
+        let err = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n[classifier]\nmodel=\"not-a-model\"\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        );
+        assert!(err.is_err());
     }
 
     #[test]

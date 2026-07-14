@@ -6,11 +6,10 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 
-use hyper_mcp_router::classifier::Classifier;
 use hyper_mcp_router::cli::{Cli, Command, ServeArgs};
 use hyper_mcp_router::config;
+use hyper_mcp_router::engines::{self, EngineOverrides};
 use hyper_mcp_router::logging;
-use hyper_mcp_router::planning::{detect_memory_budget, overcommit_warnings, plan_inference};
 use hyper_mcp_router::proxy::{build_router, AppState};
 
 #[tokio::main]
@@ -32,44 +31,28 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     // (config::load runs field + startup coverage validation internally.)
 
-    // 3. Initialise the classifier from the embedded model bytes. Size the
-    //    inference pool + intra-op threads from the detected core count
-    //    (container-aware since Rust 1.64) AND the detected memory budget
-    //    (cgroup-limit aware); config-file settings override the auto-plan,
-    //    and CLI flags override both. Explicit settings are respected but
-    //    never silently: an over-committed configuration logs a warning.
-    let detected_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let memory_budget = detect_memory_budget();
-    let plan = plan_inference(detected_cores, memory_budget);
-    let pool_size = args
-        .inference_pool_size
-        .or(cfg.classifier.inference_pool_size)
-        .unwrap_or(plan.pool_size);
-    let intra_op_threads = args
-        .intra_op_threads
-        .or(cfg.classifier.intra_op_threads)
-        .unwrap_or(plan.intra_op_threads);
+    // 3. Build the selected classifier engine (exactly one per process; CLI
+    //    flag overrides the config setting). All model-specific sizing —
+    //    session pools, thread counts, memory planning, overcommit warnings —
+    //    is owned by the engine itself (see `engines/`); the operator
+    //    overrides are merged by precedence (CLI over config) here and passed
+    //    through.
+    let model = args.classifier_model.unwrap_or(cfg.classifier.model);
+    let overrides = EngineOverrides {
+        inference_pool_size: args
+            .inference_pool_size
+            .or(cfg.classifier.inference_pool_size),
+        intra_op_threads: args.intra_op_threads.or(cfg.classifier.intra_op_threads),
+    };
+    let classifier = engines::build(model, &cfg.classifier, &overrides)
+        .with_context(|| format!("initialising classifier engine `{}`", model.as_str()))?;
     let trivial_max_words = args
         .trivial_max_words
         .unwrap_or(cfg.classifier.trivial_max_words);
-    for warning in overcommit_warnings(pool_size, intra_op_threads, detected_cores, memory_budget) {
-        tracing::warn!("{warning}");
-    }
-    let classifier = Classifier::new(
-        cfg.classifier.image_generation_threshold,
-        trivial_max_words,
-        pool_size,
-        intra_op_threads,
-    )
-    .context("initialising classifier")?;
     tracing::info!(
-        detected_cores,
-        memory_budget_mb = memory_budget.map(|b| b / (1024 * 1024)),
-        pool_size,
-        intra_op_threads,
-        "inference parallelism configured"
+        engine = classifier.name(),
+        context_char_budget = classifier.context_char_budget(),
+        "classifier engine ready"
     );
 
     // 4. Log the resolved configuration — names, types, modalities, base URLs.
@@ -96,7 +79,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     //    then stop accepting and drain in-flight requests (including open SSE
     //    streams) instead of severing them.
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
-    let state = AppState::new(Arc::new(classifier), Arc::new(cfg))?;
+    let state = AppState::new(classifier, Arc::new(cfg), trivial_max_words)?;
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(&addr)

@@ -13,9 +13,12 @@ No external state, no database, no runtime model downloads.
 
 - **Single self-contained binary** — the ONNX model and tokenizer are embedded
   at build time; nothing is fetched at runtime.
-- **Zero customer-data collection** — the embedded model needs no fine-tuning
-  and no telemetry. Operational logs contain routing metadata only, never user
-  content.
+- **Zero customer-data collection** — the default embedded model needs no
+  fine-tuning and no telemetry, and classification is fully local.
+  Operational logs contain routing metadata only, never user content.
+- **Pluggable classification** — the classifier is a trait; models live one
+  file per engine under `src/engines/` and are selected with
+  `--classifier-model` (see [Classifier engines](#classifier-engines)).
 - **Client-agnostic** — any OpenAI Chat Completions client works unmodified.
 - **Correct SSE streaming** — raw byte passthrough, no buffering or re-parsing.
   Upstream response headers (request ids, rate-limit metadata) pass through on
@@ -54,7 +57,7 @@ cargo build --release
 ## Running
 
 ```sh
-hyper-mcp-router serve [--config <path>] [--log-stdout] \
+hyper-mcp-router serve [--config <path>] [--log-stdout] [--classifier-model <MODEL>] \
     [--trivial-max-words <N>] [--inference-pool-size <N>] [--intra-op-threads <N>]
 ```
 
@@ -62,6 +65,10 @@ hyper-mcp-router serve [--config <path>] [--log-stdout] \
   missing or unparseable file is fatal (no fallback).
 - `--log-stdout` — write structured JSON logs to stdout instead of the
   well-known rolling file location (use this for Cloud Run / containers).
+- `--classifier-model <MODEL>` — which classification model to run (exactly
+  one per process; overrides the `[classifier] model` config setting).
+  Currently available: `zero-shot` (the embedded NLI model, default). See
+  [Classifier engines](#classifier-engines).
 - `--trivial-max-words <N>` — length ceiling for pruning filler turns from the
   complexity window (default `6`; `0` disables pruning). See
   [Performance & tuning](#performance--tuning).
@@ -118,6 +125,24 @@ Request handling notes:
   streaming responses have no total deadline and are guarded by the
   `server.stream_idle_timeout_secs` idle timeout instead, so long generations
   are never severed mid-stream.
+
+## Classifier engines
+
+Classification is pluggable behind the `ClassifierEngine` trait
+(`src/classifier.rs`); concrete engines live in `src/engines/`, **one file
+per model**. Everything model-specific is owned by the engine's file — how it
+is invoked (local inference vs. a remote API), how many concurrent "sessions"
+it runs and how they are sized, and how large its context window is. The
+proxy, window construction, filler pruning, the lexical image prefilter, the
+classification-skip optimisation, and the failure fallback are engine-agnostic
+and never change when an engine is added.
+
+| Model | File | Interaction | Sessions | Context budget |
+|---|---|---|---|---|
+| `zero-shot` (default) | `engines/zero_shot.rs` | embedded ONNX NLI, fully local | ORT session pool, auto-sized by CPU + memory | 1000 chars (512-token model) |
+
+Adding an engine = one new file in `engines/`, one `ClassifierModel` variant,
+and one `match` arm in `engines::build`. Nothing else changes.
 
 ## How routing works
 

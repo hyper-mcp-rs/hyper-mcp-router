@@ -31,7 +31,12 @@ max_body_bytes = 33554432
 
 # Optional classifier tuning. All fields have sensible defaults.
 [classifier]
-# Image-generation modality decision (absolute P(entailment) floor; default 0.5).
+# Which classification model to run (exactly one per process). Currently
+# available: "zero-shot" (the embedded NLI model — fully local, the default).
+# The --classifier-model CLI flag overrides this.
+model = "zero-shot"
+# Image-generation modality decision (score floor; scale is engine-specific —
+# P(entailment) for the zero-shot engine; default 0.5).
 image_generation_threshold = 0.5
 # Word ceiling for the trivial fast-path (0 disables; default 6). The
 # --trivial-max-words CLI flag overrides this.

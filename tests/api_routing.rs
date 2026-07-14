@@ -28,23 +28,20 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use hyper_mcp_router::classifier::{
-    Classifier, DEFAULT_IMAGE_GEN_THRESHOLD, DEFAULT_TRIVIAL_MAX_WORDS,
-};
+use hyper_mcp_router::classifier::{ClassifierEngine, DEFAULT_IMAGE_GEN_THRESHOLD};
 use hyper_mcp_router::config;
+use hyper_mcp_router::engines::zero_shot::ZeroShot;
+use hyper_mcp_router::prompt::DEFAULT_TRIVIAL_MAX_WORDS;
 use hyper_mcp_router::proxy::{build_router, AppState, ADVERTISED_MODEL};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Shared classifier (embedded ONNX model) — loaded once for the whole binary.
 // ───────────────────────────────────────────────────────────────────────────
 
-static CLASSIFIER: LazyLock<Arc<Classifier>> = LazyLock::new(|| {
+static CLASSIFIER: LazyLock<Arc<ZeroShot>> = LazyLock::new(|| {
     // Pool of 2 (default ORT intra-op threads) so the pooling path is exercised
     // by the correctness suite without a heavy N-session startup cost.
-    Arc::new(
-        Classifier::new(DEFAULT_IMAGE_GEN_THRESHOLD, DEFAULT_TRIVIAL_MAX_WORDS, 2, 0)
-            .expect("load embedded classifier"),
-    )
+    Arc::new(ZeroShot::new(DEFAULT_IMAGE_GEN_THRESHOLD, 2, 0).expect("load embedded classifier"))
 });
 
 /// Every backend name declared by [`mock_config_toml`].
@@ -155,12 +152,12 @@ impl Harness {
         Harness::start_with_classifier(CLASSIFIER.clone()).await
     }
 
-    async fn start_with_classifier(classifier: Arc<Classifier>) -> Harness {
+    async fn start_with_classifier(classifier: Arc<dyn ClassifierEngine>) -> Harness {
         Harness::start_with(classifier, mock_config_toml).await
     }
 
     async fn start_with(
-        classifier: Arc<Classifier>,
+        classifier: Arc<dyn ClassifierEngine>,
         config_of: impl Fn(SocketAddr) -> String,
     ) -> Harness {
         let (mock_addr, calls) = spawn_mock_backend().await;
@@ -170,7 +167,8 @@ impl Harness {
         let cfg = config::parse(&config_of(mock_addr)).expect("parse config");
         cfg.validate().expect("validate config");
 
-        let state = AppState::new(classifier, Arc::new(cfg)).expect("build app state");
+        let state = AppState::new(classifier, Arc::new(cfg), DEFAULT_TRIVIAL_MAX_WORDS)
+            .expect("build app state");
         let app = build_router(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1264,13 +1262,7 @@ async fn load_test_progressive_concurrency() {
             .unwrap_or(0);
         println!("(dedicated classifier: pool_size={pool}, intra_op_threads={intra_op})");
         let clf = Arc::new(
-            Classifier::new(
-                DEFAULT_IMAGE_GEN_THRESHOLD,
-                DEFAULT_TRIVIAL_MAX_WORDS,
-                pool,
-                intra_op,
-            )
-            .expect("build classifier"),
+            ZeroShot::new(DEFAULT_IMAGE_GEN_THRESHOLD, pool, intra_op).expect("build classifier"),
         );
         Harness::start_with_classifier(clf).await
     } else {

@@ -19,23 +19,24 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use crate::classifier::{
-    build_classification_window, extract_prompt, has_nonempty_user_text,
-    looks_like_image_generation, truncate_prompt, Classification, Classifier, ModelTier,
-    CLASSIFICATION_CHAR_BUDGET,
-};
+use crate::classifier::{Classification, ClassifierEngine, ModelTier};
 use crate::config::RouterConfig;
 use crate::modality::{detect_required_modalities, Modality, ModalitySet};
+use crate::prompt::{
+    build_classification_window, extract_prompt, has_nonempty_user_text,
+    looks_like_image_generation, truncate_prompt,
+};
 
-/// Shared, cloneable server state. The `Classifier` synchronises its ORT
-/// sessions internally (a pool of independent sessions — see
-/// `classifier::SessionPool`), so everything here is `Send + Sync` and cheap
-/// to clone.
+/// Shared, cloneable server state. The classifier is a trait object — the
+/// proxy is engine-agnostic; each engine synchronises its own "sessions"
+/// internally (see `crate::engines`). `trivial_max_words` is routing policy
+/// (window filler pruning), deliberately *not* an engine concern.
 #[derive(Clone)]
 pub struct AppState {
-    pub classifier: Arc<Classifier>,
+    pub classifier: Arc<dyn ClassifierEngine>,
     pub config: Arc<RouterConfig>,
     pub http: reqwest::Client,
+    pub trivial_max_words: usize,
 }
 
 impl AppState {
@@ -45,7 +46,11 @@ impl AppState {
     /// total timeout would sever long-lived SSE streams mid-flight. **No
     /// retries** are configured — a retry could trigger duplicate, billable
     /// generations.
-    pub fn new(classifier: Arc<Classifier>, config: Arc<RouterConfig>) -> anyhow::Result<Self> {
+    pub fn new(
+        classifier: Arc<dyn ClassifierEngine>,
+        config: Arc<RouterConfig>,
+        trivial_max_words: usize,
+    ) -> anyhow::Result<Self> {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(config.server.connect_timeout_secs));
         // Idle guard: abort when no bytes arrive for this long. This is what
@@ -59,6 +64,7 @@ impl AppState {
             classifier,
             config,
             http,
+            trivial_max_words,
         })
     }
 }
@@ -262,8 +268,7 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
     let classified: Option<ModelTier> = if state.config.candidate_count(&required) <= 1 {
         None
     } else {
-        let classification =
-            classify_or_default(&state.classifier, body, &current_turn, lexical_image).await;
+        let classification = classify_or_default(state, body, &current_turn, lexical_image).await;
         if classification.image_generation
             && !required.contains(Modality::ImageOutput)
             && !image_intent_dropped
@@ -320,8 +325,10 @@ fn try_require_image_output(config: &RouterConfig, required: &mut ModalitySet) -
 }
 
 /// Classify a request's complexity from a **window of recent substantive user
-/// turns** (see [`build_classification_window`]), mapping any model failure to
-/// the balanced default.
+/// turns** (see [`build_classification_window`]), mapping any engine failure
+/// to the balanced default. Engine-agnostic: the window budget comes from the
+/// engine ([`ClassifierEngine::context_char_budget`]), and CPU-bound engines
+/// handle their own blocking-thread hand-off.
 ///
 /// - No usable user text at all (no user messages, or only empty/attachment-only
 ///   content) → balanced default: there is nothing to judge, so don't pretend
@@ -333,15 +340,15 @@ fn try_require_image_output(config: &RouterConfig, required: &mut ModalitySet) -
 ///   an old image request in the window can't misroute the present one;
 ///   `lexical_image` is its precomputed lexical signal.
 async fn classify_or_default(
-    classifier: &Arc<Classifier>,
+    state: &AppState,
     body: &Value,
     current_turn: &str,
     lexical_image: bool,
 ) -> Classification {
     let window = build_classification_window(
         body,
-        classifier.trivial_max_words(),
-        CLASSIFICATION_CHAR_BUDGET,
+        state.trivial_max_words,
+        state.classifier.context_char_budget(),
     );
     let Some(window) = window else {
         // Nothing substantive to classify.
@@ -357,22 +364,14 @@ async fn classify_or_default(
         };
     };
 
-    // Inference is CPU-bound (one batched forward pass): run it on the blocking
-    // pool so it never stalls an async worker.
-    let classifier = Arc::clone(classifier);
-    let current_turn = current_turn.to_owned();
-    match tokio::task::spawn_blocking(move || {
-        classifier.classify(&window, &current_turn, lexical_image)
-    })
-    .await
+    match state
+        .classifier
+        .classify(&window, current_turn, lexical_image)
+        .await
     {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "classification failed; using balanced default");
-            Classification::balanced_default()
-        }
+        Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = %e, "classification task panicked; using balanced default");
+            tracing::error!(error = %e, "classification failed; using balanced default");
             Classification::balanced_default()
         }
     }

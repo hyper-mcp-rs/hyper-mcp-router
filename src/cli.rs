@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::classifier::ClassifierModel;
+
 #[derive(Debug, Parser)]
 #[command(name = "hyper-mcp-router", version, about)]
 pub struct Cli {
@@ -29,6 +31,13 @@ pub struct ServeArgs {
     /// file location (use this for Cloud Run and other container deployments).
     #[arg(long)]
     pub log_stdout: bool,
+
+    /// Which classification model to run. Exactly one is active per process;
+    /// each has its own interaction method, session sizing, and context
+    /// window (see `engines/`). Overrides the `[classifier] model` config
+    /// setting. Defaults to the embedded zero-shot model.
+    #[arg(long, value_enum)]
+    pub classifier_model: Option<ClassifierModel>,
 
     /// Word ceiling for the trivial-prompt fast path. A user turn at or below
     /// this length that consists entirely of acknowledgement/greeting filler
