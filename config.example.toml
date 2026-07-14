@@ -39,9 +39,11 @@ max_body_bytes = 33554432
 #   "gemini-embedding-001"        remote Gemini embeddings; requires api_key
 #   "gemini-embedding-2"          as above, much larger context window
 #   "text-embedding-005"          remote Gemini embeddings; smaller/cheaper
+#   "text-embedding-3-small"      remote OpenAI embeddings; cheap, 8k window
+#   "text-embedding-3-large"      remote OpenAI embeddings; higher-dimensional
 # NOTE: the remote engines send prompt text (the classification window and
-# current turn) to the Gemini API; only "deberta-v3-xsmall-zeroshot" keeps
-# everything local.
+# current turn) to their provider's API (Google or OpenAI); only
+# "deberta-v3-xsmall-zeroshot" keeps everything local.
 model = "deberta-v3-xsmall-zeroshot"
 # Image-generation modality decision (score floor; scale is engine-specific —
 # P(entailment) for the embedded NLI engine; default 0.5).
@@ -57,10 +59,11 @@ trivial_max_words = 6
 #inference_pool_size = 4
 #intra_op_threads = 2
 
-# Settings for the Gemini embedding engines. Ignored unless selected above.
-# api_key is REQUIRED when the engine is selected (startup fails without it)
-# and resolves exactly like a routed model's key: plaintext, env-var
-# expansion, or { source = "keyring", service = "...", user = "..." }.
+# Settings for the remote embedding engines (Gemini and OpenAI families — all
+# tables share the same shape). Ignored unless selected above. api_key is
+# REQUIRED when the engine is selected (startup fails without it) and
+# resolves exactly like a routed model's key: plaintext, env-var expansion,
+# or { source = "keyring", service = "...", user = "..." }.
 # (The ":-" empty default below keeps config loading working when the env
 # var is unset — env expansion runs over the whole file, comments included;
 # a selected engine with an empty key still fails fast with a clear error.)
@@ -75,6 +78,15 @@ trivial_max_words = 6
 
 #[classifier.text-embedding-005]
 #api_key = "${GEMINI_API_KEY:-}"
+
+# OpenAI engines append /v1/embeddings to base_url, so an override must NOT
+# include the /v1 suffix (unlike routed models' base_url above).
+#[classifier.text-embedding-3-small]
+#api_key = "${OPENAI_API_KEY:-}"
+#base_url = "https://api.openai.com"
+
+#[classifier.text-embedding-3-large]
+#api_key = "${OPENAI_API_KEY:-}"
 
 # `api_key` resolves three ways (below), or may be omitted entirely for a
 # keyless backend (e.g. a local Ollama / vLLM / LM Studio server, or a gateway

@@ -118,15 +118,23 @@ pub struct ClassifierConfig {
     /// Settings for the `gemini-embedding-001` engine
     /// (`[classifier.gemini-embedding-001]`). Ignored unless selected.
     #[serde(default, rename = "gemini-embedding-001")]
-    pub gemini_embedding_001: GeminiEmbeddingConfig,
+    pub gemini_embedding_001: RemoteEmbeddingConfig,
     /// Settings for the `gemini-embedding-2` engine
     /// (`[classifier.gemini-embedding-2]`). Ignored unless selected.
     #[serde(default, rename = "gemini-embedding-2")]
-    pub gemini_embedding_2: GeminiEmbeddingConfig,
+    pub gemini_embedding_2: RemoteEmbeddingConfig,
     /// Settings for the `text-embedding-005` engine
     /// (`[classifier.text-embedding-005]`). Ignored unless selected.
     #[serde(default, rename = "text-embedding-005")]
-    pub text_embedding_005: GeminiEmbeddingConfig,
+    pub text_embedding_005: RemoteEmbeddingConfig,
+    /// Settings for the `text-embedding-3-small` engine
+    /// (`[classifier.text-embedding-3-small]`). Ignored unless selected.
+    #[serde(default, rename = "text-embedding-3-small")]
+    pub text_embedding_3_small: RemoteEmbeddingConfig,
+    /// Settings for the `text-embedding-3-large` engine
+    /// (`[classifier.text-embedding-3-large]`). Ignored unless selected.
+    #[serde(default, rename = "text-embedding-3-large")]
+    pub text_embedding_3_large: RemoteEmbeddingConfig,
 }
 
 impl Default for ClassifierConfig {
@@ -136,19 +144,22 @@ impl Default for ClassifierConfig {
             image_generation_threshold: default_image_gen_threshold(),
             trivial_max_words: default_trivial_max_words(),
             deberta_v3_xsmall_zeroshot: DebertaV3XsmallZeroshotConfig::default(),
-            gemini_embedding_001: GeminiEmbeddingConfig::default(),
-            gemini_embedding_2: GeminiEmbeddingConfig::default(),
-            text_embedding_005: GeminiEmbeddingConfig::default(),
+            gemini_embedding_001: RemoteEmbeddingConfig::default(),
+            gemini_embedding_2: RemoteEmbeddingConfig::default(),
+            text_embedding_005: RemoteEmbeddingConfig::default(),
+            text_embedding_3_small: RemoteEmbeddingConfig::default(),
+            text_embedding_3_large: RemoteEmbeddingConfig::default(),
         }
     }
 }
 
-/// Settings for a Gemini embedding engine (`[classifier.gemini-embedding-*]`).
-/// Remote engines have no local session pool; their "sessions" are concurrent
-/// in-flight API requests.
+/// Settings for a remote embedding engine (any provider — the
+/// `[classifier.<model>]` tables of the Gemini and OpenAI families all share
+/// this shape). Remote engines have no local session pool; their "sessions"
+/// are concurrent in-flight API requests.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct GeminiEmbeddingConfig {
-    /// API key for the Gemini API. **Required when the engine is selected**
+pub struct RemoteEmbeddingConfig {
+    /// API key for the provider. **Required when the engine is selected**
     /// (engine construction fails at startup without it). Resolves exactly
     /// like a routed model's `api_key`: a plaintext/env-expanded string or a
     /// `{ source = "keyring", service, user }` table; an empty resolved value
@@ -156,7 +167,9 @@ pub struct GeminiEmbeddingConfig {
     #[serde(default, deserialize_with = "resolve_api_key")]
     pub api_key: Option<String>,
     /// Endpoint override (e.g. a proxy/gateway, or a mock in tests). Must be
-    /// http/https. Defaults to the public Gemini API endpoint.
+    /// http/https. Defaults to the provider's public endpoint. NOTE: the
+    /// OpenAI engines append `/v1/embeddings`, so their override must not
+    /// include a `/v1` suffix.
     #[serde(default, deserialize_with = "deserialize_opt_http_url")]
     pub base_url: Option<Url>,
     /// Maximum concurrent embedding requests in flight (this engine's
@@ -713,6 +726,33 @@ mod tests {
         assert_eq!(cfg.classifier.gemini_embedding_001.api_key, None);
         assert_eq!(cfg.classifier.gemini_embedding_001.base_url, None);
         assert_eq!(cfg.classifier.gemini_embedding_2.max_concurrency, None);
+    }
+
+    #[test]
+    fn openai_engine_tables_parse() {
+        let cfg = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n\
+             [classifier]\nmodel=\"text-embedding-3-small\"\n\
+             [classifier.text-embedding-3-small]\napi_key=\"sk-small\"\nmax_concurrency=8\n\
+             [classifier.text-embedding-3-large]\napi_key=\"sk-large\"\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.classifier.model, ClassifierModel::TextEmbedding3Small);
+        assert_eq!(
+            cfg.classifier.text_embedding_3_small.api_key.as_deref(),
+            Some("sk-small")
+        );
+        assert_eq!(
+            cfg.classifier.text_embedding_3_small.max_concurrency,
+            Some(8)
+        );
+        assert_eq!(
+            cfg.classifier.text_embedding_3_large.api_key.as_deref(),
+            Some("sk-large")
+        );
+        // Omitted fields default.
+        assert_eq!(cfg.classifier.text_embedding_3_large.base_url, None);
     }
 
     #[test]

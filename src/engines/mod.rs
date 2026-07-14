@@ -30,7 +30,9 @@
 //! Nothing else in the router changes.
 
 pub mod deberta_v3_xsmall_zeroshot;
+pub mod embedding;
 pub mod gemini;
+pub mod openai;
 
 use std::sync::Arc;
 
@@ -53,6 +55,12 @@ pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<Arc<dyn ClassifierE
         ClassifierModel::GeminiEmbedding2 => Ok(Arc::new(gemini::embedding_2::build(cfg).await?)),
         ClassifierModel::TextEmbedding005 => {
             Ok(Arc::new(gemini::text_embedding_005::build(cfg).await?))
+        }
+        ClassifierModel::TextEmbedding3Small => {
+            Ok(Arc::new(openai::text_embedding_3_small::build(cfg).await?))
+        }
+        ClassifierModel::TextEmbedding3Large => {
+            Ok(Arc::new(openai::text_embedding_3_large::build(cfg).await?))
         }
     }
 }

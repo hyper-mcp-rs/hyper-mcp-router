@@ -82,6 +82,15 @@ pub enum ClassifierModel {
     /// an API key; prompt text is sent to the Gemini API.
     #[serde(rename = "text-embedding-005")]
     TextEmbedding005,
+    /// OpenAI `text-embedding-3-small` — remote anchor-prototype embedding
+    /// classification. Requires an API key; prompt text is sent to the
+    /// OpenAI API.
+    #[serde(rename = "text-embedding-3-small")]
+    TextEmbedding3Small,
+    /// OpenAI `text-embedding-3-large` — as above, with higher-dimensional
+    /// embeddings (sharper prototypes, higher per-call price).
+    #[serde(rename = "text-embedding-3-large")]
+    TextEmbedding3Large,
 }
 
 impl ClassifierModel {
@@ -92,6 +101,8 @@ impl ClassifierModel {
             ClassifierModel::GeminiEmbedding001 => "gemini-embedding-001",
             ClassifierModel::GeminiEmbedding2 => "gemini-embedding-2",
             ClassifierModel::TextEmbedding005 => "text-embedding-005",
+            ClassifierModel::TextEmbedding3Small => "text-embedding-3-small",
+            ClassifierModel::TextEmbedding3Large => "text-embedding-3-large",
         }
     }
 }
@@ -180,6 +191,14 @@ mod tests {
             ),
             ("\"gemini-embedding-2\"", ClassifierModel::GeminiEmbedding2),
             ("\"text-embedding-005\"", ClassifierModel::TextEmbedding005),
+            (
+                "\"text-embedding-3-small\"",
+                ClassifierModel::TextEmbedding3Small,
+            ),
+            (
+                "\"text-embedding-3-large\"",
+                ClassifierModel::TextEmbedding3Large,
+            ),
         ] {
             let m: ClassifierModel = serde_json::from_str(wire).unwrap();
             assert_eq!(m, expected);

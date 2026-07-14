@@ -142,6 +142,8 @@ and never change when an engine is added.
 | `gemini-embedding-001` | `engines/gemini/embedding_001.rs` | remote anchor-prototype embeddings (Gemini API) | concurrent embed calls (default 32) | 6000 / 2000 chars (2048-token model) |
 | `gemini-embedding-2` | `engines/gemini/embedding_2.rs` | remote anchor-prototype embeddings (Gemini API) | concurrent embed calls (default 32) | 24000 / 8000 chars (8192-token model) |
 | `text-embedding-005` | `engines/gemini/text_embedding_005.rs` | remote anchor-prototype embeddings (Gemini API) | concurrent embed calls (default 32) | 6000 / 2000 chars (2048-token model) |
+| `text-embedding-3-small` | `engines/openai/text_embedding_3_small.rs` | remote anchor-prototype embeddings (OpenAI API) | concurrent embed calls (default 32) | 24000 / 8000 chars (8191-token model) |
+| `text-embedding-3-large` | `engines/openai/text_embedding_3_large.rs` | remote anchor-prototype embeddings (OpenAI API) | concurrent embed calls (default 32) | 24000 / 8000 chars (8191-token model) |
 
 Both budgets are trait methods (`context_char_budget`,
 `current_turn_char_budget`), so an engine backed by a large-context model can
@@ -149,18 +151,21 @@ raise them — e.g. to see image-generation intent expressed deep in a long
 prompt — without touching the routing core. They bound classifier input only;
 forwarded requests are never truncated.
 
-The Gemini engines classify by **anchor prototypes**: at startup they embed a
-curated exemplar set per class (one batched call, failing fast on a bad key or
-unreachable endpoint), mean-pool them into prototype vectors, and per request
-cosine-score the window and current turn against those prototypes. Their
-`api_key` is **required** and resolves exactly like a routed model's key
-(plaintext / `${ENV_VAR}` / OS keyring). Per-request API failures degrade to
-the balanced default like any engine failure.
+The remote engines (Gemini and OpenAI families) classify by **anchor
+prototypes** (shared, provider-neutral logic in `engines/embedding.rs`): at
+startup they embed a curated exemplar set per class (one batched call, failing
+fast on a bad key or unreachable endpoint), mean-pool them into prototype
+vectors, and per request cosine-score the window and current turn against
+those prototypes. Each family's `mod.rs` owns only its transport — wire
+format, auth header, endpoint layout. Their `api_key` is **required** and
+resolves exactly like a routed model's key (plaintext / `${ENV_VAR}` / OS
+keyring). Per-request API failures degrade to the balanced default like any
+engine failure.
 
 **Privacy caveat**: the remote engines send prompt text (the classification
-window and current turn) to the Gemini API. The "zero customer-data
-collection, fully local" property in the highlights holds **only for the
-default `deberta-v3-xsmall-zeroshot` engine**.
+window and current turn) to their provider's API (Google or OpenAI). The
+"zero customer-data collection, fully local" property in the highlights holds
+**only for the default `deberta-v3-xsmall-zeroshot` engine**.
 
 Adding an engine = one new file in `engines/`, one `ClassifierModel` variant,
 and one `match` arm in `engines::build`. Nothing else changes.

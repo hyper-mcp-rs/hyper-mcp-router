@@ -1,12 +1,13 @@
-//! The Gemini engine family: shared transport here in `mod.rs`, **one file per
-//! model** in this directory (`embedding_001.rs`, `embedding_2.rs`,
-//! `text_embedding_005.rs`), each defining a [`GeminiSpec`] and delegating to
-//! the shared [`GeminiEmbedding`] engine.
+//! The OpenAI embedding engine family: shared transport here in `mod.rs`,
+//! **one file per model** in this directory (`text_embedding_3_small.rs`,
+//! `text_embedding_3_large.rs`), each defining an [`OpenAiSpec`] and
+//! delegating to the shared [`OpenAiEmbedding`] engine.
 //!
 //! The classification *method* (anchor prototypes, cosine scoring) is
 //! provider-neutral and lives in `crate::engines::embedding`; this file owns
-//! only what is Gemini-specific: the `batchEmbedContents` wire format, the
-//! `x-goog-api-key` auth header, and the endpoint layout.
+//! only what is OpenAI-specific: the `/v1/embeddings` wire format (array
+//! `input` for batching; `data[].embedding` keyed by `index` in the
+//! response) and bearer-token auth.
 //!
 //! Anchor embedding happens once at startup and **fails fast** on any API
 //! problem (bad key, unreachable endpoint), so misconfiguration is a clear
@@ -15,12 +16,11 @@
 //! ## Privacy and failure notes
 //!
 //! Prompt text (the classification window and current turn) is sent to the
-//! Gemini API. Per-request failures degrade to the balanced default via the
+//! OpenAI API. Per-request failures degrade to the balanced default via the
 //! proxy, as with every engine. Error messages never echo user content.
 
-pub mod embedding_001;
-pub mod embedding_2;
-pub mod text_embedding_005;
+pub mod text_embedding_3_large;
+pub mod text_embedding_3_small;
 
 use std::time::Duration;
 
@@ -33,19 +33,17 @@ use crate::classifier::{Classification, ClassifierEngine};
 use crate::config::RemoteEmbeddingConfig;
 use crate::engines::embedding::{anchor_texts, build_prototypes, combine_similarities, Prototypes};
 
-/// Default public Gemini API endpoint.
-const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+/// Default public OpenAI API endpoint. The engine appends `/v1/embeddings`,
+/// so a `base_url` override must NOT include the `/v1` suffix (unlike routed
+/// models' `base_url`, which does).
+const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 
-/// Task type sent with every embed request; anchors and premises must use the
-/// same one for their similarities to be comparable.
-const TASK_TYPE: &str = "SEMANTIC_SIMILARITY";
-
-/// Everything that differs between Gemini embedding models. Each model file
+/// Everything that differs between OpenAI embedding models. Each model file
 /// declares one of these as a `const`.
-pub struct GeminiSpec {
+pub struct OpenAiSpec {
     /// Engine id (matches `ClassifierModel::as_str`).
     pub name: &'static str,
-    /// Model resource path sent to the API, e.g. `models/gemini-embedding-001`.
+    /// Model id sent to the API, e.g. `text-embedding-3-small`.
     pub api_model: &'static str,
     /// Char budget for the complexity window (sized to the model's input
     /// token limit).
@@ -58,11 +56,11 @@ pub struct GeminiSpec {
     pub default_request_timeout_secs: u64,
 }
 
-/// A remote Gemini embedding engine (shared by every Gemini model file).
-pub struct GeminiEmbedding {
-    spec: &'static GeminiSpec,
+/// A remote OpenAI embedding engine (shared by every OpenAI model file).
+pub struct OpenAiEmbedding {
+    spec: &'static OpenAiSpec,
     http: reqwest::Client,
-    /// Full `:batchEmbedContents` URL.
+    /// Full `/v1/embeddings` URL.
     url: String,
     api_key: String,
     /// Bounds concurrent in-flight embedding requests — this engine's
@@ -74,12 +72,12 @@ pub struct GeminiEmbedding {
     prototypes: Prototypes,
 }
 
-impl GeminiEmbedding {
+impl OpenAiEmbedding {
     /// Build the engine: validate config (the API key is **required**, exactly
     /// like a routed model's key but mandatory), construct the HTTP client,
     /// and embed the class anchors — failing fast on any API problem.
     pub async fn connect(
-        spec: &'static GeminiSpec,
+        spec: &'static OpenAiSpec,
         cfg: &RemoteEmbeddingConfig,
         image_gen_threshold: f32,
     ) -> anyhow::Result<Self> {
@@ -97,7 +95,7 @@ impl GeminiEmbedding {
             .as_ref()
             .map(|u| u.as_str().trim_end_matches('/').to_string())
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        let url = format!("{base}/v1beta/{}:batchEmbedContents", spec.api_model);
+        let url = format!("{base}/v1/embeddings");
 
         let timeout = cfg
             .request_timeout_secs
@@ -112,7 +110,7 @@ impl GeminiEmbedding {
             .unwrap_or(spec.default_max_concurrency)
             .max(1);
 
-        let mut engine = GeminiEmbedding {
+        let mut engine = OpenAiEmbedding {
             spec,
             http,
             url,
@@ -137,13 +135,13 @@ impl GeminiEmbedding {
             anchor_count = anchors.len(),
             max_concurrency,
             request_timeout_secs = timeout,
-            "gemini embedding engine ready"
+            "openai embedding engine ready"
         );
         Ok(engine)
     }
 
-    /// Embed `texts` in one `batchEmbedContents` call, bounded by the
-    /// concurrency semaphore. Never echoes the texts into errors.
+    /// Embed `texts` in one `/v1/embeddings` call (array input), bounded by
+    /// the concurrency semaphore. Never echoes the texts into errors.
     async fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let _permit = self
             .permits
@@ -151,15 +149,15 @@ impl GeminiEmbedding {
             .await
             .map_err(|_| anyhow::anyhow!("embedding concurrency semaphore closed"))?;
 
-        let body = build_batch_request(self.spec.api_model, texts);
+        let body = build_embeddings_request(self.spec.api_model, texts);
         let resp = self
             .http
             .post(&self.url)
-            .header("x-goog-api-key", &self.api_key)
+            .bearer_auth(&self.api_key)
             .json(&body)
             .send()
             .await
-            .context("gemini embeddings request failed")?;
+            .context("openai embeddings request failed")?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -171,19 +169,19 @@ impl GeminiEmbedding {
                 .chars()
                 .take(300)
                 .collect();
-            anyhow::bail!("gemini embeddings returned {status}: {detail}");
+            anyhow::bail!("openai embeddings returned {status}: {detail}");
         }
 
         let value: Value = resp
             .json()
             .await
-            .context("gemini embeddings response was not JSON")?;
+            .context("openai embeddings response was not JSON")?;
         parse_embeddings(&value, texts.len())
     }
 }
 
 #[async_trait]
-impl ClassifierEngine for GeminiEmbedding {
+impl ClassifierEngine for OpenAiEmbedding {
     fn name(&self) -> &'static str {
         self.spec.name
     }
@@ -203,7 +201,7 @@ impl ClassifierEngine for GeminiEmbedding {
         lexical_image_match: bool,
     ) -> anyhow::Result<Classification> {
         // An empty current turn cannot carry image intent; don't send an empty
-        // text to the API (some models reject it).
+        // text to the API (the embeddings endpoint rejects empty strings).
         let image_text = image_premise.trim();
         let texts: Vec<&str> = if image_text.is_empty() {
             vec![complexity_premise]
@@ -232,47 +230,61 @@ impl ClassifierEngine for GeminiEmbedding {
 // Wire format (network-free, unit-testable)
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Build the `batchEmbedContents` request body.
-fn build_batch_request(api_model: &str, texts: &[&str]) -> Value {
-    let requests: Vec<Value> = texts
-        .iter()
-        .map(|t| {
-            json!({
-                "model": api_model,
-                "content": { "parts": [{ "text": t }] },
-                "taskType": TASK_TYPE,
-            })
-        })
-        .collect();
-    json!({ "requests": requests })
+/// Build the `/v1/embeddings` request body (array input batches every text
+/// into one call).
+fn build_embeddings_request(api_model: &str, texts: &[&str]) -> Value {
+    json!({
+        "model": api_model,
+        "input": texts,
+    })
 }
 
-/// Extract `expected` embedding vectors from a `batchEmbedContents` response.
+/// Extract `expected` embedding vectors from a `/v1/embeddings` response.
+/// The API documents `data` in input order but keys each item by `index`;
+/// vectors are placed by index so a permuted response cannot mis-assign
+/// premises to prototypes.
 fn parse_embeddings(value: &Value, expected: usize) -> anyhow::Result<Vec<Vec<f32>>> {
-    let embeddings = value
-        .get("embeddings")
-        .and_then(|e| e.as_array())
-        .ok_or_else(|| anyhow::anyhow!("gemini response missing `embeddings` array"))?;
-    if embeddings.len() != expected {
+    let data = value
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| anyhow::anyhow!("openai response missing `data` array"))?;
+    if data.len() != expected {
         anyhow::bail!(
-            "gemini returned {} embeddings, expected {expected}",
-            embeddings.len()
+            "openai returned {} embeddings, expected {expected}",
+            data.len()
         );
     }
-    embeddings
-        .iter()
-        .map(|e| {
-            let values = e
-                .get("values")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow::anyhow!("gemini embedding missing `values`"))?;
-            if values.is_empty() {
-                anyhow::bail!("gemini returned an empty embedding vector");
-            }
-            Ok(values
+
+    let mut out: Vec<Option<Vec<f32>>> = vec![None; expected];
+    for item in data {
+        let index = item
+            .get("index")
+            .and_then(|i| i.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("openai embedding item missing `index`"))?
+            as usize;
+        let embedding = item
+            .get("embedding")
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| anyhow::anyhow!("openai embedding item missing `embedding`"))?;
+        if embedding.is_empty() {
+            anyhow::bail!("openai returned an empty embedding vector");
+        }
+        let slot = out
+            .get_mut(index)
+            .ok_or_else(|| anyhow::anyhow!("openai embedding index {index} out of range"))?;
+        if slot.is_some() {
+            anyhow::bail!("openai returned duplicate embedding index {index}");
+        }
+        *slot = Some(
+            embedding
                 .iter()
                 .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-                .collect())
+                .collect(),
+        );
+    }
+    out.into_iter()
+        .map(|v| {
+            v.ok_or_else(|| anyhow::anyhow!("openai response left an embedding index unfilled"))
         })
         .collect()
 }
@@ -282,29 +294,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn batch_request_shape() {
-        let body = build_batch_request("models/gemini-embedding-001", &["a", "b"]);
-        let reqs = body["requests"].as_array().unwrap();
-        assert_eq!(reqs.len(), 2);
-        assert_eq!(reqs[0]["model"], "models/gemini-embedding-001");
-        assert_eq!(reqs[0]["content"]["parts"][0]["text"], "a");
-        assert_eq!(reqs[1]["content"]["parts"][0]["text"], "b");
-        assert_eq!(reqs[0]["taskType"], "SEMANTIC_SIMILARITY");
+    fn embeddings_request_shape() {
+        let body = build_embeddings_request("text-embedding-3-small", &["a", "b"]);
+        assert_eq!(body["model"], "text-embedding-3-small");
+        assert_eq!(body["input"][0], "a");
+        assert_eq!(body["input"][1], "b");
     }
 
     #[test]
-    fn parse_embeddings_happy_path_and_errors() {
-        let ok = serde_json::json!({"embeddings": [
-            {"values": [1.0, 2.0]},
-            {"values": [3.0, 4.0]},
+    fn parse_embeddings_respects_index_order() {
+        // Deliberately permuted: index must win over array position.
+        let permuted = serde_json::json!({"data": [
+            {"index": 1, "embedding": [3.0, 4.0]},
+            {"index": 0, "embedding": [1.0, 2.0]},
         ]});
-        let parsed = parse_embeddings(&ok, 2).unwrap();
+        let parsed = parse_embeddings(&permuted, 2).unwrap();
         assert_eq!(parsed, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+    }
 
-        // Wrong count, missing array, and empty vectors are loud errors.
-        assert!(parse_embeddings(&ok, 3).is_err());
+    #[test]
+    fn parse_embeddings_rejects_malformed_responses() {
+        let ok = serde_json::json!({"data": [{"index": 0, "embedding": [1.0]}]});
+        assert!(parse_embeddings(&ok, 1).is_ok());
+        // Wrong count.
+        assert!(parse_embeddings(&ok, 2).is_err());
+        // Missing data array.
         assert!(parse_embeddings(&serde_json::json!({}), 1).is_err());
-        let empty = serde_json::json!({"embeddings": [{"values": []}]});
+        // Empty vector.
+        let empty = serde_json::json!({"data": [{"index": 0, "embedding": []}]});
         assert!(parse_embeddings(&empty, 1).is_err());
+        // Out-of-range and duplicate indices.
+        let oob = serde_json::json!({"data": [{"index": 5, "embedding": [1.0]}]});
+        assert!(parse_embeddings(&oob, 1).is_err());
+        let dup = serde_json::json!({"data": [
+            {"index": 0, "embedding": [1.0]},
+            {"index": 0, "embedding": [2.0]},
+        ]});
+        assert!(parse_embeddings(&dup, 2).is_err());
     }
 }
