@@ -130,18 +130,21 @@ name = "fast-text"
 base_url = "{base}"
 type = "fast"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "balanced-text"
 base_url = "{base}"
 type = "balanced"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "frontier-text"
 base_url = "{base}"
 type = "frontier"
 modalities = ["text"]
+context_window = 128000
 "#
     )
 }

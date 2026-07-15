@@ -74,12 +74,14 @@ name = "fast"
 base_url = "http://127.0.0.1:1"
 type = "fast"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "frontier"
 base_url = "http://127.0.0.1:1"
 type = "frontier"
 modalities = ["text"]
+context_window = 128000
 EOF
 }
 

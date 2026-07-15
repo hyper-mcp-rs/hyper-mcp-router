@@ -260,7 +260,7 @@ mod tests {
     fn yaml_config_parses_like_toml() {
         std::env::set_var("ROUTER_TEST_YAML_KEY", "yaml-key");
         let cfg = parse_with_format(
-            "server:\n  host: \"0.0.0.0\"\n  port: 1\nmodels:\n  - name: m\n    base_url: \"http://u\"\n    api_key: \"${ROUTER_TEST_YAML_KEY}\"\n    type: fast\n    modalities: [text]\n  - name: adc\n    base_url: \"http://u\"\n    api_key: { source: google-adc }\n    type: frontier\n    modalities: [text]\n",
+            "server:\n  host: \"0.0.0.0\"\n  port: 1\nmodels:\n  - name: m\n    base_url: \"http://u\"\n    api_key: \"${ROUTER_TEST_YAML_KEY}\"\n    type: fast\n    modalities: [text]\n    context_window: 128000\n  - name: adc\n    base_url: \"http://u\"\n    api_key: { source: google-adc }\n    type: frontier\n    modalities: [text]\n    context_window: 128000\n",
             config::FileFormat::Yaml,
         )
         .expect("YAML config should parse");
@@ -288,7 +288,8 @@ mod tests {
                         "base_url": "http://u",
                         "api_key": "${ROUTER_TEST_JSON_KEY}",
                         "type": "fast",
-                        "modalities": ["text"]
+                        "modalities": ["text"],
+                        "context_window": 128000
                     }
                 ]
             }"#,

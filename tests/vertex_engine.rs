@@ -232,24 +232,28 @@ name = "fast-text"
 base_url = "{chat}"
 type = "fast"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "balanced-text"
 base_url = "{chat}"
 type = "balanced"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "frontier-text"
 base_url = "{chat}"
 type = "frontier"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "image-gen"
 base_url = "{chat}"
 type = "balanced"
 modalities = ["text", "image-output"]
+context_window = 128000
 "#
     )
 }
@@ -482,6 +486,7 @@ name = "m"
 base_url = "http://{chat_addr}"
 type = "fast"
 modalities = ["text"]
+context_window = 128000
 "#
     )
 }

@@ -123,6 +123,44 @@ fn message_text(msg: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Crude chars-per-token ratio used to estimate how many tokens a request
+/// will occupy in a backend's context window (~4 characters per token for
+/// English text — the industry rule of thumb).
+pub const CONTEXT_FIT_CHARS_PER_TOKEN: usize = 4;
+
+/// Estimate how many context-window **tokens** a request will occupy
+/// upstream: the text of EVERY message — all roles, because the full
+/// conversation is forwarded verbatim (unlike the classification window,
+/// which prunes) — at [`CONTEXT_FIT_CHARS_PER_TOKEN`], plus the requested
+/// completion budget (`max_completion_tokens`, or the legacy `max_tokens`) —
+/// a context window must hold prompt AND completion.
+///
+/// This is a routing heuristic, not a tokenizer: non-text parts (base64
+/// images/audio) are not counted and real tokenizers vary by model. Model
+/// selection therefore treats context fit as a strong preference with a
+/// best-effort fallback, never a local rejection (see
+/// `config::select_candidate`).
+pub fn estimate_request_tokens(body: &serde_json::Value) -> u64 {
+    let chars: usize = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(message_text)
+                .map(|t| t.chars().count())
+                .sum()
+        })
+        .unwrap_or(0);
+    let prompt_tokens = chars.div_ceil(CONTEXT_FIT_CHARS_PER_TOKEN) as u64;
+    let completion_tokens = body
+        .get("max_completion_tokens")
+        .or_else(|| body.get("max_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    prompt_tokens + completion_tokens
+}
+
 /// The current turn's text: the `content` of the last `role == "user"` message.
 /// Used for the image-generation axis (a per-current-turn intent) and logging.
 /// Returns `None` when no user message exists.
@@ -506,5 +544,68 @@ mod tests {
         let s = "😀".repeat(500);
         let truncated = truncate_prompt(&s, 400);
         assert_eq!(truncated.chars().count(), 400);
+    }
+
+    // ── estimate_request_tokens ─────────────────────────────────────
+    #[test]
+    fn estimate_counts_every_role_at_the_chars_per_token_ratio() {
+        // 400 chars of system + 400 of user + 400 of assistant = 1200 chars
+        // → 300 tokens at 4 chars/token. ALL roles count: the full
+        // conversation is forwarded upstream, unlike the pruned
+        // classification window.
+        let text = "a".repeat(400);
+        let body = json!({"messages": [
+            {"role": "system", "content": text},
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": text},
+        ]});
+        assert_eq!(estimate_request_tokens(&body), 300);
+    }
+
+    #[test]
+    fn estimate_rounds_partial_tokens_up() {
+        let body = json!({"messages": [{"role": "user", "content": "abcde"}]});
+        // 5 chars / 4 → ceil = 2.
+        assert_eq!(estimate_request_tokens(&body), 2);
+    }
+
+    #[test]
+    fn estimate_adds_the_requested_completion_budget() {
+        let text = "a".repeat(400); // 100 prompt tokens
+        let body = json!({
+            "messages": [{"role": "user", "content": text}],
+            "max_tokens": 4096,
+        });
+        assert_eq!(estimate_request_tokens(&body), 100 + 4096);
+        // `max_completion_tokens` (the modern field) wins over `max_tokens`.
+        let body = json!({
+            "messages": [{"role": "user", "content": "a".repeat(400)}],
+            "max_completion_tokens": 1000,
+            "max_tokens": 4096,
+        });
+        assert_eq!(estimate_request_tokens(&body), 100 + 1000);
+    }
+
+    #[test]
+    fn estimate_concatenates_multipart_text_and_ignores_non_text_parts() {
+        // 8 chars of text across two parts → 2 tokens; the image part (which
+        // has no `text` field) is not counted — a documented heuristic gap.
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "efgh"},
+        ]}]});
+        assert_eq!(estimate_request_tokens(&body), 3); // "abcd efgh" = 9 chars → 3
+    }
+
+    #[test]
+    fn estimate_handles_missing_or_empty_messages() {
+        assert_eq!(estimate_request_tokens(&json!({})), 0);
+        assert_eq!(estimate_request_tokens(&json!({"messages": []})), 0);
+        // A completion budget alone still reserves context.
+        assert_eq!(
+            estimate_request_tokens(&json!({"messages": [], "max_tokens": 50})),
+            50
+        );
     }
 }

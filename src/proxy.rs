@@ -3,8 +3,9 @@
 //! Requests and responses are handled as raw `serde_json::Value` throughout —
 //! the router never deserialises into typed OpenAI structs, guaranteeing
 //! byte-for-byte passthrough of every field the client sends. Only `messages`,
-//! `model`, `stream`, and `n` are ever read; only `model` is rewritten
-//! (`n > 1` is rejected up front rather than silently altered).
+//! `model`, `stream`, `n`, and the completion budget (`max_completion_tokens`
+//! / `max_tokens`, for context-fit estimation) are ever read; only `model` is
+//! rewritten (`n > 1` is rejected up front rather than silently altered).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,7 +27,7 @@ use crate::config::{count_candidates, select_candidate, ModelApiKey, ModelConfig
 use crate::gcp_auth::{self, AccessTokenCredentials};
 use crate::modality::{detect_required_modalities, Modality, ModalitySet};
 use crate::prompt::{
-    build_classification_window, extract_prompt, has_nonempty_user_text,
+    build_classification_window, estimate_request_tokens, extract_prompt, has_nonempty_user_text,
     looks_like_image_generation, truncate_prompt,
 };
 
@@ -277,6 +278,7 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
         |routed| &routed.config,
         &route.required,
         complexity,
+        route.estimated_tokens,
     ) {
         Some(routed) => routed,
         None => {
@@ -292,6 +294,20 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
         }
     };
 
+    // Context fit is a strong preference, not a hard gate: when even the
+    // largest covering window is (by estimate) too small, the request is
+    // still forwarded there — the estimate is a heuristic and the upstream
+    // is the authority — but the overflow is logged honestly.
+    if !backend.config.fits_context(route.estimated_tokens) {
+        tracing::warn!(
+            model = %backend.config.name,
+            estimated_tokens = route.estimated_tokens,
+            context_window = backend.config.context_window.get(),
+            "request exceeds every capable backend's declared context window; \
+             forwarding to the largest as a best effort"
+        );
+    }
+
     // 5. Rewrite the model field to the selected backend's configured name.
     //    Everything else is forwarded untouched.
     body["model"] = Value::String(backend.config.name.clone());
@@ -305,6 +321,7 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
         model = %backend.config.name,
         streaming,
         prompt_chars = route.prompt_chars,
+        estimated_tokens = route.estimated_tokens,
         "routing request"
     );
 
@@ -369,6 +386,11 @@ struct RouteResolution {
     classified: Option<ModelTier>,
     image_source: Option<&'static str>,
     prompt_chars: usize,
+    /// Estimated context-window occupancy of the FULL request (all message
+    /// text plus the requested completion budget), in tokens — see
+    /// [`estimate_request_tokens`]. Candidates whose declared
+    /// `context_window` cannot fit this are avoided.
+    estimated_tokens: u64,
     /// The capacity-ladder engine selected for this request (by window
     /// length). Recorded even when classification is skipped — `classified:
     /// None` already says the engine did not run.
@@ -383,13 +405,18 @@ struct RouteResolution {
 /// the cost of making the request unroutable.
 ///
 /// Complexity is classified ONLY when it can affect the choice. With <= 1
-/// model able to serve the required set there is nothing to rank, so the
-/// (serialized) NLI pass is skipped entirely — single-model or
-/// single-candidate deployments run zero inference. (That also skips the NLI
-/// image-generation signal; the lexical signal still applies.) `classified:
-/// None` records the skip, logged honestly rather than as a fabricated tier.
+/// model able to serve the required set *within its context window* there is
+/// nothing to rank, so the (serialized) NLI pass is skipped entirely —
+/// single-model or single-candidate deployments run zero inference. (That
+/// also skips the NLI image-generation signal; the lexical signal still
+/// applies.) `classified: None` records the skip, logged honestly rather
+/// than as a fabricated tier.
 async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
     let mut required = detect_required_modalities(body);
+    // Estimated context occupancy of the FULL request — the third routing
+    // axis besides modalities and complexity. Computed once and reused by
+    // every candidate check below.
+    let estimated_tokens = estimate_request_tokens(body);
     // Build the classification window ONCE, at the top of the capacity
     // ladder; its length then selects the smallest engine whose budget covers
     // it (see [`EngineRoster::select`]). Only a window that exceeds even the
@@ -417,36 +444,40 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
     // doesn't retry (and re-log) the same dead end.
     let mut image_intent_dropped = false;
     if lexical_image && image_source.is_none() {
-        if try_require_image_output(&state.config, &mut required) {
+        if try_require_image_output(&state.config, &mut required, estimated_tokens) {
             image_source = Some("lexical");
         } else {
             image_intent_dropped = true;
         }
     }
 
-    let classified: Option<ModelTier> =
-        if count_candidates(state.models.iter(), |routed| &routed.config, &required) <= 1 {
-            None
-        } else {
-            let classification =
-                classify_or_default(engine.as_ref(), body, window, &current_turn, lexical_image)
-                    .await;
-            if classification.image_generation
-                && !required.contains(Modality::ImageOutput)
-                && !image_intent_dropped
-            {
-                if try_require_image_output(&state.config, &mut required) {
-                    image_source = Some(if lexical_image {
-                        "lexical"
-                    } else {
-                        "nli-threshold"
-                    });
+    let classified: Option<ModelTier> = if count_candidates(
+        state.models.iter(),
+        |routed| &routed.config,
+        &required,
+        estimated_tokens,
+    ) <= 1
+    {
+        None
+    } else {
+        let classification =
+            classify_or_default(engine.as_ref(), body, window, &current_turn, lexical_image).await;
+        if classification.image_generation
+            && !required.contains(Modality::ImageOutput)
+            && !image_intent_dropped
+        {
+            if try_require_image_output(&state.config, &mut required, estimated_tokens) {
+                image_source = Some(if lexical_image {
+                    "lexical"
                 } else {
-                    image_intent_dropped = true;
-                }
+                    "nli-threshold"
+                });
+            } else {
+                image_intent_dropped = true;
             }
-            Some(classification.complexity)
-        };
+        }
+        Some(classification.complexity)
+    };
     if image_intent_dropped {
         tracing::info!(
             modalities = ?required.to_kebab_vec(),
@@ -459,6 +490,7 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
         classified,
         image_source,
         prompt_chars: current_turn.chars().count(),
+        estimated_tokens,
         classifier_engine: engine.name(),
     }
 }
@@ -472,14 +504,21 @@ fn requests_multiple_choices(body: &Value) -> bool {
 }
 
 /// Soft-insert the **inferred** `image-output` modality: apply it only if some
-/// configured model can still serve the request afterwards. Deterministic
+/// configured model can still serve the request afterwards — covering its
+/// modalities AND fitting it in the model's context window (an image model
+/// whose window the request overflows is a guaranteed upstream failure, so
+/// the inferred intent degrades to a text route instead). Deterministic
 /// modalities are hard constraints (422 when uncovered), but image intent is
 /// probabilistic — degrading to a text route beats rejecting a servable
 /// request over an inference. Returns whether it was applied.
-fn try_require_image_output(config: &RouterConfig, required: &mut ModalitySet) -> bool {
+fn try_require_image_output(
+    config: &RouterConfig,
+    required: &mut ModalitySet,
+    estimated_tokens: u64,
+) -> bool {
     let mut with_image = *required;
     with_image.insert(Modality::ImageOutput);
-    if config.candidate_count(&with_image) > 0 {
+    if config.candidate_count(&with_image, estimated_tokens) > 0 {
         *required = with_image;
         true
     } else {
@@ -817,6 +856,8 @@ mod tests {
             api_key: None,
             tier: ModelTier::Balanced,
             modalities: mods.to_vec(),
+            // Effectively unbounded: these tests exercise the modality axis.
+            context_window: std::num::NonZeroU64::new(u64::MAX).unwrap(),
         }
     }
 
@@ -827,7 +868,7 @@ mod tests {
             model("image", &[Modality::Text, Modality::ImageOutput]),
         ]);
         let mut required: ModalitySet = [Modality::Text].into_iter().collect();
-        assert!(try_require_image_output(&cfg, &mut required));
+        assert!(try_require_image_output(&cfg, &mut required, 0));
         assert!(required.contains(Modality::ImageOutput));
     }
 
@@ -837,7 +878,24 @@ mod tests {
         // the request routable, rather than turn into a 422.
         let cfg = config_with(vec![model("text", &[Modality::Text])]);
         let mut required: ModalitySet = [Modality::Text].into_iter().collect();
-        assert!(!try_require_image_output(&cfg, &mut required));
+        assert!(!try_require_image_output(&cfg, &mut required, 0));
         assert!(!required.contains(Modality::ImageOutput));
+    }
+
+    #[test]
+    fn inferred_image_output_dropped_when_no_image_model_fits() {
+        // The only image-capable backend has an 8k window; a request estimated
+        // at 100k tokens would be a guaranteed upstream failure there, so the
+        // soft image intent degrades to a text route instead.
+        let mut image = model("image", &[Modality::Text, Modality::ImageOutput]);
+        image.context_window = std::num::NonZeroU64::new(8_000).unwrap();
+        let cfg = config_with(vec![model("text", &[Modality::Text]), image]);
+
+        let mut required: ModalitySet = [Modality::Text].into_iter().collect();
+        assert!(!try_require_image_output(&cfg, &mut required, 100_000));
+        assert!(!required.contains(Modality::ImageOutput));
+        // The same request at a small size keeps the inferred intent.
+        assert!(try_require_image_output(&cfg, &mut required, 500));
+        assert!(required.contains(Modality::ImageOutput));
     }
 }

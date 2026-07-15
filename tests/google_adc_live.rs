@@ -37,6 +37,7 @@ base_url = "https://us-central1-aiplatform.googleapis.com/v1/projects/{project}/
 api_key = {{ source = "google-adc" }}
 type = "balanced"
 modalities = ["text"]
+context_window = 128000
 "#
     );
     let cfg = config::parse(&toml).expect("parse config");

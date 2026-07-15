@@ -18,41 +18,47 @@
       "base_url": "https://api.openai.com/v1",
       "api_key": "sk-plaintext-key",
       "type": "fast",
-      "modalities": ["text", "tools"]
+      "modalities": ["text", "tools"],
+      "context_window": 1047576
     },
     {
       "name": "llama3",
       "base_url": "http://localhost:11434/v1",
       "type": "fast",
-      "modalities": ["text"]
+      "modalities": ["text"],
+      "context_window": 8192
     },
     {
       "name": "gpt-4.1",
       "base_url": "https://api.openai.com/v1",
       "api_key": "${OPENAI_API_KEY}",
       "type": "balanced",
-      "modalities": ["text", "tools"]
+      "modalities": ["text", "tools"],
+      "context_window": 1047576
     },
     {
       "name": "o3",
       "base_url": "https://api.openai.com/v1",
       "api_key": { "source": "keyring", "service": "hyper-mcp-router", "user": "openai-frontier" },
       "type": "frontier",
-      "modalities": ["text", "tools"]
+      "modalities": ["text", "tools"],
+      "context_window": 200000
     },
     {
       "name": "gpt-4o",
       "base_url": "https://api.openai.com/v1",
       "api_key": "${OPENAI_API_KEY}",
       "type": "balanced",
-      "modalities": ["text", "image-input", "file-input", "image-output", "tools"]
+      "modalities": ["text", "image-input", "file-input", "image-output", "tools"],
+      "context_window": 128000
     },
     {
       "name": "gpt-audio",
       "base_url": "https://api.openai.com/v1",
       "api_key": "${OPENAI_API_KEY}",
       "type": "balanced",
-      "modalities": ["text", "audio-input", "audio-output"]
+      "modalities": ["text", "audio-input", "audio-output"],
+      "context_window": 128000
     }
   ]
 }

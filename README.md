@@ -27,6 +27,10 @@ No external state, no database, no runtime model downloads.
 - **Modality-aware routing** — each request is sent to a backend that supports
   every modality it requires (including tool calling), independent of
   complexity.
+- **Context-window-aware routing** — every model declares its `context_window`
+  (required, in tokens); a request whose estimated size overflows a "fast"
+  model's small window routes to a backend that can actually hold it (see
+  [How routing works](#how-routing-works)).
 - **Context-aware complexity** — classified over a window of recent substantive
   user turns, so a terse follow-up inherits its context's difficulty; pure
   filler skips the model and routes to Fast (see
@@ -242,7 +246,7 @@ and one `match` arm in `engines::build`. Nothing else changes (its unique
 
 ## How routing works
 
-Each request resolves two axes:
+Each request resolves three axes:
 
 - **Modality set** (hard constraint) — read deterministically from the request
   JSON: content-part types (image/audio/file input), the `modalities` field
@@ -251,27 +255,40 @@ Each request resolves two axes:
   (`role: "tool"` messages, assistant `tool_calls`), so a tool-loop
   continuation stays on a tool-capable backend even if the follow-up omits
   `tools`.
+- **Context fit** (strong preference) — the request's estimated context
+  occupancy: the text of every message at ~4 characters per token, plus any
+  requested `max_tokens`/`max_completion_tokens` completion budget. Every
+  model declares its `context_window` in config (**required**, in tokens);
+  candidates whose window cannot fit the estimate are avoided — "fast" models
+  usually have far smaller windows than "frontier" ones, and a very large
+  request sent to a small-window backend is a guaranteed upstream failure.
 - **Image-generation intent** (soft constraint) — when the request doesn't say
   `modalities: ["image"]` explicitly, image-output is *inferred* via a hardened
   lexical-OR-NLI-threshold signal. Because it is probabilistic, it is applied
-  only if an image-capable backend exists — an inferred intent never makes a
-  request unroutable; it degrades to a text route instead.
+  only if an image-capable backend exists that also fits the request — an
+  inferred intent never makes a request unroutable; it degrades to a text
+  route instead.
 - **Complexity type** (preference) — the argmax of three complexity hypotheses,
   classified over a **window of recent substantive user turns** (see
   [Performance & tuning](#performance--tuning)), so a terse follow-up inherits
   the difficulty of its context. There is no message-history heuristic.
 
 The router selects the configured model whose declared modalities are a
-**superset** of the required set, preferring the resolved complexity type
-(exact → nearest higher → highest lower). If no single model covers the required
-set it returns `422`.
+**superset** of the required set and whose context window fits the request,
+preferring the resolved complexity type (exact → nearest higher → highest
+lower). If no single model covers the required set it returns `422`. If
+covering models exist but the request (by estimate) fits none of their
+windows, it is still forwarded to the largest-window candidate as a best
+effort — the estimate is a chars-per-token heuristic and the backend is the
+authority — with a warning logged.
 
-Complexity is only used to *rank among* candidates, so when at most one model can
-serve the required modality set (e.g. a single-model deployment, or a request
-for a modality only one backend provides) the router **skips classification
-entirely** and routes directly — zero inference. (The NLI image-generation
-signal is skipped along with it; the lexical signal and the explicit
-`modalities` field still apply.)
+Complexity is only used to *rank among* candidates, so when at most one model
+can serve the required modality set within its context window (e.g. a
+single-model deployment, a request for a modality only one backend provides,
+or a long transcript only one window can hold) the router **skips
+classification entirely** and routes directly — zero inference. (The NLI
+image-generation signal is skipped along with it; the lexical signal and the
+explicit `modalities` field still apply.)
 
 ## Performance & tuning
 

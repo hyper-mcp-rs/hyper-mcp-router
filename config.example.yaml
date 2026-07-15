@@ -142,6 +142,16 @@ classifier:
 # an uncovered modality is answered with a 422 at request time. (Exception:
 # *inferred* image-generation intent is soft — if no model declares
 # "image-output", such requests degrade to a text route instead of failing.)
+
+# `context_window` (REQUIRED) is the model's context window in TOKENS (prompt +
+# completion), from the provider's model card. Routing only considers models
+# whose window fits the request's estimated size (~4 characters per token of
+# message text, plus any requested max_tokens/max_completion_tokens) — "fast"
+# models often have far smaller windows than "frontier" ones, and sending a
+# very large request to a small-window backend is a guaranteed upstream error.
+# A request too large for EVERY capable model is still forwarded to the one
+# with the largest window (the estimate is a heuristic; the backend is the
+# authority) — logged as a warning.
 models:
   # 1. Plaintext key directly in the file.
   - name: "gpt-4.1-mini"
@@ -149,12 +159,14 @@ models:
     api_key: "sk-plaintext-key"
     type: "fast"
     modalities: ["text", "tools"]
+    context_window: 1047576
 
   # 1b. Keyless backend: omit api_key (or set it to "").
   - name: "llama3"
     base_url: "http://localhost:11434/v1"
     type: "fast"
     modalities: ["text"]
+    context_window: 8192
 
   # 2. Environment variable, expanded during config parsing. Use
   #    ${VAR:-default} for a fallback, or $${VAR} for a literal.
@@ -163,6 +175,7 @@ models:
     api_key: "${OPENAI_API_KEY}"
     type: "balanced"
     modalities: ["text", "tools"]
+    context_window: 1047576
 
   # 3. OS keyring lookup.
   - name: "o3"
@@ -170,6 +183,7 @@ models:
     api_key: { source: "keyring", service: "hyper-mcp-router", user: "openai-frontier" }
     type: "frontier"
     modalities: ["text", "tools"]
+    context_window: 200000
 
   # 4. Google Application Default Credentials, for backends hosted on Vertex
   #    AI (its OpenAI-compatible endpoint takes OAuth Bearer tokens, not API
@@ -184,6 +198,7 @@ models:
   #  api_key: { source: "google-adc" }
   #  type: "frontier"
   #  modalities: ["text", "tools"]
+  #  context_window: 1048576
 
   # A single multimodal model can cover several modalities at once.
   - name: "gpt-4o"
@@ -191,6 +206,7 @@ models:
     api_key: "${OPENAI_API_KEY}"
     type: "balanced"
     modalities: ["text", "image-input", "file-input", "image-output", "tools"]
+    context_window: 128000
 
   # A dedicated voice model: audio in and audio out (plus text).
   - name: "gpt-audio"
@@ -198,3 +214,4 @@ models:
     api_key: "${OPENAI_API_KEY}"
     type: "balanced"
     modalities: ["text", "audio-input", "audio-output"]
+    context_window: 128000

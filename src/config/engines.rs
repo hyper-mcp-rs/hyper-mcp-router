@@ -289,7 +289,7 @@ mod tests {
              [classifier.gemini-embedding-001]\napi_key=\"${ROUTER_TEST_GEMINI_KEY}\"\n\
              base_url=\"http://localhost:9\"\nmax_concurrency=8\nrequest_timeout_secs=5\n\
              [classifier.gemini-embedding-2]\napi_key=\"plain-key\"\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap();
         assert_eq!(cfg.classifier.models, [ClassifierModel::GeminiEmbedding001]);
@@ -315,7 +315,7 @@ mod tests {
              [classifier]\nmodel=\"text-embedding-005\"\n\
              [classifier.text-embedding-005]\nproject=\"my-proj\"\nlocation=\"us-east1\"\n\
              quota_project=\"billing-proj\"\naccess_token=\"te5-token\"\nmax_concurrency=16\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap();
         assert_eq!(cfg.classifier.models, [ClassifierModel::TextEmbedding005]);
@@ -335,7 +335,7 @@ mod tests {
         let cfg = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n\
              [classifier.text-embedding-005]\naccess_token=\"\"\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap();
         let te5 = &cfg.classifier.text_embedding_005;
@@ -410,7 +410,7 @@ mod tests {
              [classifier]\nmodel=\"gemini-embedding-001\"\n\
              [classifier.gemini-embedding-001]\nproject=\"p\"\nlocation=\"europe-west4\"\n\
              quota_project=\"q\"\naccess_token=\"tok\"\nmax_concurrency=4\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap();
         let g = &cfg.classifier.gemini_embedding_001;
@@ -436,7 +436,7 @@ mod tests {
         let cfg = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n\
              [classifier.gemini-embedding-001]\napi_key=\"\"\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap();
         assert_eq!(cfg.classifier.gemini_embedding_001.api_key, None);
@@ -449,7 +449,7 @@ mod tests {
         let err = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n\
              [classifier.gemini-embedding-001]\nbase_url=\"ftp://x\"\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         );
         assert!(err.is_err());
     }
@@ -462,7 +462,7 @@ mod tests {
         let err = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n\
              [classifier.gemini-embedding-001]\napi_key={ source = \"google-adc\" }\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap_err();
         assert!(

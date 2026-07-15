@@ -251,18 +251,21 @@ name = "fast-text"
 base_url = "{base}"
 type = "fast"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "balanced-text"
 base_url = "{base}"
 type = "balanced"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "frontier-all"
 base_url = "{base}"
 type = "frontier"
 modalities = ["text", "image-input", "audio-input", "file-input", "audio-output", "image-output", "tools"]
+context_window = 128000
 "#
     )
 }
@@ -284,6 +287,7 @@ base_url = "{base}"
 api_key = "test-key"
 type = "balanced"
 modalities = ["text", "image-input", "audio-input", "file-input", "audio-output", "image-output", "tools"]
+context_window = 128000
 "#
     )
 }
@@ -303,18 +307,21 @@ name = "fast-text"
 base_url = "{base}"
 type = "fast"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "balanced-text"
 base_url = "{base}"
 type = "balanced"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "frontier-text"
 base_url = "{base}"
 type = "frontier"
 modalities = ["text"]
+context_window = 128000
 "#
     )
 }
@@ -336,6 +343,7 @@ base_url = "{base}"
 api_key = "test-key"
 type = "fast"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "balanced-text"
@@ -343,6 +351,7 @@ base_url = "{base}"
 api_key = "test-key"
 type = "balanced"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "frontier-text"
@@ -350,6 +359,7 @@ base_url = "{base}"
 api_key = "test-key"
 type = "frontier"
 modalities = ["text"]
+context_window = 128000
 
 [[models]]
 name = "vision"
@@ -357,6 +367,7 @@ base_url = "{base}"
 api_key = "test-key"
 type = "balanced"
 modalities = ["text", "image-input"]
+context_window = 128000
 
 [[models]]
 name = "audio"
@@ -364,6 +375,7 @@ base_url = "{base}"
 api_key = "test-key"
 type = "balanced"
 modalities = ["text", "audio-input", "audio-output"]
+context_window = 128000
 
 [[models]]
 name = "files"
@@ -371,6 +383,7 @@ base_url = "{base}"
 api_key = "test-key"
 type = "balanced"
 modalities = ["text", "file-input"]
+context_window = 128000
 
 [[models]]
 name = "image-gen"
@@ -378,6 +391,7 @@ base_url = "{base}"
 api_key = "test-key"
 type = "balanced"
 modalities = ["text", "image-output"]
+context_window = 128000
 
 [[models]]
 name = "agent"
@@ -385,6 +399,7 @@ base_url = "{base}"
 api_key = "test-key"
 type = "balanced"
 modalities = ["text", "tools"]
+context_window = 128000
 "#
     )
 }

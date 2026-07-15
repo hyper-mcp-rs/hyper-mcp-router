@@ -7,7 +7,9 @@
 //! Requests and responses elsewhere are handled as raw JSON; this module is the
 //! only place typed structs are used, and only for the operator's config file.
 
+use std::cmp::Reverse;
 use std::fmt;
+use std::num::NonZeroU64;
 
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
@@ -230,12 +232,27 @@ pub struct ModelConfig {
     pub tier: ModelTier,
     /// Non-empty; matched as a set for superset checks.
     pub modalities: Vec<Modality>,
+    /// The model's context window in **tokens** (prompt + completion), e.g.
+    /// `context_window = 128000`. REQUIRED: routing avoids models whose
+    /// window cannot fit the request's estimated size — "fast" models
+    /// typically have much smaller windows than "frontier" ones, and an
+    /// oversized request sent to a small-window backend is a guaranteed
+    /// upstream failure — so every model must declare its capacity (an
+    /// omitted or zero value is a startup error, not a silent "fits
+    /// everything").
+    pub context_window: NonZeroU64,
 }
 
 impl ModelConfig {
     /// The declared modalities as a set, for superset matching.
     pub fn modality_set(&self) -> ModalitySet {
         self.modalities.iter().copied().collect()
+    }
+
+    /// Whether a request estimated at `estimated_tokens` fits this model's
+    /// declared context window.
+    pub fn fits_context(&self, estimated_tokens: u64) -> bool {
+        estimated_tokens <= self.context_window.get()
     }
 }
 
@@ -457,25 +474,35 @@ impl RouterConfig {
     }
 
     /// Pick the model whose declared modalities are a **superset** of
-    /// `required`, preferring `complexity`. Returns `None` when no single model
-    /// covers the whole set (the proxy then returns 422).
+    /// `required` and whose context window fits `estimated_tokens`, preferring
+    /// `complexity`. Returns `None` when no single model covers the whole
+    /// modality set (the proxy then returns 422).
     ///
-    /// Ranking among survivors: exact type match → nearest higher type
+    /// Ranking among fitting survivors: exact type match → nearest higher type
     /// (escalation) → highest lower type. Ties break toward the first-declared
-    /// model in config.
+    /// model in config. When no covering model fits, the largest-window one is
+    /// chosen as a best effort — see [`select_candidate`].
     pub fn select_model(
         &self,
         required: &ModalitySet,
         complexity: ModelTier,
+        estimated_tokens: u64,
     ) -> Option<&ModelConfig> {
-        select_candidate(self.models.iter(), |m| m, required, complexity)
+        select_candidate(
+            self.models.iter(),
+            |m| m,
+            required,
+            complexity,
+            estimated_tokens,
+        )
     }
 
-    /// How many models can serve `required` (declare a superset of it). When this
-    /// is `<= 1` the complexity tier is irrelevant — there is nothing to rank —
-    /// so the proxy can skip classification entirely and route directly.
-    pub fn candidate_count(&self, required: &ModalitySet) -> usize {
-        count_candidates(self.models.iter(), |m| m, required)
+    /// How many models can serve `required` (declare a superset of it) within
+    /// their context window. When this is `<= 1` the complexity tier is
+    /// irrelevant — there is nothing to rank — so the proxy can skip
+    /// classification entirely and route directly.
+    pub fn candidate_count(&self, required: &ModalitySet, estimated_tokens: u64) -> usize {
+        count_candidates(self.models.iter(), |m| m, required, estimated_tokens)
     }
 }
 
@@ -485,31 +512,59 @@ impl RouterConfig {
 /// resolved auth). `model_of` projects an item to its [`ModelConfig`].
 ///
 /// 1. Filter by capability (superset), preserving declaration order.
-/// 2. Rank survivors: exact type → nearest higher (escalation) → highest
-///    lower (fallback); `min_by_key` returns the first minimum, so a tie
-///    resolves toward the earlier-declared item.
+/// 2. Keep candidates whose context window fits `estimated_tokens` — a
+///    "fast" model with a small window must never receive a request that
+///    cannot fit in it, regardless of the complexity verdict.
+/// 3. Rank fitting survivors: exact type → nearest higher (escalation) →
+///    highest lower (fallback); `min_by_key` returns the first minimum, so a
+///    tie resolves toward the earlier-declared item.
+/// 4. When NO covering candidate fits, fall back to the largest declared
+///    window (best tier rank, then declaration order, break ties). The size
+///    estimate is a chars-per-token heuristic, so a hard local rejection
+///    could refuse requests the backend would actually accept — forwarding
+///    to the most capacious backend lets the upstream be the judge.
 pub(crate) fn select_candidate<'a, T: 'a>(
     items: impl IntoIterator<Item = &'a T>,
     model_of: impl Fn(&T) -> &ModelConfig,
     required: &ModalitySet,
     complexity: ModelTier,
+    estimated_tokens: u64,
 ) -> Option<&'a T> {
-    items
+    let covering: Vec<&'a T> = items
         .into_iter()
         .filter(|item| model_of(item).modality_set().is_superset(required))
+        .collect();
+    covering
+        .iter()
+        .copied()
+        .filter(|item| model_of(item).fits_context(estimated_tokens))
         .min_by_key(|item| tier_rank(model_of(item).tier, complexity))
+        .or_else(|| {
+            covering.into_iter().min_by_key(|item| {
+                let m = model_of(item);
+                (
+                    Reverse(m.context_window.get()),
+                    tier_rank(m.tier, complexity),
+                )
+            })
+        })
 }
 
-/// Companion to [`select_candidate`]: how many items could serve `required`.
-/// When this is `<= 1` the complexity tier is irrelevant (nothing to rank).
+/// Companion to [`select_candidate`]: how many items could serve `required`
+/// within their context window. When this is `<= 1` the complexity tier is
+/// irrelevant (nothing to rank).
 pub(crate) fn count_candidates<'a, T: 'a>(
     items: impl IntoIterator<Item = &'a T>,
     model_of: impl Fn(&T) -> &ModelConfig,
     required: &ModalitySet,
+    estimated_tokens: u64,
 ) -> usize {
     items
         .into_iter()
-        .filter(|item| model_of(item).modality_set().is_superset(required))
+        .filter(|item| {
+            let m = model_of(item);
+            m.modality_set().is_superset(required) && m.fits_context(estimated_tokens)
+        })
         .count()
 }
 
@@ -537,7 +592,7 @@ mod tests {
     #[test]
     fn server_tuning_fields_default_when_omitted() {
         let cfg = parse(
-            "[server]\nhost=\"0.0.0.0\"\nport=1\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap();
         assert_eq!(cfg.server.stream_idle_timeout_secs, 300);
@@ -563,7 +618,7 @@ mod tests {
     fn classifier_model_parses_and_rejects_unknown() {
         let cfg = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n[classifier]\nmodel=\"deberta-v3-xsmall-zeroshot\"\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap();
         assert_eq!(
@@ -574,7 +629,7 @@ mod tests {
         // An unknown model id must be a loud config error, never a silent default.
         let err = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n[classifier]\nmodel=\"not-a-model\"\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         );
         assert!(err.is_err());
     }
@@ -584,7 +639,7 @@ mod tests {
         let cfg = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n\
              [classifier]\nmodel=[\"gemini-embedding-2\", \"deberta-v3-xsmall-zeroshot\"]\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap();
         // Config order is preserved verbatim — the capacity ladder is derived
@@ -604,7 +659,7 @@ mod tests {
         let err = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n\
              [classifier]\nmodel=[\"deberta-v3-xsmall-zeroshot\", \"not-a-model\"]\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         );
         assert!(err.is_err());
     }
@@ -614,7 +669,7 @@ mod tests {
         let cfg = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n\
              [classifier]\nmodel=[\"deberta-v3-xsmall-zeroshot\", \"deberta-v3-xsmall-zeroshot\"]\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap();
         let err = cfg.validate().unwrap_err();
@@ -625,7 +680,7 @@ mod tests {
     fn classifier_model_empty_list_fails_validation() {
         let cfg = parse(
             "[server]\nhost=\"0.0.0.0\"\nport=1\n[classifier]\nmodel=[]\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap();
         let err = cfg.validate().unwrap_err();
@@ -638,7 +693,7 @@ mod tests {
             "[server]\nhost=\"0.0.0.0\"\nport=1\n\
              [classifier]\nimage_generation_threshold=0.7\n\
              [classifier.deberta-v3-xsmall-zeroshot]\nimage_generation_threshold=0.9\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap();
         assert_eq!(cfg.classifier.image_generation_threshold, 0.7);
@@ -665,7 +720,7 @@ mod tests {
             "[server]\nhost=\"0.0.0.0\"\nport=1\nstream_idle_timeout_secs=42\nmax_body_bytes=1024\n\
              [classifier]\ntrivial_max_words=3\n\
              [classifier.deberta-v3-xsmall-zeroshot]\ninference_pool_size=4\nintra_op_threads=1\n\
-             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n",
         )
         .unwrap();
         assert_eq!(cfg.server.stream_idle_timeout_secs, 42);
@@ -699,7 +754,7 @@ port = 8080
     #[test]
     fn api_key_plaintext() {
         let cfg = parse_single_model(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key=\"sk-plain\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key=\"sk-plain\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
         ));
         assert_eq!(
             cfg.models[0].api_key,
@@ -711,7 +766,7 @@ port = 8080
     fn api_key_absent_is_none() {
         // Field omitted entirely: keyless backend.
         let cfg = parse_single_model(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
         ));
         assert_eq!(cfg.models[0].api_key, None);
     }
@@ -720,7 +775,7 @@ port = 8080
     fn api_key_empty_string_is_none() {
         // Explicit empty string is treated the same as omitting the field.
         let cfg = parse_single_model(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key=\"\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key=\"\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
         ));
         assert_eq!(cfg.models[0].api_key, None);
     }
@@ -729,7 +784,7 @@ port = 8080
     fn keyless_model_passes_validation() {
         // A keyless single-tier catalogue must still validate (coverage aside).
         let cfg = parse_single_model(&format!(
-            "{BASE}\n[[models]]\nname=\"fast\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n[[models]]\nname=\"bal\"\nbase_url=\"http://u\"\ntype=\"balanced\"\nmodalities=[\"text\"]\n[[models]]\nname=\"front\"\nbase_url=\"http://u\"\ntype=\"frontier\"\nmodalities=[\"text\", \"image-input\", \"audio-input\", \"file-input\", \"audio-output\", \"image-output\", \"tools\"]\n"
+            "{BASE}\n[[models]]\nname=\"fast\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n[[models]]\nname=\"bal\"\nbase_url=\"http://u\"\ntype=\"balanced\"\nmodalities=[\"text\"]\ncontext_window=128000\n[[models]]\nname=\"front\"\nbase_url=\"http://u\"\ntype=\"frontier\"\nmodalities=[\"text\", \"image-input\", \"audio-input\", \"file-input\", \"audio-output\", \"image-output\", \"tools\"]\ncontext_window=128000\n"
         ));
         assert!(cfg.validate().is_ok());
         assert!(cfg.models.iter().all(|m| m.api_key.is_none()));
@@ -739,7 +794,7 @@ port = 8080
     fn api_key_env_expanded() {
         std::env::set_var("ROUTER_TEST_KEY", "sk-from-env");
         let cfg = parse_single_model(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key=\"${{ROUTER_TEST_KEY}}\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key=\"${{ROUTER_TEST_KEY}}\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
         ));
         assert_eq!(
             cfg.models[0].api_key,
@@ -759,7 +814,7 @@ port = 8080
             return;
         };
         let cfg = parse_single_model(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"keyring\", service = \"{service}\", user = \"{user}\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"keyring\", service = \"{service}\", user = \"{user}\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
         ));
         assert_eq!(
             cfg.models[0].api_key,
@@ -773,7 +828,7 @@ port = 8080
         // Parsing must record the marker WITHOUT touching ADC (hermetic):
         // credential discovery happens at startup, not at config load.
         let cfg = parse_single_model(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"google-adc\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"google-adc\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
         ));
         assert_eq!(cfg.models[0].api_key, Some(ModelApiKey::GoogleAdc));
     }
@@ -781,7 +836,7 @@ port = 8080
     #[test]
     fn api_key_google_adc_rejects_extra_fields() {
         let err = parse(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"google-adc\", service = \"x\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"google-adc\", service = \"x\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
         ))
         .unwrap_err();
         assert!(
@@ -793,7 +848,7 @@ port = 8080
     #[test]
     fn api_key_unknown_source_lists_the_valid_ones() {
         let err = parse(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"vault\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"vault\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
         ))
         .unwrap_err();
         assert!(
@@ -806,7 +861,7 @@ port = 8080
     #[test]
     fn base_url_parses_and_is_retained() {
         let cfg = parse_single_model(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"https://api.example.com/v1\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"https://api.example.com/v1\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
         ));
         assert_eq!(
             cfg.models[0].base_url.as_str(),
@@ -817,7 +872,7 @@ port = 8080
     #[test]
     fn base_url_rejects_malformed() {
         let err = parse(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"not a url\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"not a url\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
         ))
         .unwrap_err();
         assert!(err.to_string().contains("base_url"), "got: {err}");
@@ -826,20 +881,28 @@ port = 8080
     #[test]
     fn base_url_rejects_non_http_scheme() {
         let err = parse(&format!(
-            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"ftp://files.example.com\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"ftp://files.example.com\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
         ))
         .unwrap_err();
         assert!(err.to_string().contains("http or https"), "got: {err}");
     }
 
     // ── select_model ──────────────────────────────────────────────────────────
+    /// A model with an effectively unbounded window, for tests that exercise
+    /// the modality/tier axes without a capacity constraint.
     fn model(name: &str, tier: ModelTier, mods: &[Modality]) -> ModelConfig {
+        model_ctx(name, tier, mods, u64::MAX)
+    }
+
+    /// [`model`] with a specific context window (tokens).
+    fn model_ctx(name: &str, tier: ModelTier, mods: &[Modality], window: u64) -> ModelConfig {
         ModelConfig {
             name: name.to_string(),
             base_url: Url::parse("http://x").unwrap(),
             api_key: Some(ModelApiKey::Static("k".to_string())),
             tier,
             modalities: mods.to_vec(),
+            context_window: NonZeroU64::new(window).expect("nonzero window"),
         }
     }
 
@@ -869,6 +932,7 @@ port = 8080
             .select_model(
                 &req(&[Modality::Text, Modality::ImageInput]),
                 ModelTier::Balanced,
+                0,
             )
             .unwrap();
         assert_eq!(chosen.name, "vision");
@@ -882,7 +946,7 @@ port = 8080
             model("frontier", ModelTier::Frontier, &[Modality::Text]),
         ]);
         let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Balanced)
+            .select_model(&req(&[Modality::Text]), ModelTier::Balanced, 0)
             .unwrap();
         assert_eq!(chosen.name, "balanced");
     }
@@ -895,7 +959,7 @@ port = 8080
         ]);
         // want Balanced, none exact => nearest higher is Frontier.
         let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Balanced)
+            .select_model(&req(&[Modality::Text]), ModelTier::Balanced, 0)
             .unwrap();
         assert_eq!(chosen.name, "frontier");
     }
@@ -908,7 +972,7 @@ port = 8080
         ]);
         // want Frontier, nothing at/above => highest lower is Balanced.
         let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Frontier)
+            .select_model(&req(&[Modality::Text]), ModelTier::Frontier, 0)
             .unwrap();
         assert_eq!(chosen.name, "balanced");
     }
@@ -920,7 +984,7 @@ port = 8080
             model("second", ModelTier::Balanced, &[Modality::Text]),
         ]);
         let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Balanced)
+            .select_model(&req(&[Modality::Text]), ModelTier::Balanced, 0)
             .unwrap();
         assert_eq!(chosen.name, "first");
     }
@@ -936,6 +1000,7 @@ port = 8080
             .select_model(
                 &req(&[Modality::AudioInput, Modality::AudioOutput]),
                 ModelTier::Balanced,
+                0,
             )
             .unwrap();
         assert_eq!(chosen.name, "voice");
@@ -959,7 +1024,8 @@ port = 8080
         assert!(cfg
             .select_model(
                 &req(&[Modality::AudioInput, Modality::AudioOutput]),
-                ModelTier::Balanced
+                ModelTier::Balanced,
+                0
             )
             .is_none());
     }
@@ -1039,14 +1105,14 @@ port = 8080
             ),
         ]);
         // Three text models can serve plain text.
-        assert_eq!(cfg.candidate_count(&req(&[Modality::Text])), 3);
+        assert_eq!(cfg.candidate_count(&req(&[Modality::Text]), 0), 3);
         // Only the vision model can serve image input.
         assert_eq!(
-            cfg.candidate_count(&req(&[Modality::Text, Modality::ImageInput])),
+            cfg.candidate_count(&req(&[Modality::Text, Modality::ImageInput]), 0),
             1
         );
         // Nothing serves audio output.
-        assert_eq!(cfg.candidate_count(&req(&[Modality::AudioOutput])), 0);
+        assert_eq!(cfg.candidate_count(&req(&[Modality::AudioOutput]), 0), 0);
     }
 
     #[test]
@@ -1065,13 +1131,145 @@ port = 8080
             .select_model(
                 &req(&[Modality::Text, Modality::Tools]),
                 ModelTier::Balanced,
+                0,
             )
             .unwrap();
         assert_eq!(chosen.name, "agent");
         // Without the tools requirement, tier preference picks `plain`.
         let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Balanced)
+            .select_model(&req(&[Modality::Text]), ModelTier::Balanced, 0)
             .unwrap();
         assert_eq!(chosen.name, "plain");
+    }
+
+    // ── context-window fit ────────────────────────────────────────────
+    #[test]
+    fn select_skips_models_whose_window_cannot_fit_the_request() {
+        // The fast model's tier matches, but its 8k window cannot hold a
+        // 100k-token request: capacity beats tier preference.
+        let cfg = catalogue(vec![
+            model_ctx("fast-small", ModelTier::Fast, &[Modality::Text], 8_000),
+            model_ctx(
+                "frontier-big",
+                ModelTier::Frontier,
+                &[Modality::Text],
+                200_000,
+            ),
+        ]);
+        let chosen = cfg
+            .select_model(&req(&[Modality::Text]), ModelTier::Fast, 100_000)
+            .unwrap();
+        assert_eq!(chosen.name, "frontier-big");
+        // A small request still routes by tier preference.
+        let chosen = cfg
+            .select_model(&req(&[Modality::Text]), ModelTier::Fast, 500)
+            .unwrap();
+        assert_eq!(chosen.name, "fast-small");
+    }
+
+    #[test]
+    fn select_window_boundary_is_inclusive() {
+        let cfg = catalogue(vec![model_ctx(
+            "m",
+            ModelTier::Fast,
+            &[Modality::Text],
+            8_000,
+        )]);
+        assert!(cfg.models[0].fits_context(8_000));
+        assert!(!cfg.models[0].fits_context(8_001));
+    }
+
+    #[test]
+    fn select_falls_back_to_largest_window_when_nothing_fits() {
+        // The estimate is a heuristic, so an oversized request is forwarded
+        // to the most capacious covering model (best effort) rather than
+        // rejected locally.
+        let cfg = catalogue(vec![
+            model_ctx("small", ModelTier::Fast, &[Modality::Text], 8_000),
+            model_ctx("medium", ModelTier::Balanced, &[Modality::Text], 32_000),
+            model_ctx("large", ModelTier::Frontier, &[Modality::Text], 128_000),
+        ]);
+        let chosen = cfg
+            .select_model(&req(&[Modality::Text]), ModelTier::Fast, 1_000_000)
+            .unwrap();
+        assert_eq!(chosen.name, "large");
+    }
+
+    #[test]
+    fn select_fallback_still_respects_modalities() {
+        // Best-effort capacity fallback never overrides a capability
+        // constraint: an uncovered modality set stays a 422, whatever the size.
+        let cfg = catalogue(vec![model_ctx(
+            "small",
+            ModelTier::Fast,
+            &[Modality::Text],
+            8_000,
+        )]);
+        assert!(cfg
+            .select_model(&req(&[Modality::AudioOutput]), ModelTier::Fast, 1_000_000)
+            .is_none());
+    }
+
+    #[test]
+    fn select_fallback_breaks_window_ties_by_tier_then_declaration() {
+        let cfg = catalogue(vec![
+            model_ctx("fast-a", ModelTier::Fast, &[Modality::Text], 8_000),
+            model_ctx("balanced", ModelTier::Balanced, &[Modality::Text], 8_000),
+            model_ctx("fast-b", ModelTier::Fast, &[Modality::Text], 8_000),
+        ]);
+        // Nothing fits 100k; all windows tie at 8k → the wanted tier wins,
+        // then declaration order.
+        let chosen = cfg
+            .select_model(&req(&[Modality::Text]), ModelTier::Fast, 100_000)
+            .unwrap();
+        assert_eq!(chosen.name, "fast-a");
+    }
+
+    #[test]
+    fn candidate_count_reflects_context_fit() {
+        let cfg = catalogue(vec![
+            model_ctx("small", ModelTier::Fast, &[Modality::Text], 8_000),
+            model_ctx("large", ModelTier::Frontier, &[Modality::Text], 128_000),
+        ]);
+        assert_eq!(cfg.candidate_count(&req(&[Modality::Text]), 500), 2);
+        // Only the large model fits: a single candidate, so the proxy can
+        // skip classification — the tier cannot change the outcome.
+        assert_eq!(cfg.candidate_count(&req(&[Modality::Text]), 100_000), 1);
+        // Nothing fits: zero FITTING candidates (selection then falls back).
+        assert_eq!(cfg.candidate_count(&req(&[Modality::Text]), 1_000_000), 0);
+    }
+
+    #[test]
+    fn context_window_parses() {
+        let cfg = parse_single_model(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
+        ));
+        assert_eq!(
+            cfg.models[0].context_window,
+            NonZeroU64::new(128_000).unwrap()
+        );
+    }
+
+    #[test]
+    fn context_window_is_required() {
+        // Capacity is a routing axis, so every model must declare it — an
+        // omitted window is a load-time error, not a silent "fits everything".
+        let err = parse(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("context_window"), "got: {err}");
+    }
+
+    #[test]
+    fn context_window_rejects_zero() {
+        let err = parse(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=0\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("context_window") || err.to_string().contains("nonzero"),
+            "got: {err}"
+        );
     }
 }
