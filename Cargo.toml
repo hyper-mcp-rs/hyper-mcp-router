@@ -21,7 +21,7 @@ path = "src/main.rs"
 anyhow     = "1.0"
 async-trait = "0.1"
 axum       = "0.8"
-clap       = { version = "4", features = ["derive"] }
+clap       = { version = "4.6", features = ["derive"] }
 config     = "0.15"
 directories = "6.0"
 # ADC (Application Default Credentials) for the vertex engine family: token
@@ -30,13 +30,13 @@ google-cloud-auth = "1.14"
 keyring    = "4.1"
 ndarray    = "0.17"   # must match the ndarray version `ort` re-exports
 ort        = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
-regex      = "1"
+regex      = "1.13"
 reqwest    = { version = "0.13", features = ["stream", "json"] }
-serde      = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tokenizers = "0.23"
-tokio      = { version = "1", features = ["full"] }
+tokio      = { version = "1.52", features = ["full"] }
 tracing    = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

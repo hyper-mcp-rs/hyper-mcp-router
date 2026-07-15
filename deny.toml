@@ -26,11 +26,13 @@ all-features = true
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 ignore = [
-    # quick-xml < 0.41 has two high-severity vulnerabilities (RUSTSEC-2026-0194,
-    # RUSTSEC-2026-0195) but we cannot upgrade without checking compatibility
-    # with all dependents (rmcp, reqwest, etc.).
-    { id = "RUSTSEC-2026-0194", reason = "Cannot upgrade quick-xml without checking all dependents" },
-    { id = "RUSTSEC-2026-0195", reason = "Cannot upgrade quick-xml without checking all dependents" },
+    # paste is archived/unmaintained (RUSTSEC-2024-0436). It is a proc-macro —
+    # compile-time only, no runtime attack surface — pulled in by tokenizers
+    # (latest, 0.23.1) both directly and via macro_rules_attribute; no fixed
+    # upstream exists ("no safe upgrade is available"). Unblock: tokenizers /
+    # macro_rules_attribute migrating to the pastey fork — re-check this on
+    # every tokenizers upgrade. https://rustsec.org/advisories/RUSTSEC-2024-0436
+    { id = "RUSTSEC-2024-0436", reason = "tokenizers -> macro_rules_attribute -> paste; compile-time proc-macro only, no fixed upstream yet" },
 ]
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -62,7 +64,6 @@ allow = [
     "MIT",
     "MPL-2.0",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "Zlib",
 ]
 # Windows system crates used by self_update and its dependencies.
@@ -91,18 +92,37 @@ multiple-versions = "warn"
 wildcards = "deny"
 deny = []
 skip = [
-    # Transitive deps: ed25519-dalek ecosystem requires both old (0.10.x) and new (2.x)
+    # RustCrypto 0.10 vs 0.11 generation split: google-cloud-auth's stack
+    # (rand 0.10, chacha20) is on the new generation while tokenizers and
+    # friends still pull the old one.
     "block-buffer",
     "cpufeatures",
     "crypto-common",
     "digest",
-    "getrandom",
+    "hmac",
     "sha2",
-    "thiserror",
-    "thiserror-impl",
+    # rand 0.9 (tokenizers) vs rand 0.10 (google-cloud-gax), and the
+    # rand_core/getrandom/r-efi generations they drag along.
+    "getrandom",
+    "r-efi",
+    "rand",
+    "rand_core",
+    # base64 0.13 is pinned by spm_precompiled (tokenizers); everything else
+    # is on 0.22.
+    "base64",
+    # core-foundation 0.9 is pinned by system-configuration (hyper-util);
+    # rustls-platform-verifier/security-framework are on 0.10.
+    "core-foundation",
+    # darling 0.20 (derive_builder_core) vs 0.23 (serde_with_macros).
+    "darling",
+    "darling_core",
+    "darling_macro",
+    # indexmap/ort/ahash pin different hashbrown generations.
+    "hashbrown",
 ]
 skip-tree = [
-    # windows-sys: self_update pulls in both old and new versions for Windows support
+    # Transitive Windows-support crates pin both the old (0.52) and new
+    # (0.61) windows-sys generations.
     { name = "windows-sys", version = "0.52" },
 ]
 
