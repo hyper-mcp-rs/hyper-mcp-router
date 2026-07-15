@@ -259,20 +259,45 @@ impl DebertaV3XsmallZeroshot {
             }))
             .map_err(|e| anyhow::anyhow!("tokenizer truncation: {e}"))?;
 
+        // Hypothesis wording is deliberately **content-typed** ("this is a
+        // factual question / a request to prove something"), never
+        // meta-judgmental ("this is a simple/complex task"): a prompt does
+        // not *entail* a judgment about its own difficulty, and with the
+        // earlier judgment-style wording this xsmall NLI model scored every
+        // hypothesis in the 0.001–0.1 noise band and the balanced rung won
+        // argmax on generic affinity — even "2+2" routed balanced. Several
+        // hypotheses may map to the same tier (`combine` argmaxes across all
+        // of them); they still cost one batched forward pass. Calibration is
+        // guarded by the `hypothesis_calibration_fixture` test below — run it
+        // (`cargo test -- --ignored`) whenever this list changes.
         let hypotheses = vec![
             (
                 HypothesisKind::Complexity(ModelTier::Fast),
-                "This is a simple task requiring a short, direct answer with no reasoning.".into(),
+                "This is a simple factual question.".into(),
+            ),
+            (
+                HypothesisKind::Complexity(ModelTier::Fast),
+                "This is a short and simple request.".into(),
+            ),
+            (
+                HypothesisKind::Complexity(ModelTier::Fast),
+                "This asks for a single word, number, or yes-or-no answer.".into(),
             ),
             (
                 HypothesisKind::Complexity(ModelTier::Balanced),
-                "This is a moderately complex task requiring explanation or multi-step reasoning."
-                    .into(),
+                "This is a request to explain, write, or fix something.".into(),
             ),
             (
                 HypothesisKind::Complexity(ModelTier::Frontier),
-                "This is a highly complex task requiring deep expertise, analysis, or long-form synthesis."
-                    .into(),
+                "This is a request to prove or formally verify something.".into(),
+            ),
+            (
+                HypothesisKind::Complexity(ModelTier::Frontier),
+                "This is a request to design a large-scale or distributed system.".into(),
+            ),
+            (
+                HypothesisKind::Complexity(ModelTier::Frontier),
+                "This is a request for philosophical analysis.".into(),
             ),
             (
                 HypothesisKind::ImageGeneration,
@@ -575,7 +600,485 @@ mod tests {
         assert!(combine(&low, true, 0.5).image_generation);
     }
 
-    // ── model-backed directionality guard (opt-in) ──────────────────────────
+    // ── model-backed hypothesis calibration fixture (opt-in) ────────────
+    // Guards the hypothesis wording in `new()`. Under the original
+    // judgment-style hypotheses ("this is a simple/complex task") every one
+    // of these prompts classified Balanced — fast-tier recall was zero. Run
+    // whenever the hypothesis list changes:
+    //   cargo test --lib deberta -- --ignored --nocapture
+    // Loads the embedded ONNX model. Zero-shot NLI argmax is inherently
+    // fuzzy on borderline prompts, so this is a **miss-budget** test, not an
+    // exact fixture: it fails when the overall miss rate or any single
+    // tier's miss rate exceeds its budget. The printed miss table (expected
+    // vs got, with per-hypothesis scores) is the tuning tool.
+    //
+    // Tuning bias, when trading precision against recall between wordings:
+    // prefer the set that keeps **frontier recall** highest — a hard prompt
+    // under-served by a cheaper model is a worse failure than an easy prompt
+    // over-served by a costlier one — and prefer misses that escalate
+    // (Balanced→Frontier) over misses that demote.
+
+    /// The calibration fixture: `(expected tier, prompt)`. Roughly balanced
+    /// across tiers. Fast: short factual/lookup/conversion questions.
+    /// Balanced: everyday explain/write/fix/how-to tasks. Frontier: proofs,
+    /// formal analysis, complex system design, scholarly synthesis.
+    const CALIBRATION_FIXTURE: &[(ModelTier, &str)] = &[
+        // ── Fast ──────────────────────────────────────────────────
+        (ModelTier::Fast, "What is the capital of France?"),
+        (ModelTier::Fast, "What is the capital of Japan?"),
+        (ModelTier::Fast, "2+2"),
+        (ModelTier::Fast, "Name one color."),
+        (ModelTier::Fast, "Name three primary colors."),
+        (ModelTier::Fast, "Spell the word cat."),
+        (ModelTier::Fast, "How do you spell accommodate?"),
+        (ModelTier::Fast, "yes or no: is the sky blue"),
+        (ModelTier::Fast, "Is a tomato a fruit?"),
+        (ModelTier::Fast, "Is the sun a star?"),
+        (ModelTier::Fast, "What time zone is Denver in?"),
+        (ModelTier::Fast, "What time zone is Tokyo in?"),
+        (ModelTier::Fast, "How many ounces are in a pound?"),
+        (ModelTier::Fast, "How many feet are in a mile?"),
+        (ModelTier::Fast, "How many days are in March?"),
+        (ModelTier::Fast, "How many continents are there?"),
+        (ModelTier::Fast, "How many sides does a hexagon have?"),
+        (ModelTier::Fast, "How many minutes are in a day?"),
+        (
+            ModelTier::Fast,
+            "Give me a one line descriptor of who you are",
+        ),
+        (ModelTier::Fast, "Say hello."),
+        (ModelTier::Fast, "Who wrote Romeo and Juliet?"),
+        (ModelTier::Fast, "Who painted the Mona Lisa?"),
+        (ModelTier::Fast, "Who is the author of 1984?"),
+        (ModelTier::Fast, "What year did World War Two end?"),
+        (ModelTier::Fast, "What is the chemical symbol for gold?"),
+        (ModelTier::Fast, "What language is spoken in Brazil?"),
+        (ModelTier::Fast, "What is the square root of 81?"),
+        (ModelTier::Fast, "What does HTTP stand for?"),
+        (ModelTier::Fast, "What does CPU stand for?"),
+        (
+            ModelTier::Fast,
+            "What is the boiling point of water in Fahrenheit?",
+        ),
+        (ModelTier::Fast, "What is the tallest mountain on Earth?"),
+        (ModelTier::Fast, "What is the plural of goose?"),
+        (ModelTier::Fast, "What currency is used in Switzerland?"),
+        (ModelTier::Fast, "Convert 10 kilometers to miles."),
+        (ModelTier::Fast, "When is the next leap year?"),
+        (ModelTier::Fast, "Name one planet with rings."),
+        (ModelTier::Fast, "Name a mammal that can fly."),
+        (ModelTier::Fast, "Give me a synonym for happy."),
+        (ModelTier::Fast, "What color is chlorophyll?"),
+        (
+            ModelTier::Fast,
+            "What ocean is between Africa and Australia?",
+        ),
+        (ModelTier::Fast, "What is the opposite of transparent?"),
+        (ModelTier::Fast, "What is the capital of Australia?"),
+        // ── Balanced ──────────────────────────────────────────────
+        (
+            ModelTier::Balanced,
+            "Can you explain the difference between optimistic and pessimistic \
+             locking in databases, and when should I use each?",
+        ),
+        (
+            ModelTier::Balanced,
+            "Write a Python function that parses a CSV file and handles quoted \
+             fields correctly.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Why does my Docker container exit immediately after starting, and \
+             how do I debug it?",
+        ),
+        (
+            ModelTier::Balanced,
+            "Summarize the plot of Hamlet in three paragraphs.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Explain the difference between TCP and UDP.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Write a bash script that backs up a directory every night.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Why is my React component re-rendering twice in development mode?",
+        ),
+        (
+            ModelTier::Balanced,
+            "How do I set up a virtual environment in Python?",
+        ),
+        (
+            ModelTier::Balanced,
+            "Write a SQL query that finds duplicate email addresses in a users table.",
+        ),
+        (ModelTier::Balanced, "Explain how DNS resolution works."),
+        (
+            ModelTier::Balanced,
+            "My git rebase went wrong and I have conflicts in five files. How do I recover?",
+        ),
+        (
+            ModelTier::Balanced,
+            "Write a regex that validates a US phone number.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Summarize the causes of World War One in a few paragraphs.",
+        ),
+        (
+            ModelTier::Balanced,
+            "How does garbage collection work in Java?",
+        ),
+        (
+            ModelTier::Balanced,
+            "Explain what a closure is in JavaScript with an example.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Write a cover letter for a junior data analyst position.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Fix this error: TypeError: cannot read property of undefined.",
+        ),
+        (
+            ModelTier::Balanced,
+            "How do I dockerize a Node.js application?",
+        ),
+        (
+            ModelTier::Balanced,
+            "Explain the difference between REST and GraphQL.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Write a Python script that renames all files in a folder to lowercase.",
+        ),
+        (
+            ModelTier::Balanced,
+            "What are the pros and cons of microservices?",
+        ),
+        (
+            ModelTier::Balanced,
+            "How do I center a div horizontally and vertically in CSS?",
+        ),
+        (ModelTier::Balanced, "Explain how HTTPS encryption works."),
+        (
+            ModelTier::Balanced,
+            "Draft an email to my team announcing a new deployment process.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Why does my SQL query run slowly on large tables, and how can I speed it up?",
+        ),
+        (
+            ModelTier::Balanced,
+            "Explain the difference between threads and processes.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Write a unit test for a function that calculates shipping costs.",
+        ),
+        (
+            ModelTier::Balanced,
+            "How does the OAuth 2.0 authorization code flow work?",
+        ),
+        (
+            ModelTier::Balanced,
+            "Explain recursion to a beginner with a simple example.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Write a product description for a wireless keyboard.",
+        ),
+        (
+            ModelTier::Balanced,
+            "How do I migrate a MySQL database to PostgreSQL?",
+        ),
+        (
+            ModelTier::Balanced,
+            "What is dependency injection and why is it useful?",
+        ),
+        (
+            ModelTier::Balanced,
+            "Debug why my Flask app returns a 500 error on POST requests.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Write a function to merge two sorted arrays in JavaScript.",
+        ),
+        (
+            ModelTier::Balanced,
+            "How does a hash map handle collisions?",
+        ),
+        (
+            ModelTier::Balanced,
+            "Explain the difference between var, let, and const.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Write a YAML pipeline that runs tests on every pull request.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Why am I getting a segmentation fault in this C program?",
+        ),
+        (
+            ModelTier::Balanced,
+            "How do I implement pagination in a REST API?",
+        ),
+        (
+            ModelTier::Balanced,
+            "Explain event bubbling in the browser.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Write a short blog post about the benefits of code review.",
+        ),
+        (
+            ModelTier::Balanced,
+            "Fix the off-by-one error in my binary search implementation.",
+        ),
+        // ── Frontier ──────────────────────────────────────────────
+        (
+            ModelTier::Frontier,
+            "Derive and rigorously prove the asymptotic time complexity of \
+             red-black tree rebalancing across a sequence of insertions and \
+             deletions, with a formal amortized analysis.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Design a globally distributed event-sourcing platform with \
+             exactly-once cross-region semantics, a formal proof sketch of causal \
+             consistency, and a reconciliation algorithm for split-brain recovery \
+             with complexity analysis.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Write a critical analysis of the epistemological assumptions \
+             underlying Bayesian and frequentist statistics, synthesizing the \
+             major philosophical objections to each.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Prove that the square root of 2 is irrational.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Prove that the set of real numbers is uncountable.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Derive the time complexity of Dijkstra's algorithm with a binary \
+             heap and prove its correctness.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Design a multi-region active-active database architecture with \
+             conflict resolution, and prove its consistency guarantees.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Provide a formal proof that the halting problem is undecidable.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Design a distributed rate limiter that guarantees fairness across \
+             ten thousand nodes, with a formal analysis of its failure modes.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Critically analyze the philosophical implications of Gödel's \
+             incompleteness theorems for mathematical realism.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Design a Byzantine fault tolerant consensus protocol and prove \
+             safety and liveness under partial synchrony.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Prove the correctness of the Raft leader election algorithm under \
+             network partitions.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Write a rigorous analysis of the trade-offs between CRDTs and \
+             operational transformation for collaborative editing, with formal \
+             convergence proofs.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Formally verify that this mutex implementation is deadlock-free \
+             using temporal logic.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Design a complete architecture for a real-time fraud detection \
+             system processing one million transactions per second, with a formal \
+             latency analysis.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Analyze the epistemological differences between Popperian \
+             falsificationism and Kuhnian paradigm shifts.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Derive the backpropagation algorithm from the chain rule and \
+             analyze its numerical stability.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Design a sharding strategy for a petabyte-scale time-series \
+             database and rigorously analyze its rebalancing complexity.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Provide an amortized analysis of splay tree operations and prove \
+             the access lemma.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Critique the theoretical foundations of modern portfolio theory \
+             from a behavioral economics perspective.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Design a formally verified compiler pass and prove semantic \
+             preservation.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Prove the max-flow min-cut theorem and derive its implications for \
+             bipartite matching.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Develop a formal model of eventual consistency for a geo-replicated \
+             key-value store and prove convergence under concurrent writes.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Analyze the theoretical limits of gradient-based optimization in \
+             non-convex loss landscapes, with proofs of convergence rates.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Design a zero-knowledge proof system for anonymous credentials and \
+             prove its soundness and completeness.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Prove that every planar graph is four-colorable, or outline the \
+             structure of the known proof and its computer-assisted portions.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Synthesize the current theoretical debates on the hard problem of \
+             consciousness into a rigorous philosophical position paper.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Design a lock-free concurrent B-tree and prove linearizability of \
+             all operations.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Derive the CAP theorem formally and analyze its boundaries under \
+             partial synchrony assumptions.",
+        ),
+        (
+            ModelTier::Frontier,
+            "Construct a formal semantics for a small functional language and \
+             prove type soundness via progress and preservation.",
+        ),
+    ];
+
+    #[test]
+    #[ignore = "loads the embedded ONNX model"]
+    fn hypothesis_calibration_fixture() {
+        /// Overall miss budget: the fraction of the fixture allowed to route
+        /// to the wrong tier before the test fails.
+        const MAX_MISS_RATE: f64 = 0.15;
+        /// Per-tier miss budget — catches a *systematic* failure of one tier
+        /// (the original bug was fast-tier recall of exactly zero, which an
+        /// overall budget alone could hide behind two healthy tiers).
+        const MAX_TIER_MISS_RATE: f64 = 0.25;
+
+        let clf = DebertaV3XsmallZeroshot::new(DEFAULT_IMAGE_GEN_THRESHOLD, 1, 0).unwrap();
+
+        let mut misses: Vec<String> = Vec::new();
+        let mut totals: std::collections::BTreeMap<ModelTier, (usize, usize)> =
+            std::collections::BTreeMap::new(); // tier -> (count, missed)
+        for &(want, prompt) in CALIBRATION_FIXTURE {
+            let got = clf.classify_sync(prompt, prompt, false).unwrap().complexity;
+            let entry = totals.entry(want).or_insert((0, 0));
+            entry.0 += 1;
+            if got != want {
+                entry.1 += 1;
+                // The per-hypothesis score table is the tuning tool.
+                let scores = clf.inner.score_hypotheses(prompt, prompt).unwrap();
+                let table: Vec<String> = scores
+                    .iter()
+                    .map(|(kind, s)| match kind {
+                        HypothesisKind::Complexity(t) => format!("{t:?}={s:.3}"),
+                        HypothesisKind::ImageGeneration => format!("Image={s:.3}"),
+                    })
+                    .collect();
+                misses.push(format!(
+                    "want {want:?}, got {got:?} [{}] for {prompt:?}",
+                    table.join(" ")
+                ));
+            }
+        }
+
+        let total = CALIBRATION_FIXTURE.len();
+        let miss_rate = misses.len() as f64 / total as f64;
+        println!(
+            "calibration: {}/{} correct (miss rate {:.1}%, budget {:.0}%)",
+            total - misses.len(),
+            total,
+            miss_rate * 100.0,
+            MAX_MISS_RATE * 100.0
+        );
+        let mut tier_failures = Vec::new();
+        for (tier, (count, missed)) in &totals {
+            let rate = *missed as f64 / *count as f64;
+            println!(
+                "  {tier:?}: {}/{} correct (miss rate {:.1}%, budget {:.0}%)",
+                count - missed,
+                count,
+                rate * 100.0,
+                MAX_TIER_MISS_RATE * 100.0
+            );
+            if rate > MAX_TIER_MISS_RATE {
+                tier_failures.push(format!("{tier:?} miss rate {:.1}%", rate * 100.0));
+            }
+        }
+        for m in &misses {
+            println!("  miss: {m}");
+        }
+
+        assert!(
+            miss_rate <= MAX_MISS_RATE,
+            "overall miss rate {:.1}% exceeds the {:.0}% budget:\n  {}",
+            miss_rate * 100.0,
+            MAX_MISS_RATE * 100.0,
+            misses.join("\n  ")
+        );
+        assert!(
+            tier_failures.is_empty(),
+            "per-tier miss budget ({:.0}%) exceeded: {}\n  {}",
+            MAX_TIER_MISS_RATE * 100.0,
+            tier_failures.join(", "),
+            misses.join("\n  ")
+        );
+    }
+
+    // ── model-backed directionality guard (opt-in) ──────────────────────
     // Loads the embedded ONNX model; run with `cargo test -- --ignored`.
     // Guards against label-order regressions (entailment must be index 0).
     #[test]
