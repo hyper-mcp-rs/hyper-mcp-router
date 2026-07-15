@@ -59,6 +59,7 @@ cargo build --release
 
 ```sh
 hyper-mcp-router serve [--config <path>] [--log-stdout]
+hyper-mcp-router validate [--config <path>]
 ```
 
 - `--config <path>` — explicit config file. If given it is used verbatim; a
@@ -67,6 +68,16 @@ hyper-mcp-router serve [--config <path>] [--log-stdout]
   error).
 - `--log-stdout` — write structured JSON logs to stdout instead of the
   well-known rolling file location (use this for Cloud Run / containers).
+
+`validate` loads and validates a config, prints the classifier ladder and
+backend catalogue that `serve` would run, and exits — without starting the
+server, initialising engines, or touching the network. It covers everything
+`serve` checks at boot that can be checked offline: schema and field
+validation, modality coverage, the engine auth-surface choice, required
+Vertex `project`/`location` fields, and distinct capacity-ladder budgets.
+Credentials are **not** exercised — a config can validate and still fail at
+boot on ADC or keyring problems. A validation failure exits non-zero, so it
+works as a CI/pre-deploy check.
 
 That is the whole CLI, deliberately: everything else — including which
 classifier model runs and its model-specific tuning — lives in the config

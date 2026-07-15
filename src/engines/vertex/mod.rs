@@ -187,48 +187,20 @@ impl VertexSetup {
     /// **required** when the engine is selected; auth is ADC unless a static
     /// `access_token` is set). Fails fast with actionable messages.
     fn establish(spec: &'static VertexSpec, cfg: &VertexEmbeddingConfig) -> anyhow::Result<Self> {
-        let project = cfg
-            .project
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "classifier engine `{}` requires a GCP project: set `project` in \
-                     [classifier.{}]",
-                    spec.name,
-                    spec.name,
-                )
-            })?;
+        // `project` and `location` first (pure config checks — the same
+        // helper the offline `validate` subcommand runs), so a config problem
+        // fails before credential discovery.
+        let (project, location) = cfg.project_and_location(spec.name)?;
 
         // Static token if configured, otherwise Application Default
         // Credentials — built before the HTTP client so a credential
-        // discovery problem is the first thing to fail.
+        // discovery problem is the next thing to fail.
         let token = match cfg.access_token.clone() {
             Some(token) => TokenSource::Static(token),
             None => TokenSource::adc(spec.name)?,
         };
 
         let quota_project = parse_quota_project(spec.name, cfg.quota_project.as_deref())?;
-
-        // Deliberately no default: the location determines model
-        // availability (some models are multi-region/global-only), data
-        // residency, and the endpoint host, so the operator must choose it
-        // consciously.
-        let location = cfg
-            .location
-            .as_deref()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "classifier engine `{}` requires a `location` in [classifier.{}] \
-                     (a Vertex region such as \"us-central1\", a multi-region such as \
-                     \"us\", or \"global\")",
-                    spec.name,
-                    spec.name,
-                )
-            })?;
 
         let base = cfg
             .base_url

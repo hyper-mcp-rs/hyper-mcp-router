@@ -35,7 +35,7 @@ const MODEL_MAX_TOKENS: usize = 512;
 /// well under [`MODEL_MAX_TOKENS`] (~4 chars/token) so the packed context plus
 /// a hypothesis stays inside the model even for dense/code text; tokenizer
 /// truncation is the hard backstop.
-const CLASSIFICATION_CHAR_BUDGET: usize = 1000;
+pub(crate) const CLASSIFICATION_CHAR_BUDGET: usize = 1000;
 
 /// Character budget for the current turn (the image premise / lexical
 /// prefilter input). Tight for three model-specific reasons: (1) 400 chars

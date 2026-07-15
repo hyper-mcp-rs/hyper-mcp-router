@@ -102,6 +102,41 @@ pub struct VertexEmbeddingConfig {
     pub image_generation_threshold: Option<f32>,
 }
 
+impl VertexEmbeddingConfig {
+    /// The required-when-selected `project` and `location`, trimmed. Pure —
+    /// shared by engine construction (`engines/vertex`) and the offline
+    /// `validate` subcommand so the error messages stay single-sourced.
+    pub fn project_and_location(&self, engine: &str) -> anyhow::Result<(&str, &str)> {
+        let project = self
+            .project
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "classifier engine `{engine}` requires a GCP project: set `project` in \
+                     [classifier.{engine}]"
+                )
+            })?;
+        // Deliberately no default: the location determines model availability
+        // (some models are multi-region/global-only), data residency, and the
+        // endpoint host, so the operator must choose it consciously.
+        let location = self
+            .location
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "classifier engine `{engine}` requires a `location` in [classifier.{engine}] \
+                     (a Vertex region such as \"us-central1\", a multi-region such as \"us\", \
+                     or \"global\")"
+                )
+            })?;
+        Ok((project, location))
+    }
+}
+
 /// Which Google API surface an engine talks to. The gemini-embedding models
 /// are published on **both**; from the router's perspective these are two
 /// completely different engines (different endpoint layout, wire format, and
@@ -309,6 +344,36 @@ mod tests {
         assert_eq!(te5.quota_project, None);
         assert_eq!(te5.access_token, None);
         assert_eq!(te5.base_url, None);
+    }
+
+    #[test]
+    fn project_and_location_trims_and_requires_both() {
+        let mut v = VertexEmbeddingConfig::default();
+
+        let err = v.project_and_location("text-embedding-005").unwrap_err();
+        assert!(
+            err.to_string().contains("requires a GCP project"),
+            "got: {err}"
+        );
+
+        // Blank-after-trim counts as absent, for both fields.
+        v.project = Some("  ".into());
+        let err = v.project_and_location("text-embedding-005").unwrap_err();
+        assert!(
+            err.to_string().contains("requires a GCP project"),
+            "got: {err}"
+        );
+
+        v.project = Some(" my-proj ".into());
+        let err = v.project_and_location("text-embedding-005").unwrap_err();
+        assert!(
+            err.to_string().contains("requires a `location`"),
+            "got: {err}"
+        );
+
+        v.location = Some(" us-central1 ".into());
+        let (project, location) = v.project_and_location("text-embedding-005").unwrap();
+        assert_eq!((project, location), ("my-proj", "us-central1"));
     }
 
     #[test]

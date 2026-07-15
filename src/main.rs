@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 
-use hyper_mcp_router::cli::{Cli, Command, ServeArgs};
+use hyper_mcp_router::cli::{Cli, Command, ServeArgs, ValidateArgs};
 use hyper_mcp_router::config;
 use hyper_mcp_router::engines;
 use hyper_mcp_router::logging;
@@ -17,7 +17,55 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve(args) => serve(args).await,
+        Command::Validate(args) => validate(args),
     }
+}
+
+/// Resolve, parse, and validate a config file, then print what would run —
+/// without starting the server, initialising engines, or touching the network
+/// (credentials are NOT exercised; a config can validate and still fail at
+/// boot on ADC/keyring problems). Human-facing output on stdout; a validation
+/// failure returns the error (non-zero exit), so this works as a CI check.
+fn validate(args: ValidateArgs) -> anyhow::Result<()> {
+    let config_path = config::resolve_config_path(args.config)?;
+    let cfg = config::load(&config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    // The offline slice of what `build_roster` enforces at boot (auth-surface
+    // choice, required Vertex fields, distinct ladder budgets).
+    engines::validate_config(&cfg.classifier)?;
+
+    println!("config OK: {}", config_path.display());
+
+    // The capacity ladder as `serve` would assemble it: ascending by context
+    // budget, with the `local` marker that makes mixed local/remote rosters
+    // (and their privacy implications) visible.
+    let mut rungs: Vec<_> = cfg.classifier.models.clone();
+    rungs.sort_by_key(|m| engines::context_char_budget(*m));
+    println!("classifier ladder ({} rung(s)):", rungs.len());
+    for model in &rungs {
+        println!(
+            "  {} (context_char_budget {}, {})",
+            model.as_str(),
+            engines::context_char_budget(*model),
+            if engines::is_local(*model) {
+                "local"
+            } else {
+                "remote"
+            },
+        );
+    }
+
+    println!("backends ({}):", cfg.models.len());
+    for m in &cfg.models {
+        println!(
+            "  {} [{:?}] {} {:?}",
+            m.name,
+            m.tier,
+            m.base_url,
+            m.modality_set().to_kebab_vec(),
+        );
+    }
+    Ok(())
 }
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {

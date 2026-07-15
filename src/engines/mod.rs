@@ -43,13 +43,21 @@ pub mod vertex;
 use std::sync::Arc;
 
 use crate::classifier::{ClassifierEngine, ClassifierModel, EngineRoster};
-use crate::config::{ClassifierConfig, GoogleApi};
+use crate::config::{ClassifierConfig, GoogleApi, GoogleEmbeddingConfig};
 
 /// Construct every engine named by `cfg.models` and assemble the capacity
 /// ladder. Engine construction failures and roster-shape violations
 /// (duplicate context budgets, non-monotone current-turn budgets — see
 /// [`EngineRoster::new`]) all fail here, at boot.
+///
+/// The pure, offline checks ([`validate_config`]) run **first**, so a config
+/// mistake in any rung fails before *any* engine does expensive startup work
+/// (inference-session allocation, credential discovery, remote anchor
+/// embedding). This also makes the `validate` subcommand's guarantee
+/// structural: a config it rejects is rejected here identically.
 pub async fn build_roster(cfg: &ClassifierConfig) -> anyhow::Result<EngineRoster> {
+    validate_config(cfg)?;
+
     let mut engines = Vec::with_capacity(cfg.models.len());
     for model in &cfg.models {
         let engine = build(*model, cfg).await.map_err(|e| {
@@ -100,5 +108,234 @@ pub async fn build(
         ClassifierModel::TextEmbedding005 => {
             Ok(Arc::new(vertex::text_embedding_005::build(cfg).await?))
         }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Offline validation (the `validate` subcommand)
+// ───────────────────────────────────────────────────────────────────────
+
+/// The context-window character budget an engine would report via
+/// [`ClassifierEngine::context_char_budget`], available **without**
+/// constructing it (pure; no I/O). For the dual-surface gemini models the
+/// budget is identical on both surfaces (same model, same input limit).
+pub fn context_char_budget(model: ClassifierModel) -> usize {
+    match model {
+        ClassifierModel::DebertaV3XsmallZeroshot => {
+            deberta_v3_xsmall_zeroshot::CLASSIFICATION_CHAR_BUDGET
+        }
+        ClassifierModel::GeminiEmbedding001 => gemini::embedding_001::SPEC.context_char_budget,
+        ClassifierModel::GeminiEmbedding2 => gemini::embedding_2::SPEC.context_char_budget,
+        ClassifierModel::TextEmbedding005 => vertex::text_embedding_005::SPEC.context_char_budget,
+    }
+}
+
+/// Whether an engine runs fully locally (no prompt text leaves the process),
+/// without constructing it. Mirrors [`ClassifierEngine::is_local`].
+pub fn is_local(model: ClassifierModel) -> bool {
+    matches!(model, ClassifierModel::DebertaV3XsmallZeroshot)
+}
+
+/// Offline validation of the classifier engine configuration: everything
+/// [`build_roster`] would reject that can be checked **without** constructing
+/// engines — no network, no credential (ADC) resolution, no inference-session
+/// allocation. Checked here:
+///
+/// - each dual-surface gemini engine names exactly one API surface
+///   ([`GoogleEmbeddingConfig::surface`]);
+/// - every Vertex-surface engine has the required `project` and `location`;
+/// - the capacity ladder's context budgets are pairwise distinct (the shape
+///   rule of [`EngineRoster::new`] that real configs can actually violate —
+///   e.g. `gemini-embedding-001` and `text-embedding-005` share a budget).
+///
+/// Used by the `validate` CLI subcommand, and run first by [`build_roster`]
+/// at boot — so the two can never drift apart on what they accept.
+/// [`build_roster`] remains the deeper check (it additionally exercises
+/// credentials and remote startup work).
+pub fn validate_config(cfg: &ClassifierConfig) -> anyhow::Result<()> {
+    for model in &cfg.models {
+        match model {
+            // Embedded local engine: nothing remote to misconfigure.
+            ClassifierModel::DebertaV3XsmallZeroshot => {}
+            ClassifierModel::GeminiEmbedding001 => {
+                validate_google_surface(&cfg.gemini_embedding_001, "gemini-embedding-001")?
+            }
+            ClassifierModel::GeminiEmbedding2 => {
+                validate_google_surface(&cfg.gemini_embedding_2, "gemini-embedding-2")?
+            }
+            ClassifierModel::TextEmbedding005 => cfg
+                .text_embedding_005
+                .project_and_location("text-embedding-005")
+                .map(|_| ())?,
+        }
+    }
+
+    for (i, a) in cfg.models.iter().enumerate() {
+        for b in &cfg.models[i + 1..] {
+            if context_char_budget(*a) == context_char_budget(*b) {
+                anyhow::bail!(
+                    "classifier engines `{}` and `{}` share the same context_char_budget ({}); \
+                     the capacity ladder requires distinct budgets",
+                    a.as_str(),
+                    b.as_str(),
+                    context_char_budget(*a),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The dual-surface slice of [`validate_config`]: the auth fields must name
+/// exactly one surface, and the Vertex surface additionally needs `project`
+/// and `location`.
+fn validate_google_surface(cfg: &GoogleEmbeddingConfig, engine: &str) -> anyhow::Result<()> {
+    match cfg.surface(engine)? {
+        GoogleApi::GenerativeLanguage => Ok(()),
+        GoogleApi::Vertex => cfg.to_vertex().project_and_location(engine).map(|_| ()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(models: Vec<ClassifierModel>) -> ClassifierConfig {
+        ClassifierConfig {
+            models,
+            ..ClassifierConfig::default()
+        }
+    }
+
+    #[test]
+    fn static_budgets_match_the_engine_specs() {
+        // Drift guard: the pure mapping must report exactly what a built
+        // engine would. The deberta value is the shared crate const; the
+        // dual-surface gemini models must agree across both surfaces.
+        assert_eq!(
+            context_char_budget(ClassifierModel::DebertaV3XsmallZeroshot),
+            deberta_v3_xsmall_zeroshot::CLASSIFICATION_CHAR_BUDGET
+        );
+        assert_eq!(
+            context_char_budget(ClassifierModel::GeminiEmbedding001),
+            vertex::gemini_embedding_001::SPEC.context_char_budget
+        );
+        assert_eq!(
+            context_char_budget(ClassifierModel::GeminiEmbedding2),
+            vertex::gemini_embedding_2::SPEC.context_char_budget
+        );
+        assert_eq!(
+            context_char_budget(ClassifierModel::TextEmbedding005),
+            vertex::text_embedding_005::SPEC.context_char_budget
+        );
+    }
+
+    #[test]
+    fn only_the_embedded_engine_is_local() {
+        assert!(is_local(ClassifierModel::DebertaV3XsmallZeroshot));
+        assert!(!is_local(ClassifierModel::GeminiEmbedding001));
+        assert!(!is_local(ClassifierModel::GeminiEmbedding2));
+        assert!(!is_local(ClassifierModel::TextEmbedding005));
+    }
+
+    #[test]
+    fn default_config_validates() {
+        validate_config(&ClassifierConfig::default()).unwrap();
+    }
+
+    #[test]
+    fn full_ladder_with_vertex_auth_validates() {
+        let mut cfg = cfg_with(vec![
+            ClassifierModel::DebertaV3XsmallZeroshot,
+            ClassifierModel::TextEmbedding005,
+            ClassifierModel::GeminiEmbedding2,
+        ]);
+        cfg.text_embedding_005.project = Some("proj".into());
+        cfg.text_embedding_005.location = Some("us-central1".into());
+        cfg.gemini_embedding_2.project = Some("proj".into());
+        cfg.gemini_embedding_2.location = Some("global".into());
+        validate_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn text_embedding_005_requires_project_and_location() {
+        let mut cfg = cfg_with(vec![ClassifierModel::TextEmbedding005]);
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("requires a GCP project"), "got: {err}");
+
+        cfg.text_embedding_005.project = Some("proj".into());
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("requires a `location`"), "got: {err}");
+    }
+
+    #[test]
+    fn gemini_engine_rejects_ambiguous_or_missing_surface() {
+        // Neither auth field: the surface is undecidable.
+        let cfg = cfg_with(vec![ClassifierModel::GeminiEmbedding2]);
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("requires either `api_key`"), "got: {err}");
+
+        // Both auth fields: ambiguous.
+        let mut cfg = cfg_with(vec![ClassifierModel::GeminiEmbedding2]);
+        cfg.gemini_embedding_2.api_key = Some("k".into());
+        cfg.gemini_embedding_2.project = Some("proj".into());
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("sets both `api_key"), "got: {err}");
+    }
+
+    #[test]
+    fn gemini_vertex_surface_requires_location() {
+        let mut cfg = cfg_with(vec![ClassifierModel::GeminiEmbedding2]);
+        cfg.gemini_embedding_2.project = Some("proj".into());
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("requires a `location`"), "got: {err}");
+    }
+
+    #[test]
+    fn gemini_generative_language_surface_needs_no_location() {
+        let mut cfg = cfg_with(vec![ClassifierModel::GeminiEmbedding2]);
+        cfg.gemini_embedding_2.api_key = Some("k".into());
+        validate_config(&cfg).unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_roster_runs_the_offline_checks_before_building_any_engine() {
+        // A ladder whose only problem is the duplicate budget between
+        // gemini-embedding-001 and text-embedding-005. Without the up-front
+        // validate_config call, build_roster would first BUILD the gemini
+        // engine — a live network call (anchor embedding) with this fake key
+        // — before EngineRoster::new could object. The pre-check makes this
+        // fail instantly and offline; this test hanging or erroring on I/O
+        // means the fail-fast ordering regressed.
+        let mut cfg = cfg_with(vec![
+            ClassifierModel::GeminiEmbedding001,
+            ClassifierModel::TextEmbedding005,
+        ]);
+        cfg.gemini_embedding_001.api_key = Some("fake-key-never-sent".into());
+        cfg.text_embedding_005.project = Some("proj".into());
+        cfg.text_embedding_005.location = Some("us-central1".into());
+        let err = build_roster(&cfg).await.unwrap_err().to_string();
+        assert!(
+            err.contains("share the same context_char_budget"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_context_budgets_are_rejected() {
+        // gemini-embedding-001 and text-embedding-005 genuinely share a
+        // budget — the one ladder-shape violation a real config can hit.
+        let mut cfg = cfg_with(vec![
+            ClassifierModel::GeminiEmbedding001,
+            ClassifierModel::TextEmbedding005,
+        ]);
+        cfg.gemini_embedding_001.api_key = Some("k".into());
+        cfg.text_embedding_005.project = Some("proj".into());
+        cfg.text_embedding_005.location = Some("us-central1".into());
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("share the same context_char_budget"),
+            "got: {err}"
+        );
     }
 }
