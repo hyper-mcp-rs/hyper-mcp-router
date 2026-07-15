@@ -61,6 +61,54 @@ partial download or upstream change can never be silently embedded.
 cargo build --release
 ```
 
+## Docker
+
+The [`Dockerfile`](./Dockerfile) builds the smallest image this router can
+ship in: a **`scratch`** container holding a fully statically linked (musl)
+executable and a CA bundle — nothing else, not even a shell (~200 MB on
+disk, dominated by the embedded model). pyke publishes no musl ONNX Runtime
+binaries, so stage 1 compiles ONNX Runtime from source as static musl
+libraries — the first build takes ~30–60 min on native hardware; later
+builds reuse the cached layer. A build-time `readelf` gate fails the build
+if the executable picks up any dynamic dependency.
+
+```sh
+docker build -t hyper-mcp-router .                                         # native arch
+docker buildx build --platform linux/amd64,linux/arm64 -t hyper-mcp-router . # both
+```
+
+Both `linux/amd64` and `linux/arm64` are supported; prefer **native
+builders per architecture** — the ONNX Runtime compile under QEMU emulation
+takes hours.
+
+Mount the config at the well-known `/etc` path (no flags needed — config
+discovery probes it) with `server.host = "0.0.0.0"` so the port mapping can
+reach it; logs go to stdout:
+
+```sh
+docker run -p 8080:8080 \
+  -v ./config.toml:/etc/hyper-mcp-router/config.toml:ro \
+  hyper-mcp-router
+```
+
+For `{ source = "google-adc" }` backends and the Vertex AI classifier
+engines, provide Application Default Credentials — there is no gcloud in
+the image (on GCE/Cloud Run/GKE the metadata server provides ADC and no
+mount is needed):
+
+```sh
+docker run -p 8080:8080 \
+  -v ./config.toml:/etc/hyper-mcp-router/config.toml:ro \
+  -v ~/.config/gcloud/application_default_credentials.json:/gcloud/adc.json:ro \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/gcloud/adc.json \
+  hyper-mcp-router
+```
+
+Container caveats: the image runs as a non-root numeric user with no
+writable filesystem — always use `--log-stdout` (the default `CMD` does) —
+and `api_key = { source = "keyring" }` cannot work without an OS secret
+store; use `${ENV_VAR}`-expanded keys instead.
+
 ## Running
 
 ```sh

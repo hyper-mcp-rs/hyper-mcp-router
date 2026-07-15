@@ -1,0 +1,18 @@
+# Keep the build context minimal: the Dockerfile copies only what it needs
+# (Cargo manifests, build.rs, .cargo/, src/), but a small context uploads
+# faster and avoids cache-busting on unrelated changes.
+target/
+.git/
+.cargo/
+.sentrux/
+.zed/
+tests/
+*.md
+LICENSE
+config.example.*
+test-config.toml
+measure_session_memory.sh
+lefthook.yml
+deny.toml
+Dockerfile
+.dockerignore

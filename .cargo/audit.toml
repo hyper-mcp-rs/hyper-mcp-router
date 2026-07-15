@@ -1,5 +1,7 @@
+# cargo-audit configuration (the pre-push `audit` hook).
+#
+# Keep advisory ignores in `deny.toml` under [advisories].ignore so `cargo
+# audit` and `cargo deny` stay in sync; add entries here only if the two
+# tools must deliberately diverge (with a comment saying why).
 [advisories]
-ignore = [
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
-]
+ignore = []
