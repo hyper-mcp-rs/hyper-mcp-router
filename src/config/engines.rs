@@ -94,6 +94,12 @@ pub struct VertexEmbeddingConfig {
     /// Per-call total timeout, seconds. Omit for the model's default.
     #[serde(default)]
     pub request_timeout_secs: Option<u64>,
+    /// Per-engine score floor for the image-generation axis (embedding
+    /// similarity scale). Omit to inherit the top-level `[classifier]
+    /// image_generation_threshold`. With several engines configured, prefer
+    /// this per-engine key — threshold scales are engine-specific.
+    #[serde(default)]
+    pub image_generation_threshold: Option<f32>,
 }
 
 /// Which Google API surface an engine talks to. The gemini-embedding models
@@ -149,6 +155,13 @@ pub struct GoogleEmbeddingConfig {
     /// Per-call total timeout, seconds.
     #[serde(default)]
     pub request_timeout_secs: Option<u64>,
+    /// Per-engine score floor for the image-generation axis (embedding
+    /// similarity scale for this engine family). Omit to inherit the
+    /// top-level `[classifier] image_generation_threshold`. With several
+    /// engines configured, prefer this per-engine key — threshold scales are
+    /// engine-specific, so one global number cannot fit all engines.
+    #[serde(default)]
+    pub image_generation_threshold: Option<f32>,
 }
 
 impl GoogleEmbeddingConfig {
@@ -198,6 +211,7 @@ impl GoogleEmbeddingConfig {
             base_url: self.base_url.clone(),
             max_concurrency: self.max_concurrency,
             request_timeout_secs: self.request_timeout_secs,
+            image_generation_threshold: self.image_generation_threshold,
         }
     }
 }
@@ -217,6 +231,12 @@ pub struct DebertaV3XsmallZeroshotConfig {
     /// Omit for auto-sizing.
     #[serde(default)]
     pub intra_op_threads: Option<usize>,
+    /// Per-engine score floor for the image-generation axis (P(entailment)
+    /// scale for this engine). Omit to inherit the top-level `[classifier]
+    /// image_generation_threshold`. With several engines configured, prefer
+    /// this per-engine key — threshold scales are engine-specific.
+    #[serde(default)]
+    pub image_generation_threshold: Option<f32>,
 }
 
 #[cfg(test)]
@@ -237,7 +257,7 @@ mod tests {
              [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
         )
         .unwrap();
-        assert_eq!(cfg.classifier.model, ClassifierModel::GeminiEmbedding001);
+        assert_eq!(cfg.classifier.models, [ClassifierModel::GeminiEmbedding001]);
         let g1 = &cfg.classifier.gemini_embedding_001;
         // Env-expanded, exactly like a routed model's key.
         assert_eq!(g1.api_key.as_deref(), Some("g-key"));
@@ -263,7 +283,7 @@ mod tests {
              [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
         )
         .unwrap();
-        assert_eq!(cfg.classifier.model, ClassifierModel::TextEmbedding005);
+        assert_eq!(cfg.classifier.models, [ClassifierModel::TextEmbedding005]);
         let te5 = &cfg.classifier.text_embedding_005;
         assert_eq!(te5.project.as_deref(), Some("my-proj"));
         assert_eq!(te5.location.as_deref(), Some("us-east1"));

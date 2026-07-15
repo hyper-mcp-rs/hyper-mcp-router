@@ -9,8 +9,9 @@
 //! the crate's unit tests. `main.rs` is a thin binary wrapper over it.
 //!
 //! Classification is pluggable: `classifier` defines the `ClassifierEngine`
-//! trait and the `ClassifierModel` selector; `engines/` holds one file per
-//! model (exactly one is active per process).
+//! trait, the `ClassifierModel` selector, and the `EngineRoster` capacity
+//! ladder; `engines/` holds one file per model (one or more are active per
+//! process — several form a ladder selected per request by prompt size).
 
 pub mod classifier;
 pub mod cli;

@@ -1,8 +1,11 @@
 //! Classifier engines — **one file per model**, grouped by provider family.
 //!
-//! Exactly one engine is active per process, selected by the
-//! `[classifier] model` config setting (config-only: each model brings its
-//! own configuration, so the config file is the single source of truth).
+//! One or more engines are active per process, selected by the
+//! `[classifier] model` config setting (a single id or a list; config-only:
+//! each model brings its own configuration, so the config file is the single
+//! source of truth). Several engines form a **capacity ladder**
+//! ([`crate::classifier::EngineRoster`]): sorted by context budget, each
+//! request is classified by the smallest engine whose budget covers it.
 //! Everything model-specific lives inside the engine's own file: how it is
 //! invoked, how many concurrent "sessions" it supports and how they are
 //! sized, and how large its context window is. Families with several models
@@ -27,7 +30,10 @@
 //!    kebab-case name is the config value).
 //! 4. Add the `match` arm in [`build`] below.
 //!
-//! Nothing else in the router changes.
+//! Nothing else in the router changes. (Roster note: an engine's
+//! `context_char_budget` must differ from every other engine's, and its
+//! `current_turn_char_budget` must not be smaller than that of any
+//! lower-capacity engine — `EngineRoster::new` enforces both at startup.)
 
 pub mod deberta_v3_xsmall_zeroshot;
 pub mod embedding;
@@ -36,12 +42,30 @@ pub mod vertex;
 
 use std::sync::Arc;
 
-use crate::classifier::{ClassifierEngine, ClassifierModel};
+use crate::classifier::{ClassifierEngine, ClassifierModel, EngineRoster};
 use crate::config::{ClassifierConfig, GoogleApi};
 
-/// Construct the engine selected by `cfg.model`. This is the **only** place
-/// that maps a [`ClassifierModel`] to a concrete engine type. Async because
-/// remote engines do startup work over the network (anchor embedding);
+/// Construct every engine named by `cfg.models` and assemble the capacity
+/// ladder. Engine construction failures and roster-shape violations
+/// (duplicate context budgets, non-monotone current-turn budgets — see
+/// [`EngineRoster::new`]) all fail here, at boot.
+pub async fn build_roster(cfg: &ClassifierConfig) -> anyhow::Result<EngineRoster> {
+    let mut engines = Vec::with_capacity(cfg.models.len());
+    for model in &cfg.models {
+        let engine = build(*model, cfg).await.map_err(|e| {
+            e.context(format!(
+                "initialising classifier engine `{}`",
+                model.as_str()
+            ))
+        })?;
+        engines.push(engine);
+    }
+    EngineRoster::new(engines)
+}
+
+/// Construct one engine. This is the **only** place that maps a
+/// [`ClassifierModel`] to a concrete engine type. Async because remote
+/// engines do startup work over the network (anchor embedding);
 /// misconfiguration — including missing or ambiguous credentials — fails
 /// here, at boot.
 ///
@@ -49,8 +73,11 @@ use crate::config::{ClassifierConfig, GoogleApi};
 /// the auth fields of the engine's config table pick the concrete engine
 /// (`api_key` ⇒ `gemini/`, `project` ⇒ `vertex/` — see
 /// [`crate::config::GoogleEmbeddingConfig::surface`]).
-pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<Arc<dyn ClassifierEngine>> {
-    match cfg.model {
+pub async fn build(
+    model: ClassifierModel,
+    cfg: &ClassifierConfig,
+) -> anyhow::Result<Arc<dyn ClassifierEngine>> {
+    match model {
         ClassifierModel::DebertaV3XsmallZeroshot => Ok(Arc::new(
             deberta_v3_xsmall_zeroshot::DebertaV3XsmallZeroshot::from_config(cfg)?,
         )),

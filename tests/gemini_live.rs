@@ -15,7 +15,7 @@ use hyper_mcp_router::config::{ClassifierConfig, GoogleEmbeddingConfig};
 /// Build the engine for `cfg`, classify the standard premises, and apply the
 /// shared sanity assertions (cosine scoring is not an exact oracle).
 async fn classify_and_assert(cfg: ClassifierConfig, engine_name: &str) {
-    let engine = hyper_mcp_router::engines::build(&cfg)
+    let engine = hyper_mcp_router::engines::build(cfg.models[0], &cfg)
         .await
         .unwrap_or_else(|e| panic!("build {engine_name} on the Generative Language API: {e:#}"));
     assert_eq!(engine.name(), engine_name);
@@ -70,7 +70,7 @@ fn api_key() -> String {
 #[ignore = "hits the live Generative Language API; needs GEMINI_API_KEY"]
 async fn gemini_embedding_001_on_generative_language_classifies_live() {
     let cfg = ClassifierConfig {
-        model: ClassifierModel::GeminiEmbedding001,
+        models: vec![ClassifierModel::GeminiEmbedding001],
         gemini_embedding_001: GoogleEmbeddingConfig {
             api_key: Some(api_key()),
             ..Default::default()
@@ -85,7 +85,7 @@ async fn gemini_embedding_001_on_generative_language_classifies_live() {
 #[ignore = "hits the live Generative Language API; needs GEMINI_API_KEY"]
 async fn gemini_embedding_2_on_generative_language_classifies_live() {
     let cfg = ClassifierConfig {
-        model: ClassifierModel::GeminiEmbedding2,
+        models: vec![ClassifierModel::GeminiEmbedding2],
         gemini_embedding_2: GoogleEmbeddingConfig {
             api_key: Some(api_key()),
             ..Default::default()

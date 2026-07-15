@@ -183,7 +183,11 @@ impl DebertaV3XsmallZeroshot {
         {
             tracing::warn!("{warning}");
         }
-        let engine = Self::new(cfg.image_generation_threshold, pool_size, intra_op_threads)?;
+        let threshold = cfg
+            .deberta_v3_xsmall_zeroshot
+            .image_generation_threshold
+            .unwrap_or(cfg.image_generation_threshold);
+        let engine = Self::new(threshold, pool_size, intra_op_threads)?;
         tracing::info!(
             detected_cores,
             memory_budget_mb = memory_budget.map(|b| b / (1024 * 1024)),
@@ -306,6 +310,10 @@ impl DebertaV3XsmallZeroshot {
 impl ClassifierEngine for DebertaV3XsmallZeroshot {
     fn name(&self) -> &'static str {
         "deberta-v3-xsmall-zeroshot"
+    }
+
+    fn is_local(&self) -> bool {
+        true // embedded ONNX inference; no prompt text leaves the process
     }
 
     fn context_char_budget(&self) -> usize {

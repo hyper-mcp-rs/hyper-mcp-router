@@ -170,8 +170,11 @@ impl Harness {
         let cfg = config::parse(&config_of(mock_addr)).expect("parse config");
         cfg.validate().expect("validate config");
 
-        let state = AppState::new(classifier, Arc::new(cfg), DEFAULT_TRIVIAL_MAX_WORDS)
-            .expect("build app state");
+        // Single-engine roster: multi-engine ladder tests live in
+        // roster_routing.rs.
+        let state =
+            AppState::with_single_engine(classifier, Arc::new(cfg), DEFAULT_TRIVIAL_MAX_WORDS)
+                .expect("build app state");
         let app = build_router(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

@@ -190,6 +190,10 @@ impl ClassifierEngine for GeminiEmbedding {
         self.spec.name
     }
 
+    fn is_local(&self) -> bool {
+        false // prompt text is sent to the Generative Language API
+    }
+
     fn context_char_budget(&self) -> usize {
         self.spec.context_char_budget
     }

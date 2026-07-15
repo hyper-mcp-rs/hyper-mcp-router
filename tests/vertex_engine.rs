@@ -271,12 +271,12 @@ impl Harness {
         let cfg = config::parse(&vertex_config_toml(embed_addr, chat_addr)).expect("parse config");
         cfg.validate().expect("validate config");
 
-        let engine = engines::build(&cfg.classifier)
+        let engine = engines::build(cfg.classifier.models[0], &cfg.classifier)
             .await
             .expect("build vertex engine against mock");
         let trivial_max_words = cfg.classifier.trivial_max_words;
-        let state =
-            AppState::new(engine, Arc::new(cfg), trivial_max_words).expect("build app state");
+        let state = AppState::with_single_engine(engine, Arc::new(cfg), trivial_max_words)
+            .expect("build app state");
         let app = build_router(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -364,7 +364,9 @@ async fn quota_project_header_omitted_when_not_configured() {
     let toml = vertex_config_toml(embed_addr, chat_addr)
         .replace("quota_project = \"test-quota-project\"\n", "");
     let cfg = config::parse(&toml).expect("parse config");
-    let _engine = engines::build(&cfg.classifier).await.expect("build engine");
+    let _engine = engines::build(cfg.classifier.models[0], &cfg.classifier)
+        .await
+        .expect("build engine");
     let calls = embed.calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 1, "anchor embedding call");
     assert_eq!(calls[0].quota_project, None);
@@ -376,7 +378,9 @@ async fn engine_name_and_budgets() {
     let (embed_addr, _embed) = spawn_mock_vertex().await;
     let (chat_addr, _chat) = spawn_mock_chat().await;
     let cfg = config::parse(&vertex_config_toml(embed_addr, chat_addr)).expect("parse config");
-    let engine = engines::build(&cfg.classifier).await.expect("build engine");
+    let engine = engines::build(cfg.classifier.models[0], &cfg.classifier)
+        .await
+        .expect("build engine");
     assert_eq!(engine.name(), "text-embedding-005");
     assert_eq!(engine.context_char_budget(), 6_000);
     assert_eq!(engine.current_turn_char_budget(), 2_000);
@@ -494,7 +498,9 @@ async fn build_gemini_twin(
     let (chat_addr, _chat) = spawn_mock_chat().await;
     let toml = gemini_twin_config_toml(model, location, embed_addr, chat_addr);
     let cfg = config::parse(&toml).expect("parse config");
-    let engine = engines::build(&cfg.classifier).await.expect("build engine");
+    let engine = engines::build(cfg.classifier.models[0], &cfg.classifier)
+        .await
+        .expect("build engine");
     let calls = embed.calls.lock().unwrap().clone();
     (engine, calls)
 }
@@ -573,7 +579,7 @@ async fn missing_location_fails_engine_build() {
     let toml =
         vertex_config_toml(embed_addr, chat_addr).replace("location = \"us-central1\"\n", "");
     let cfg = config::parse(&toml).expect("config parses without the location");
-    let msg = match engines::build(&cfg.classifier).await {
+    let msg = match engines::build(cfg.classifier.models[0], &cfg.classifier).await {
         Ok(_) => panic!("engine build must fail without a location"),
         Err(e) => e.to_string(),
     };
@@ -594,7 +600,7 @@ async fn missing_project_fails_engine_build() {
     let toml =
         vertex_config_toml(embed_addr, chat_addr).replace("project = \"test-project\"\n", "");
     let cfg = config::parse(&toml).expect("config parses without the project");
-    let msg = match engines::build(&cfg.classifier).await {
+    let msg = match engines::build(cfg.classifier.models[0], &cfg.classifier).await {
         Ok(_) => panic!("engine build must fail without a project"),
         Err(e) => e.to_string(),
     };

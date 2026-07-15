@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use anyhow::Context;
 
-use crate::classifier::{Classification, ClassifierEngine, ModelTier};
+use crate::classifier::{Classification, ClassifierEngine, EngineRoster, ModelTier};
 use crate::config::{count_candidates, select_candidate, ModelApiKey, ModelConfig, RouterConfig};
 use crate::gcp_auth::{self, AccessTokenCredentials};
 use crate::modality::{detect_required_modalities, Modality, ModalitySet};
@@ -30,13 +30,14 @@ use crate::prompt::{
     looks_like_image_generation, truncate_prompt,
 };
 
-/// Shared, cloneable server state. The classifier is a trait object — the
-/// proxy is engine-agnostic; each engine synchronises its own "sessions"
-/// internally (see `crate::engines`). `trivial_max_words` is routing policy
-/// (window filler pruning), deliberately *not* an engine concern.
+/// Shared, cloneable server state. The classifiers are trait objects on a
+/// capacity ladder ([`EngineRoster`]) — the proxy is engine-agnostic; each
+/// engine synchronises its own "sessions" internally (see `crate::engines`).
+/// `trivial_max_words` is routing policy (window filler pruning),
+/// deliberately *not* an engine concern.
 #[derive(Clone)]
 pub struct AppState {
-    pub classifier: Arc<dyn ClassifierEngine>,
+    pub classifiers: EngineRoster,
     pub config: Arc<RouterConfig>,
     pub http: reqwest::Client,
     pub trivial_max_words: usize,
@@ -161,7 +162,7 @@ impl AppState {
     /// retries** are configured — a retry could trigger duplicate, billable
     /// generations.
     pub fn new(
-        classifier: Arc<dyn ClassifierEngine>,
+        classifiers: EngineRoster,
         config: Arc<RouterConfig>,
         trivial_max_words: usize,
     ) -> anyhow::Result<Self> {
@@ -177,12 +178,26 @@ impl AppState {
         let models: Arc<[RoutedModel]> = RoutedModel::resolve_all(&config)?.into();
 
         Ok(AppState {
-            classifier,
+            classifiers,
             config,
             http,
             trivial_max_words,
             models,
         })
+    }
+
+    /// Convenience for a single-engine deployment (and tests): wrap one
+    /// engine in a trivial roster.
+    pub fn with_single_engine(
+        classifier: Arc<dyn ClassifierEngine>,
+        config: Arc<RouterConfig>,
+        trivial_max_words: usize,
+    ) -> anyhow::Result<Self> {
+        Self::new(
+            EngineRoster::new(vec![classifier])?,
+            config,
+            trivial_max_words,
+        )
     }
 }
 
@@ -286,6 +301,7 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
         modalities = ?route.required.to_kebab_vec(),
         image_output_source = route.image_source,
         complexity = ?route.classified,
+        classifier_engine = route.classifier_engine,
         model = %backend.config.name,
         streaming,
         prompt_chars = route.prompt_chars,
@@ -353,6 +369,10 @@ struct RouteResolution {
     classified: Option<ModelTier>,
     image_source: Option<&'static str>,
     prompt_chars: usize,
+    /// The capacity-ladder engine selected for this request (by window
+    /// length). Recorded even when classification is skipped — `classified:
+    /// None` already says the engine did not run.
+    classifier_engine: &'static str,
 }
 
 /// Resolve a request's route along both axes.
@@ -370,10 +390,22 @@ struct RouteResolution {
 /// None` records the skip, logged honestly rather than as a fabricated tier.
 async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
     let mut required = detect_required_modalities(body);
+    // Build the classification window ONCE, at the top of the capacity
+    // ladder; its length then selects the smallest engine whose budget covers
+    // it (see [`EngineRoster::select`]). Only a window that exceeds even the
+    // top budget is truncated — and a single-engine roster reproduces the
+    // previous one-engine behaviour exactly.
+    let window = build_classification_window(
+        body,
+        state.trivial_max_words,
+        state.classifiers.max_context_char_budget(),
+    );
+    let window_chars = window.as_deref().map_or(0, |w| w.chars().count());
+    let engine = state.classifiers.select(window_chars);
     // How much of the current turn the classifier (and the lexical prefilter)
-    // sees is model-specific — the engine declares its budget.
+    // sees is model-specific — the *selected* engine declares its budget.
     let current_turn = extract_prompt(body)
-        .map(|p| truncate_prompt(&p, state.classifier.current_turn_char_budget()))
+        .map(|p| truncate_prompt(&p, engine.current_turn_char_budget()))
         .unwrap_or_default();
     let lexical_image = looks_like_image_generation(&current_turn);
     let mut image_source: Option<&'static str> = if required.contains(Modality::ImageOutput) {
@@ -397,7 +429,8 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
             None
         } else {
             let classification =
-                classify_or_default(state, body, &current_turn, lexical_image).await;
+                classify_or_default(engine.as_ref(), body, window, &current_turn, lexical_image)
+                    .await;
             if classification.image_generation
                 && !required.contains(Modality::ImageOutput)
                 && !image_intent_dropped
@@ -426,6 +459,7 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
         classified,
         image_source,
         prompt_chars: current_turn.chars().count(),
+        classifier_engine: engine.name(),
     }
 }
 
@@ -454,10 +488,12 @@ fn try_require_image_output(config: &RouterConfig, required: &mut ModalitySet) -
 }
 
 /// Classify a request's complexity from a **window of recent substantive user
-/// turns** (see [`build_classification_window`]), mapping any engine failure
-/// to the balanced default. Engine-agnostic: the window budget comes from the
-/// engine ([`ClassifierEngine::context_char_budget`]), and CPU-bound engines
-/// handle their own blocking-thread hand-off.
+/// turns** (already built by [`resolve_route`] at the capacity ladder's top
+/// budget — the selected engine's own budget is guaranteed to cover it, see
+/// [`EngineRoster::select`]). Engine-agnostic; CPU-bound engines handle
+/// their own blocking-thread hand-off. An engine failure maps to the
+/// balanced default — deliberately no retry on a lower rung, which would add
+/// tail latency and blur the failure signal.
 ///
 /// - No usable user text at all (no user messages, or only empty/attachment-only
 ///   content) → balanced default: there is nothing to judge, so don't pretend
@@ -469,16 +505,12 @@ fn try_require_image_output(config: &RouterConfig, required: &mut ModalitySet) -
 ///   an old image request in the window can't misroute the present one;
 ///   `lexical_image` is its precomputed lexical signal.
 async fn classify_or_default(
-    state: &AppState,
+    engine: &dyn ClassifierEngine,
     body: &Value,
+    window: Option<String>,
     current_turn: &str,
     lexical_image: bool,
 ) -> Classification {
-    let window = build_classification_window(
-        body,
-        state.trivial_max_words,
-        state.classifier.context_char_budget(),
-    );
     let Some(window) = window else {
         // Nothing substantive to classify.
         return if has_nonempty_user_text(body) {
@@ -493,14 +525,14 @@ async fn classify_or_default(
         };
     };
 
-    match state
-        .classifier
-        .classify(&window, current_turn, lexical_image)
-        .await
-    {
+    match engine.classify(&window, current_turn, lexical_image).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = %e, "classification failed; using balanced default");
+            tracing::error!(
+                engine = engine.name(),
+                error = %e,
+                "classification failed; using balanced default"
+            );
             Classification::balanced_default()
         }
     }

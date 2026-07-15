@@ -129,8 +129,10 @@ Request handling notes:
 Classification is pluggable behind the `ClassifierEngine` trait
 (`src/classifier.rs`); concrete engines live in `src/engines/`, **one file
 per model**, grouped by provider family (shared family plumbing lives in the
-family's `mod.rs`, e.g. `engines/gemini/`). The active model is selected by
-the `[classifier] model` config setting — **config-only, no CLI flag**: each
+family's `mod.rs`, e.g. `engines/gemini/`). The active model(s) are selected
+by the `[classifier] model` config setting — a single id, or a **list**
+forming a [capacity ladder](#the-capacity-ladder-multiple-engines) —
+**config-only, no CLI flag**: each
 model brings its own settings in
 a `[classifier.<model>]` table (e.g. `[classifier.deberta-v3-xsmall-zeroshot]`
 holds `inference_pool_size` / `intra_op_threads`, which are meaningless for
@@ -156,6 +158,42 @@ Both budgets are trait methods (`context_char_budget`,
 raise them — e.g. to see image-generation intent expressed deep in a long
 prompt — without touching the routing core. They bound classifier input only;
 forwarded requests are never truncated.
+
+### The capacity ladder (multiple engines)
+
+`[classifier] model` also accepts a **list**:
+
+```toml
+[classifier]
+model = ["deberta-v3-xsmall-zeroshot", "gemini-embedding-2"]
+```
+
+The engines form a **capacity ladder** (`EngineRoster` in
+`src/classifier.rs`), ordered by their `context_char_budget` — derived from
+the engines, never declared in config. Per request the router builds the
+classification window once at the *top* engine's budget and hands it to the
+**smallest engine whose budget covers it**: short prompts stay on the cheap
+(typically local) engine, long prompts escalate to the larger-context one
+instead of being judged by their last 1000 characters, and only a window that
+exceeds even the top budget is truncated (at the top budget). A single-engine
+config behaves exactly as before.
+
+Ladder rules, enforced at startup: budgets must be **unique** (the ladder
+needs a total order; listing the same model twice is a config error), and
+`current_turn_char_budget` must be **monotone** in ladder order (a
+higher-capacity engine may never see *less* of the current turn). The startup
+log prints one line per rung — engine, budgets, and a `local` marker.
+Thresholds: `image_generation_threshold` scales are engine-specific, so with
+several engines prefer the per-engine key in each `[classifier.<model>]`
+table; the top-level key acts as the fallback for engines without their own.
+A request-time engine failure still maps to the balanced default —
+deliberately no retry on a lower rung. Note that a growing conversation can
+cross a rung boundary mid-session and be judged by a different engine; the
+classification is best-effort by design.
+
+**Privacy**: with a mixed local/remote ladder (like the example above),
+prompt **length** decides whether prompt text is sent to a remote provider
+for classification. Configure only local engines if that must never happen.
 
 The remote engines (Gemini and Vertex AI families) classify by
 **anchor prototypes** (shared, provider-neutral logic in
@@ -184,10 +222,12 @@ the balanced default like any engine failure.
 **Privacy caveat**: the remote engines send prompt text (the classification
 window and current turn) to their provider's API (Google). The
 "zero customer-data collection, fully local" property in the highlights holds
-**only for the default `deberta-v3-xsmall-zeroshot` engine**.
+**only for the default `deberta-v3-xsmall-zeroshot` engine** — and, on a
+multi-engine ladder, only when **every** rung is local.
 
 Adding an engine = one new file in `engines/`, one `ClassifierModel` variant,
-and one `match` arm in `engines::build`. Nothing else changes.
+and one `match` arm in `engines::build`. Nothing else changes (its unique
+`context_char_budget` slots it into the ladder automatically).
 
 ## How routing works
 

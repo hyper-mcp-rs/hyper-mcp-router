@@ -245,12 +245,12 @@ impl Harness {
             config::parse(&gemini_config_toml(model, embed_addr, chat_addr)).expect("parse config");
         cfg.validate().expect("validate config");
 
-        let engine = engines::build(&cfg.classifier)
+        let engine = engines::build(cfg.classifier.models[0], &cfg.classifier)
             .await
             .expect("build gemini engine against mock");
         let trivial_max_words = cfg.classifier.trivial_max_words;
-        let state =
-            AppState::new(engine, Arc::new(cfg), trivial_max_words).expect("build app state");
+        let state = AppState::with_single_engine(engine, Arc::new(cfg), trivial_max_words)
+            .expect("build app state");
         let app = build_router(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -409,7 +409,9 @@ async fn gemini_embedding_2_uses_own_endpoint_and_budgets() {
         chat_addr,
     ))
     .expect("parse config");
-    let engine = engines::build(&cfg.classifier).await.expect("build engine");
+    let engine = engines::build(cfg.classifier.models[0], &cfg.classifier)
+        .await
+        .expect("build engine");
     assert_eq!(engine.name(), "gemini-embedding-2");
     assert_eq!(engine.context_char_budget(), 24_000);
     assert_eq!(engine.current_turn_char_budget(), 8_000);
@@ -430,7 +432,7 @@ async fn missing_credentials_fail_engine_build_naming_both_surfaces() {
     let toml = gemini_config_toml("gemini-embedding-001", embed_addr, chat_addr)
         .replace("api_key = \"test-gemini-key\"\n", "");
     let cfg = config::parse(&toml).expect("config parses without the key");
-    let msg = match engines::build(&cfg.classifier).await {
+    let msg = match engines::build(cfg.classifier.models[0], &cfg.classifier).await {
         Ok(_) => panic!("engine build must fail without credentials"),
         Err(e) => e.to_string(),
     };
@@ -453,7 +455,7 @@ async fn both_surfaces_configured_fails_engine_build() {
         "api_key = \"test-gemini-key\"\nproject = \"some-project\"\n",
     );
     let cfg = config::parse(&toml).expect("config parses with both fields");
-    let msg = match engines::build(&cfg.classifier).await {
+    let msg = match engines::build(cfg.classifier.models[0], &cfg.classifier).await {
         Ok(_) => panic!("engine build must fail when both surfaces are configured"),
         Err(e) => e.to_string(),
     };

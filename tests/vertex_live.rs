@@ -17,7 +17,7 @@ use hyper_mcp_router::config::{ClassifierConfig, GoogleEmbeddingConfig, VertexEm
 /// and apply the shared sanity assertions (cosine scoring is not an exact
 /// oracle; see comments).
 async fn classify_and_assert(cfg: ClassifierConfig, engine_name: &str, location: &str) {
-    let engine = hyper_mcp_router::engines::build(&cfg)
+    let engine = hyper_mcp_router::engines::build(cfg.models[0], &cfg)
         .await
         .unwrap_or_else(|e| panic!("build {engine_name} at `{location}`: {e:#}"));
     assert_eq!(engine.name(), engine_name);
@@ -80,7 +80,7 @@ async fn vertex_text_embedding_005_classifies_live_at_region_and_multiregion() {
 
     for location in ["us-central1", "us"] {
         let cfg = ClassifierConfig {
-            model: ClassifierModel::TextEmbedding005,
+            models: vec![ClassifierModel::TextEmbedding005],
             text_embedding_005: VertexEmbeddingConfig {
                 project: Some(project.clone()),
                 location: Some(location.into()),
@@ -107,7 +107,7 @@ async fn gemini_embedding_2_on_vertex_classifies_live_at_us_and_global() {
 
     for location in ["us", "global"] {
         let cfg = ClassifierConfig {
-            model: ClassifierModel::GeminiEmbedding2,
+            models: vec![ClassifierModel::GeminiEmbedding2],
             gemini_embedding_2: GoogleEmbeddingConfig {
                 project: Some(project.clone()),
                 location: Some(location.into()),
@@ -134,7 +134,7 @@ async fn gemini_embedding_001_on_vertex_classifies_live_at_region_and_multiregio
 
     for location in ["us-central1", "us"] {
         let cfg = ClassifierConfig {
-            model: ClassifierModel::GeminiEmbedding001,
+            models: vec![ClassifierModel::GeminiEmbedding001],
             gemini_embedding_001: GoogleEmbeddingConfig {
                 project: Some(project.clone()),
                 location: Some(location.into()),

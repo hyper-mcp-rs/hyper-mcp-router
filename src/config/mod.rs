@@ -1,16 +1,14 @@
-//! Configuration: TOML/YAML/JSON deserialization, the model catalogue,
-//! API-key resolution (plaintext / env / keyring), model selection, and
-//! startup coverage validation.
+//! Configuration: the config **schema** — typed structs, custom
+//! deserializers, API-key resolution (plaintext / env / keyring), the model
+//! catalogue, model selection, and startup coverage validation. Loading —
+//! path discovery, TOML/YAML/JSON format selection, env expansion, parsing —
+//! lives in the `load` submodule.
 //!
 //! Requests and responses elsewhere are handled as raw JSON; this module is the
 //! only place typed structs are used, and only for the operator's config file.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
-use directories::ProjectDirs;
-use regex::Regex;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
 use url::Url;
@@ -24,6 +22,9 @@ pub use engines::{
     DebertaV3XsmallZeroshotConfig, GoogleApi, GoogleEmbeddingConfig, RemoteEmbeddingConfig,
     VertexEmbeddingConfig,
 };
+
+mod load;
+pub use load::{expand_env, load, parse, parse_with_format, resolve_config_path};
 
 /// Application identifier used for OS config/log directory discovery.
 const APP_NAME: &str = "hyper-mcp-router";
@@ -101,15 +102,26 @@ fn default_max_body_bytes() -> usize {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClassifierConfig {
-    /// Which classification model to run (exactly one per process; see
-    /// `classifier::ClassifierModel`). **Config-only** — there is no CLI
-    /// override, because each model brings its own configuration; different
-    /// models mean different config files. Defaults to the embedded
-    /// `deberta-v3-xsmall-zeroshot` model.
-    #[serde(default)]
-    pub model: ClassifierModel,
-    /// Score floor for the image-generation axis (scale is engine-specific;
-    /// P(entailment) for the zero-shot engine).
+    /// Which classification model(s) to run — a single id, or a **list**
+    /// forming a capacity ladder (see `classifier::EngineRoster`): engines
+    /// are ordered by their context budget and each request is classified by
+    /// the smallest engine whose budget covers its classification window.
+    /// **Config-only** — there is no CLI override, because each model brings
+    /// its own configuration; different models mean different config files.
+    /// Defaults to the embedded `deberta-v3-xsmall-zeroshot` model.
+    #[serde(
+        default = "default_classifier_models",
+        rename = "model",
+        deserialize_with = "one_or_many_models"
+    )]
+    pub models: Vec<ClassifierModel>,
+    /// Score floor for the image-generation axis, used by every engine that
+    /// does not set its own `image_generation_threshold` in its
+    /// `[classifier.<model>]` table. The scale is **engine-specific**
+    /// (P(entailment) for the zero-shot engine, embedding similarity for the
+    /// remote engines) — with several engines configured, prefer the
+    /// per-engine keys; one global number cannot mean the same thing to all
+    /// of them.
     #[serde(default = "default_image_gen_threshold")]
     pub image_generation_threshold: f32,
     /// Word ceiling for the trivial fast-path (`0` disables).
@@ -142,7 +154,7 @@ pub struct ClassifierConfig {
 impl Default for ClassifierConfig {
     fn default() -> Self {
         ClassifierConfig {
-            model: ClassifierModel::default(),
+            models: default_classifier_models(),
             image_generation_threshold: default_image_gen_threshold(),
             trivial_max_words: default_trivial_max_words(),
             deberta_v3_xsmall_zeroshot: DebertaV3XsmallZeroshotConfig::default(),
@@ -158,6 +170,42 @@ fn default_image_gen_threshold() -> f32 {
 }
 fn default_trivial_max_words() -> usize {
     DEFAULT_TRIVIAL_MAX_WORDS
+}
+fn default_classifier_models() -> Vec<ClassifierModel> {
+    vec![ClassifierModel::default()]
+}
+
+/// Deserialize `[classifier] model` as either a single model id or a list of
+/// them. A visitor (rather than an untagged enum) so an unknown id keeps its
+/// loud, specific error message instead of "did not match any variant".
+fn one_or_many_models<'de, D>(deserializer: D) -> Result<Vec<ClassifierModel>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OneOrManyVisitor;
+
+    impl<'de> Visitor<'de> for OneOrManyVisitor {
+        type Value = Vec<ClassifierModel>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a classifier model id, or a list of them")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            let model = ClassifierModel::deserialize(de::value::StrDeserializer::<E>::new(v))?;
+            Ok(vec![model])
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut models = Vec::new();
+            while let Some(model) = seq.next_element::<ClassifierModel>()? {
+                models.push(model);
+            }
+            Ok(models)
+        }
+    }
+
+    deserializer.deserialize_any(OneOrManyVisitor)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -362,167 +410,23 @@ where
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Environment-variable expansion
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Expand `${VAR}` / `${VAR:-default}` references in the raw config text before
-/// TOML parsing. `$${VAR}` is an escape hatch for a literal `${VAR}`, and bare
-/// `$VAR` is left untouched. All missing (no-default) variables are collected
-/// and reported together in a single error.
-pub fn expand_env(input: &str) -> anyhow::Result<String> {
-    static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\$(\$?)\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?\}")
-            .expect("valid env-expansion regex")
-    });
-
-    let mut out = String::with_capacity(input.len());
-    let mut last = 0;
-    let mut missing: Vec<String> = Vec::new();
-
-    for caps in RE.captures_iter(input) {
-        let m = caps.get(0).unwrap();
-        out.push_str(&input[last..m.start()]);
-        last = m.end();
-
-        let escaped = caps.get(1).is_some_and(|g| !g.as_str().is_empty());
-        let var = &caps[2];
-        let default = caps.get(4).map(|g| g.as_str());
-
-        if escaped {
-            // `$${VAR[:-default]}` → literal `${VAR[:-default]}`.
-            out.push_str("${");
-            out.push_str(var);
-            if let Some(d) = default {
-                out.push_str(":-");
-                out.push_str(d);
-            }
-            out.push('}');
-            continue;
-        }
-
-        match std::env::var(var) {
-            Ok(v) if !v.is_empty() => out.push_str(&v),
-            _ => match default {
-                Some(d) => out.push_str(d),
-                None => missing.push(var.to_string()),
-            },
-        }
-    }
-    out.push_str(&input[last..]);
-
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "unset environment variable(s) with no default: {}",
-            missing.join(", ")
-        );
-    }
-    Ok(out)
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Loading, path resolution, validation
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Resolve the config path: an explicit `--config` is used verbatim (a missing
-/// or unparseable file is then fatal — no fallback); otherwise the first
-/// existing well-known OS location is used. Returns an error listing every path
-/// searched when none exists.
-pub fn resolve_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    if let Some(path) = explicit {
-        return Ok(path);
-    }
-
-    let candidates = well_known_config_paths();
-    for path in &candidates {
-        if path.exists() {
-            return Ok(path.clone());
-        }
-    }
-
-    let searched = candidates
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join("\n  ");
-    anyhow::bail!(
-        "no config file found. Pass --config <path> or create one at a well-known location. Searched:\n  {searched}"
-    );
-}
-
-/// Config file names probed in each well-known directory, in priority order.
-const CONFIG_FILE_NAMES: [&str; 4] = ["config.toml", "config.yaml", "config.yml", "config.json"];
-
-/// Platform-appropriate config locations, user-scoped before system-wide.
-/// Within a directory, `config.toml` wins over `config.yaml`/`config.yml`,
-/// which win over `config.json`.
-fn well_known_config_paths() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(dirs) = ProjectDirs::from("", "", APP_NAME) {
-        for name in CONFIG_FILE_NAMES {
-            candidates.push(dirs.config_dir().join(name));
-        }
-    }
-    #[cfg(unix)]
-    for name in CONFIG_FILE_NAMES {
-        candidates.push(PathBuf::from(format!("/etc/{APP_NAME}/{name}")));
-    }
-    candidates
-}
-
-/// Map a config path to its parse format by file extension
-/// (case-insensitive). Anything else is a loud error rather than a silent
-/// guess at the wrong format.
-fn format_for_path(path: &Path) -> anyhow::Result<config::FileFormat> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("toml") => Ok(config::FileFormat::Toml),
-        Some("yaml") | Some("yml") => Ok(config::FileFormat::Yaml),
-        Some("json") => Ok(config::FileFormat::Json),
-        _ => anyhow::bail!(
-            "unsupported config file extension for `{}`: expected `.toml`, `.yaml`, `.yml`, or `.json`",
-            path.display()
-        ),
-    }
-}
-
-/// Load, env-expand, parse, and validate the config at `path`. The format is
-/// chosen by file extension (`.toml`, `.yaml`/`.yml`, or `.json`).
-pub fn load(path: &Path) -> anyhow::Result<RouterConfig> {
-    let format = format_for_path(path)?;
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("failed to read config `{}`: {e}", path.display()))?;
-    let cfg = parse_with_format(&raw, format)?;
-    cfg.validate()?;
-    Ok(cfg)
-}
-
-/// Env-expand then TOML-parse config text. Split out for unit testing.
-pub fn parse(raw: &str) -> anyhow::Result<RouterConfig> {
-    parse_with_format(raw, config::FileFormat::Toml)
-}
-
-/// Env-expand then parse config text in the given format. Env expansion runs
-/// on the raw text, so `${VAR}` works identically in TOML, YAML, and JSON.
-pub fn parse_with_format(raw: &str, format: config::FileFormat) -> anyhow::Result<RouterConfig> {
-    let expanded = expand_env(raw)?;
-    let cfg: RouterConfig = config::Config::builder()
-        .add_source(config::File::from_str(&expanded, format))
-        .build()?
-        .try_deserialize()
-        .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
-    Ok(cfg)
-}
-
 impl RouterConfig {
     /// Field-level and startup coverage validation. Fails fast with a clear
     /// message on any incomplete configuration.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.models.is_empty() {
             anyhow::bail!("no [[models]] configured");
+        }
+        if self.classifier.models.is_empty() {
+            anyhow::bail!("[classifier] model lists no models; name at least one engine");
+        }
+        for (i, model) in self.classifier.models.iter().enumerate() {
+            if self.classifier.models[..i].contains(model) {
+                anyhow::bail!(
+                    "[classifier] model lists `{}` more than once",
+                    model.as_str()
+                );
+            }
         }
         for m in &self.models {
             if m.modalities.is_empty() {
@@ -627,50 +531,7 @@ fn tier_rank(tier: ModelTier, want: ModelTier) -> i32 {
 mod tests {
     use super::*;
 
-    // ── env expansion ───────────────────────────────────────────────────────
-    #[test]
-    fn expand_simple_var() {
-        std::env::set_var("ROUTER_TEST_A", "value-a");
-        assert_eq!(expand_env("x=${ROUTER_TEST_A}").unwrap(), "x=value-a");
-    }
-
-    #[test]
-    fn expand_default_used_when_unset() {
-        std::env::remove_var("ROUTER_TEST_UNSET_1");
-        assert_eq!(
-            expand_env("x=${ROUTER_TEST_UNSET_1:-fallback}").unwrap(),
-            "x=fallback"
-        );
-    }
-
-    #[test]
-    fn expand_default_ignored_when_set() {
-        std::env::set_var("ROUTER_TEST_B", "real");
-        assert_eq!(
-            expand_env("x=${ROUTER_TEST_B:-fallback}").unwrap(),
-            "x=real"
-        );
-    }
-
-    #[test]
-    fn expand_escape_hatch_literal() {
-        assert_eq!(expand_env("x=$${VAR}").unwrap(), "x=${VAR}");
-    }
-
-    #[test]
-    fn expand_bare_var_passthrough() {
-        assert_eq!(expand_env("x=$VAR").unwrap(), "x=$VAR");
-    }
-
-    #[test]
-    fn expand_collects_all_missing() {
-        std::env::remove_var("ROUTER_TEST_MISS_1");
-        std::env::remove_var("ROUTER_TEST_MISS_2");
-        let err = expand_env("${ROUTER_TEST_MISS_1} ${ROUTER_TEST_MISS_2}").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("ROUTER_TEST_MISS_1"));
-        assert!(msg.contains("ROUTER_TEST_MISS_2"));
-    }
+    // ── env expansion, formats, loading: see `load::tests` ───────────
 
     // ── server / classifier tuning fields ─────────────────────────────
     #[test]
@@ -682,8 +543,8 @@ mod tests {
         assert_eq!(cfg.server.stream_idle_timeout_secs, 300);
         assert_eq!(cfg.server.max_body_bytes, 32 * 1024 * 1024);
         assert_eq!(
-            cfg.classifier.model,
-            ClassifierModel::DebertaV3XsmallZeroshot
+            cfg.classifier.models,
+            [ClassifierModel::DebertaV3XsmallZeroshot]
         );
         assert_eq!(cfg.classifier.trivial_max_words, DEFAULT_TRIVIAL_MAX_WORDS);
         assert_eq!(
@@ -706,8 +567,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            cfg.classifier.model,
-            ClassifierModel::DebertaV3XsmallZeroshot
+            cfg.classifier.models,
+            [ClassifierModel::DebertaV3XsmallZeroshot]
         );
 
         // An unknown model id must be a loud config error, never a silent default.
@@ -716,6 +577,86 @@ mod tests {
              [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn classifier_model_accepts_a_list() {
+        let cfg = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n\
+             [classifier]\nmodel=[\"gemini-embedding-2\", \"deberta-v3-xsmall-zeroshot\"]\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap();
+        // Config order is preserved verbatim — the capacity ladder is derived
+        // from engine budgets at startup, never from list order.
+        assert_eq!(
+            cfg.classifier.models,
+            [
+                ClassifierModel::GeminiEmbedding2,
+                ClassifierModel::DebertaV3XsmallZeroshot,
+            ]
+        );
+        cfg.validate().expect("a distinct list must validate");
+    }
+
+    #[test]
+    fn classifier_model_list_rejects_unknown_ids_loudly() {
+        let err = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n\
+             [classifier]\nmodel=[\"deberta-v3-xsmall-zeroshot\", \"not-a-model\"]\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn classifier_model_list_rejects_duplicates_at_validation() {
+        let cfg = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n\
+             [classifier]\nmodel=[\"deberta-v3-xsmall-zeroshot\", \"deberta-v3-xsmall-zeroshot\"]\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("more than once"), "got: {err}");
+    }
+
+    #[test]
+    fn classifier_model_empty_list_fails_validation() {
+        let cfg = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n[classifier]\nmodel=[]\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("lists no models"), "got: {err}");
+    }
+
+    #[test]
+    fn per_engine_image_generation_threshold_overrides_global() {
+        let cfg = parse(
+            "[server]\nhost=\"0.0.0.0\"\nport=1\n\
+             [classifier]\nimage_generation_threshold=0.7\n\
+             [classifier.deberta-v3-xsmall-zeroshot]\nimage_generation_threshold=0.9\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.classifier.image_generation_threshold, 0.7);
+        assert_eq!(
+            cfg.classifier
+                .deberta_v3_xsmall_zeroshot
+                .image_generation_threshold,
+            Some(0.9)
+        );
+        // Engines without their own key inherit the global at build time.
+        assert_eq!(
+            cfg.classifier.gemini_embedding_2.image_generation_threshold,
+            None
+        );
+        assert_eq!(
+            cfg.classifier.text_embedding_005.image_generation_threshold,
+            None
+        );
     }
 
     #[test]
@@ -740,100 +681,6 @@ mod tests {
             cfg.classifier.deberta_v3_xsmall_zeroshot.intra_op_threads,
             Some(1)
         );
-    }
-
-    // ── config file formats ───────────────────────────────────────────
-    #[test]
-    fn format_for_path_maps_known_extensions() {
-        use config::FileFormat;
-        let cases = [
-            ("config.toml", FileFormat::Toml),
-            ("config.yaml", FileFormat::Yaml),
-            ("config.yml", FileFormat::Yaml),
-            ("config.json", FileFormat::Json),
-            // Extension matching must be case-insensitive.
-            ("CONFIG.TOML", FileFormat::Toml),
-            ("config.YAML", FileFormat::Yaml),
-        ];
-        for (name, want) in cases {
-            let got = format_for_path(Path::new(name)).expect(name);
-            // `FileFormat` isn't PartialEq; compare debug representations.
-            assert_eq!(format!("{got:?}"), format!("{want:?}"), "path {name}");
-        }
-    }
-
-    #[test]
-    fn format_for_path_rejects_unknown_or_missing_extension() {
-        for name in ["config.ini", "config", "config.tml"] {
-            let err = format_for_path(Path::new(name)).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("unsupported config file extension"),
-                "path {name}: got {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn yaml_config_parses_like_toml() {
-        std::env::set_var("ROUTER_TEST_YAML_KEY", "yaml-key");
-        let cfg = parse_with_format(
-            "server:\n  host: \"0.0.0.0\"\n  port: 1\nmodels:\n  - name: m\n    base_url: \"http://u\"\n    api_key: \"${ROUTER_TEST_YAML_KEY}\"\n    type: fast\n    modalities: [text]\n  - name: adc\n    base_url: \"http://u\"\n    api_key: { source: google-adc }\n    type: frontier\n    modalities: [text]\n",
-            config::FileFormat::Yaml,
-        )
-        .expect("YAML config should parse");
-        cfg.validate().expect("YAML config should validate");
-        assert_eq!(cfg.server.host, "0.0.0.0");
-        assert_eq!(cfg.models.len(), 2);
-        assert_eq!(
-            cfg.models[0].api_key,
-            Some(ModelApiKey::Static("yaml-key".to_string()))
-        );
-        // A map-shaped api_key (YAML mapping instead of a TOML inline table)
-        // must hit the same custom deserializer path.
-        assert_eq!(cfg.models[1].api_key, Some(ModelApiKey::GoogleAdc));
-    }
-
-    #[test]
-    fn json_config_parses_like_toml() {
-        std::env::set_var("ROUTER_TEST_JSON_KEY", "json-key");
-        let cfg = parse_with_format(
-            r#"{
-                "server": { "host": "0.0.0.0", "port": 1 },
-                "models": [
-                    {
-                        "name": "m",
-                        "base_url": "http://u",
-                        "api_key": "${ROUTER_TEST_JSON_KEY}",
-                        "type": "fast",
-                        "modalities": ["text"]
-                    }
-                ]
-            }"#,
-            config::FileFormat::Json,
-        )
-        .expect("JSON config should parse");
-        cfg.validate().expect("JSON config should validate");
-        assert_eq!(cfg.models.len(), 1);
-        assert_eq!(
-            cfg.models[0].api_key,
-            Some(ModelApiKey::Static("json-key".to_string()))
-        );
-    }
-
-    #[test]
-    fn well_known_paths_probe_all_formats_toml_first() {
-        let paths = well_known_config_paths();
-        assert!(!paths.is_empty());
-        // Every candidate is one of the supported file names, and within each
-        // directory TOML is probed before YAML before JSON.
-        let names: Vec<&str> = paths
-            .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap())
-            .collect();
-        for chunk in names.chunks(CONFIG_FILE_NAMES.len()) {
-            assert_eq!(chunk, CONFIG_FILE_NAMES, "candidates {names:?}");
-        }
     }
 
     // ── engine settings: see `engines::tests` ───────────────────────
@@ -983,83 +830,6 @@ port = 8080
         ))
         .unwrap_err();
         assert!(err.to_string().contains("http or https"), "got: {err}");
-    }
-
-    // ── shipped example configs (drift guard) ─────────────────────────
-
-    /// Parse + validate a checked-in example. Secret *resolution* (env vars,
-    /// OS keyring) is covered by dedicated tests, so neutralize those two
-    /// constructs (in their format-specific spelling) to a plaintext key here
-    /// rather than depend on external state.
-    fn parse_example(
-        label: &str,
-        raw: &str,
-        keyring_table: &str,
-        format: config::FileFormat,
-    ) -> RouterConfig {
-        let neutralized = raw
-            .replace(keyring_table, "\"sk-example\"")
-            .replace("${OPENAI_API_KEY}", "sk-example");
-        let cfg = parse_with_format(&neutralized, format)
-            .unwrap_or_else(|e| panic!("{label} must parse under the current schema: {e}"));
-        cfg.validate()
-            .unwrap_or_else(|e| panic!("{label} must pass startup validation: {e}"));
-        cfg
-    }
-
-    fn toml_example() -> RouterConfig {
-        parse_example(
-            "config.example.toml",
-            include_str!("../../config.example.toml"),
-            "{ source = \"keyring\", service = \"hyper-mcp-router\", user = \"openai-frontier\" }",
-            config::FileFormat::Toml,
-        )
-    }
-
-    #[test]
-    fn example_config_matches_current_schema() {
-        // The checked-in examples are documentation only (nothing parses them
-        // at build or run time), so they can silently drift out of sync with
-        // the schema. This guards that the canonical TOML example still parses
-        // and passes startup validation.
-        let cfg = toml_example();
-
-        // Sanity: the example still demonstrates its documented features.
-        assert!(
-            cfg.models.iter().any(|m| m.api_key.is_none()),
-            "example should include a keyless backend"
-        );
-        assert!(
-            cfg.models
-                .iter()
-                .any(|m| m.modality_set().contains(Modality::AudioOutput)),
-            "example should cover audio-output"
-        );
-    }
-
-    #[test]
-    fn yaml_example_config_is_equivalent_to_toml() {
-        let cfg = parse_example(
-            "config.example.yaml",
-            include_str!("../../config.example.yaml"),
-            "{ source: \"keyring\", service: \"hyper-mcp-router\", user: \"openai-frontier\" }",
-            config::FileFormat::Yaml,
-        );
-        // The YAML example is documented as an exact translation of the TOML
-        // one; comparing the fully-parsed configs guards against drift in
-        // either direction.
-        assert_eq!(format!("{cfg:?}"), format!("{:?}", toml_example()));
-    }
-
-    #[test]
-    fn json_example_config_is_equivalent_to_toml() {
-        let cfg = parse_example(
-            "config.example.json",
-            include_str!("../../config.example.json"),
-            "{ \"source\": \"keyring\", \"service\": \"hyper-mcp-router\", \"user\": \"openai-frontier\" }",
-            config::FileFormat::Json,
-        );
-        assert_eq!(format!("{cfg:?}"), format!("{:?}", toml_example()));
     }
 
     // ── select_model ──────────────────────────────────────────────────────────

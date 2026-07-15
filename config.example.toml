@@ -34,7 +34,7 @@ max_body_bytes = 33554432
 # brings its own configuration (a [classifier.<model>] table); different
 # classifier models mean different config files.
 [classifier]
-# Which classification model to run (exactly one per process). Available:
+# Which classification model(s) to run. Available:
 #   "deberta-v3-xsmall-zeroshot"  embedded NLI model; fully local (default)
 #   "gemini-embedding-001"        remote Gemini embeddings; requires api_key
 #   "gemini-embedding-2"          as above, much larger context window
@@ -42,9 +42,24 @@ max_body_bytes = 33554432
 # NOTE: the remote engines send prompt text (the classification window and
 # current turn) to their provider's API (Google); only
 # "deberta-v3-xsmall-zeroshot" keeps everything local.
+#
+# A LIST of models forms a capacity ladder: engines are ordered by their
+# context budget (each budget must be unique), and every request is
+# classified by the smallest engine whose budget covers its classification
+# window — short prompts stay on the cheap engine, long prompts escalate, and
+# only a window exceeding even the top engine's budget is truncated. E.g.:
+#   model = ["deberta-v3-xsmall-zeroshot", "gemini-embedding-2"]
+# PRIVACY: with a mixed local/remote ladder like that one, prompt LENGTH
+# decides whether prompt text is sent to the remote provider for
+# classification. Configure only local engines if that must never happen
+# (the startup log prints each rung with a `local` marker).
 model = "deberta-v3-xsmall-zeroshot"
 # Image-generation modality decision (score floor; scale is engine-specific —
-# P(entailment) for the embedded NLI engine; default 0.5).
+# P(entailment) for the embedded NLI engine; default 0.5). This is the
+# GLOBAL default; every [classifier.<model>] table below can override it with
+# its own image_generation_threshold, and with several engines configured you
+# should prefer the per-engine keys — the scales differ per engine, so one
+# global number cannot fit all of them.
 image_generation_threshold = 0.5
 # Word ceiling for the trivial fast-path (0 disables; default 6).
 trivial_max_words = 6
@@ -56,6 +71,7 @@ trivial_max_words = 6
 [classifier.deberta-v3-xsmall-zeroshot]
 #inference_pool_size = 4
 #intra_op_threads = 2
+#image_generation_threshold = 0.5   # per-engine override (P(entailment) scale)
 
 # Settings for the remote embedding engines. Ignored unless selected above.
 # The gemini-embedding models are published on TWO Google API surfaces, and
@@ -77,6 +93,7 @@ trivial_max_words = 6
 #base_url = "https://generativelanguage.googleapis.com"  # optional override
 #max_concurrency = 32          # concurrent embed calls (the "session pool")
 #request_timeout_secs = 10     # per embed call
+#image_generation_threshold = 0.5  # per-engine override (similarity scale)
 
 #[classifier.gemini-embedding-2]
 #api_key = "${GEMINI_API_KEY:-}"

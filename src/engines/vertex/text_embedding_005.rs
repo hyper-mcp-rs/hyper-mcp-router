@@ -43,12 +43,11 @@ const _: () = {
 
 /// Build the engine from its `[classifier.text-embedding-005]` table.
 pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<VertexEmbedding> {
-    VertexEmbedding::connect(
-        &SPEC,
-        &cfg.text_embedding_005,
-        cfg.image_generation_threshold,
-    )
-    .await
+    let threshold = cfg
+        .text_embedding_005
+        .image_generation_threshold
+        .unwrap_or(cfg.image_generation_threshold);
+    VertexEmbedding::connect(&SPEC, &cfg.text_embedding_005, threshold).await
 }
 
 #[cfg(test)]

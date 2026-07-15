@@ -420,6 +420,10 @@ impl ClassifierEngine for VertexEmbedding {
         self.spec.name
     }
 
+    fn is_local(&self) -> bool {
+        false // prompt text is sent to the Vertex AI API
+    }
+
     fn context_char_budget(&self) -> usize {
         self.spec.context_char_budget
     }
@@ -567,6 +571,10 @@ impl VertexEmbedContent {
 impl ClassifierEngine for VertexEmbedContent {
     fn name(&self) -> &'static str {
         self.spec.name
+    }
+
+    fn is_local(&self) -> bool {
+        false // prompt text is sent to the Vertex AI API
     }
 
     fn context_char_budget(&self) -> usize {

@@ -44,10 +44,14 @@ const _: () = {
 /// Build the engine from the Generative-Language slice of its
 /// `[classifier.gemini-embedding-2]` table.
 pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<GeminiEmbedding> {
+    let threshold = cfg
+        .gemini_embedding_2
+        .image_generation_threshold
+        .unwrap_or(cfg.image_generation_threshold);
     GeminiEmbedding::connect(
         &SPEC,
         &cfg.gemini_embedding_2.to_generative_language(),
-        cfg.image_generation_threshold,
+        threshold,
     )
     .await
 }

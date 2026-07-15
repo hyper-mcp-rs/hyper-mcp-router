@@ -49,10 +49,12 @@ modalities = ["text"]
 
     // Default (embedded) classifier; with a single-model catalogue the proxy
     // skips classification anyway — this test is about auth, not routing.
-    let engine = engines::build(&cfg.classifier).await.expect("build engine");
+    let engine = engines::build(cfg.classifier.models[0], &cfg.classifier)
+        .await
+        .expect("build engine");
     let trivial_max_words = cfg.classifier.trivial_max_words;
     // ADC discovery happens HERE, at startup, because a google-adc model exists.
-    let state = AppState::new(engine, Arc::new(cfg), trivial_max_words)
+    let state = AppState::with_single_engine(engine, Arc::new(cfg), trivial_max_words)
         .expect("AppState::new must discover Application Default Credentials");
     let app = build_router(state);
 

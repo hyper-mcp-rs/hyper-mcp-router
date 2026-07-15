@@ -43,12 +43,11 @@ const _: () = {
 /// Build the engine from the Vertex slice of its
 /// `[classifier.gemini-embedding-001]` table.
 pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<VertexEmbedding> {
-    VertexEmbedding::connect(
-        &SPEC,
-        &cfg.gemini_embedding_001.to_vertex(),
-        cfg.image_generation_threshold,
-    )
-    .await
+    let threshold = cfg
+        .gemini_embedding_001
+        .image_generation_threshold
+        .unwrap_or(cfg.image_generation_threshold);
+    VertexEmbedding::connect(&SPEC, &cfg.gemini_embedding_001.to_vertex(), threshold).await
 }
 
 #[cfg(test)]
