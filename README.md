@@ -1,11 +1,13 @@
 # hyper-mcp-router
 
 An adaptive, OpenAI Chat Completions compatible LLM router. It presents a single
-virtual model to any client, classifies each incoming prompt with an **embedded**
-zero-shot NLI model, and transparently forwards the request to the appropriate
-backend model tier — with **modality-aware** routing across the full Chat
-Completions v1 surface (text, image/audio/file input, audio/image output, and
-tool calling).
+virtual model to any client, classifies each incoming prompt — by default with
+an **embedded** zero-shot NLI model; remote embedding engines are pluggable —
+and transparently forwards the request to the appropriate backend model tier,
+with **modality-aware** routing across the full Chat Completions v1 surface
+(text, image/audio/file input, audio/image output, and tool calling) and
+**context-window-aware** placement (a request is never knowingly sent to a
+backend whose window it cannot fit).
 
 No external state, no database, no runtime model downloads.
 
@@ -246,7 +248,9 @@ and one `match` arm in `engines::build`. Nothing else changes (its unique
 
 ## How routing works
 
-Each request resolves three axes:
+Each request resolves three routing axes — capability (the modality set,
+including an inferred image-generation signal), capacity (context fit), and
+complexity:
 
 - **Modality set** (hard constraint) — read deterministically from the request
   JSON: content-part types (image/audio/file input), the `modalities` field
@@ -255,6 +259,12 @@ Each request resolves three axes:
   (`role: "tool"` messages, assistant `tool_calls`), so a tool-loop
   continuation stays on a tool-capable backend even if the follow-up omits
   `tools`.
+- **Image-generation intent** (soft addition to the modality set) — when the
+  request doesn't say `modalities: ["image"]` explicitly, image-output is
+  *inferred* via a hardened lexical-OR-NLI-threshold signal. Because it is
+  probabilistic, it is applied only if an image-capable backend exists that
+  also fits the request — an inferred intent never makes a request
+  unroutable; it degrades to a text route instead.
 - **Context fit** (strong preference) — the request's estimated context
   occupancy: the text of every message at ~4 characters per token, plus any
   requested `max_tokens`/`max_completion_tokens` completion budget. Every
@@ -262,16 +272,32 @@ Each request resolves three axes:
   candidates whose window cannot fit the estimate are avoided — "fast" models
   usually have far smaller windows than "frontier" ones, and a very large
   request sent to a small-window backend is a guaranteed upstream failure.
-- **Image-generation intent** (soft constraint) — when the request doesn't say
-  `modalities: ["image"]` explicitly, image-output is *inferred* via a hardened
-  lexical-OR-NLI-threshold signal. Because it is probabilistic, it is applied
-  only if an image-capable backend exists that also fits the request — an
-  inferred intent never makes a request unroutable; it degrades to a text
-  route instead.
 - **Complexity type** (preference) — the argmax of three complexity hypotheses,
   classified over a **window of recent substantive user turns** (see
   [Performance & tuning](#performance--tuning)), so a terse follow-up inherits
   the difficulty of its context. There is no message-history heuristic.
+
+### Modality reference
+
+The full modality vocabulary — the ids a model declares in its `modalities`
+config list, what makes a request *require* each one, and what happens when
+no configured model covers it:
+
+| Modality id | Direction | A request requires it when… | If no model declares it |
+|---|---|---|---|
+| `text` | in/out | always — text I/O is in play for every chat request | Startup error: text is the fallback baseline, so at least one model (any tier) **must** declare it |
+| `image-input` | input | any message has an `image_url` content part (`input_image` accepted as a newer alias) | `422` at request time |
+| `audio-input` | input | any message has an `input_audio` content part | `422` at request time |
+| `file-input` | input | any message has a `file` content part (documents, e.g. PDFs) | `422` at request time |
+| `audio-output` | output | the request's `modalities` field contains `"audio"` | `422` at request time |
+| `image-output` | output | **explicit**: the request's `modalities` field contains `"image"` (hard requirement) — or **inferred**: the lexical/NLI image-generation signal fires (soft) | Explicit: `422`. Inferred: the intent is dropped and the request degrades to a text route (also when no image-capable model fits the request's context estimate) |
+| `tools` | capability | the request offers a non-empty `tools` (or legacy `functions`) array — or the transcript already carries tool artifacts: `role: "tool"` messages, assistant `tool_calls`, or a legacy `function_call` | `422` at request time |
+
+Detection is deterministic, metadata-only, and never consults the classifier;
+a model's declared set must be a **superset** of the required set to be a
+candidate. Only `text` coverage is validated at startup — every other
+modality is best-effort: configure it or requests requiring it are refused
+with a `422` naming the uncovered set.
 
 The router selects the configured model whose declared modalities are a
 **superset** of the required set and whose context window fits the request,
@@ -292,10 +318,21 @@ explicit `modalities` field still apply.)
 
 ## Performance & tuning
 
-Complexity classification runs a single batched forward pass through the
-embedded NLI model, and that pass is the router's main CPU cost. The mechanisms
-below keep it accurate, off the hot path where possible, and scalable across
-cores. **All are automatic** — the knobs exist only for override.
+What classification *costs* depends on the engine. With the default embedded
+`deberta-v3-xsmall-zeroshot` engine it is a single batched ONNX forward pass
+— the router's main **CPU** cost; with a remote embedding engine it is one
+batched embed **API call** — a network round-trip and provider quota, with
+essentially no local CPU or memory cost. The mechanisms below keep
+classification accurate, off the hot path where possible, and scalable.
+**All are automatic** — the knobs exist only for override.
+
+Scope guide: the [complexity window](#complexity-window-context-aware-no-history-heuristic)
+is engine-agnostic routing policy (only the character budget is
+engine-specific). The [session pool](#adaptive-inference-concurrency-embedded-engine)
+and [memory](#memory) sections — and every latency/throughput/memory number
+in them — apply **only to the embedded engine**; the remote engines'
+equivalents are covered in
+[their own section](#remote-engines-gemini--vertex-ai).
 
 ### Complexity window (context-aware, no history heuristic)
 
@@ -308,8 +345,11 @@ just the last message. Walking back from the current turn, the router:
   pattern, so a terse `"Prove P != NP."` is never mistaken for filler);
 - skips **assistant/tool** messages entirely (usually the longest text), so the
   budget stretches across many turns of actual user intent;
-- accumulates substantive user turns until the conversation start or a character
-  budget (kept safely inside the model's 512-token limit).
+- accumulates substantive user turns until the conversation start or a
+  character budget — engine-specific, sized to the classifier model's input
+  limit (for the default embedded model, kept safely inside its 512-token
+  limit; see the [capacity ladder](#the-capacity-ladder-multiple-engines) for
+  how a multi-engine roster sizes the window).
 
 Consequences:
 
@@ -319,15 +359,21 @@ Consequences:
   — a hard conversation stays hard until genuinely new (substantive) work pushes
   it out; the natural reset is a **new conversation**.
 - A conversation of **pure filler** prunes to an empty window and routes to the
-  **Fast** tier **without running the model** (~0.3 ms vs ~13 ms) — the old
-  fast-path, now falling out naturally.
+  **Fast** tier **without running the engine at all** (~0.3 ms vs ~13 ms for
+  the embedded model) — the old fast-path, now falling out naturally. For a
+  remote engine this saves a billable API call — and keeps that prompt's text
+  from leaving the process at all.
 - Image-generation intent is judged on the **current turn only**, so an old
   "draw a cat" turn in the window can't misroute a later, unrelated request.
 
 `[classifier] trivial_max_words` (default `6`) sets the filler-pruning length
 ceiling; `0` disables pruning.
 
-### Adaptive inference concurrency (session pool)
+### Adaptive inference concurrency (embedded engine)
+
+**Embedded-engine only** — everything in this section (and [Memory](#memory)
+below) concerns the local ONNX sessions of `deberta-v3-xsmall-zeroshot`; the
+remote engines run no local inference and ignore these settings entirely.
 
 `ort`'s `Session::run` requires exclusive access, so the classifier holds a
 **pool** of independent sessions and leases one per request, allowing up to
@@ -385,7 +431,42 @@ single-session ceiling. Lowering `intra_op_threads` trades a little per-request
 latency for more concurrency; raise it if single-request latency matters more
 than throughput.
 
+### Remote engines (Gemini / Vertex AI)
+
+The remote embedding engines have a different cost profile, and different
+knobs (in their `[classifier.<model>]` tables):
+
+- **Per-request cost is one batched embed call** — the classification window
+  and the current turn embedded together (Gemini `batchEmbedContents`;
+  Vertex `:predict` with true batching — except the gemini-* models on
+  Vertex, whose API takes one text per request, so a "batch" fans out as up
+  to two concurrent calls). Latency is the provider's API round-trip, not
+  local CPU; cost is provider quota/billing.
+- **`max_concurrency`** (default `32`) bounds in-flight embed calls — the
+  remote analogue of the embedded engine's session pool, backed by a
+  semaphore rather than ONNX sessions. There is no CPU/memory auto-plan to
+  size it: raise it for burst throughput (within provider rate limits),
+  lower it to smooth quota consumption.
+- **`request_timeout_secs`** (default `10`) bounds each embed call; a
+  timeout or API failure degrades that request to the balanced default,
+  like any engine failure.
+- **No memory planning** — `inference_pool_size` / `intra_op_threads` and
+  the [Memory](#memory) numbers do not apply; the engines hold only
+  prototype vectors.
+- **Startup embeds the anchor set** in one batched call, failing fast on a
+  bad credential or unreachable endpoint — a broken remote engine is a boot
+  error, not a per-request surprise.
+
+The engine-agnostic savings matter *more* here: the trivial fast-path and
+the classification-skip optimisation don't just save milliseconds — each
+skipped classification is an API call not billed and prompt text not sent to
+the provider.
+
 ### Measuring
+
+Both measuring tools below exercise the **embedded engine**; remote-engine
+performance is dominated by the provider's API latency and rate limits, so
+measure those against the provider's own quotas.
 
 An opt-in load test ramps concurrency and reports latency percentiles and
 throughput:
@@ -398,7 +479,7 @@ Environment overrides: `LOAD_REQUESTS` (requests per concurrency level),
 `LOAD_PROMPT` (fixed prompt — a trivial one measures the empty-window Fast path),
 `LOAD_TURNS` (build N-user-turn conversations to measure how the windowed
 classifier scales with conversation depth), `LOAD_POOL_SIZE` / `LOAD_INTRA_OP`
-(build a dedicated classifier to sweep pool size).
+(build a dedicated embedded classifier to sweep its pool size).
 
 Per-session **memory** is measured separately by
 `measure_session_memory.sh` (repo root), which starts the router at two pool
@@ -414,9 +495,13 @@ rather than growing with the transcript.
 
 ## Logging
 
-Structured JSON (NDJSON) always. Level via `RUST_LOG` (default `info`). Log
+Structured JSON (NDJSON) always. Level via `RUST_LOG`; the default is `info`
+with ONNX Runtime's verbose per-session logging quieted to `warn`
+(`info,ort=warn`), and a set `RUST_LOG` overrides that entirely. Log
 destination is the rolling daily file `{config dir}/hyper-mcp-router/logs/router.log`
-(overridable with `ROUTER_LOG_PATH`) or stdout with `--log-stdout`.
+(directory overridable with `ROUTER_LOG_PATH`) or stdout with `--log-stdout`.
+Routing logs are metadata-only — modalities, tier, engine, prompt sizes,
+estimated tokens, latency — never user content.
 
 ## License
 
