@@ -61,6 +61,13 @@ partial download or upstream change can never be silently embedded.
 cargo build --release
 ```
 
+Supported native targets are Linux (x86_64/aarch64, glibc) and macOS
+(aarch64) — plus the fully static musl container image below. **Native
+Windows (MSVC) builds currently fail to link**: the prebuilt ONNX Runtime
+binaries use the dynamic CRT (`/MD`) while a transitive C++ dependency
+(`esaxx-rs`, via `tokenizers`) hardcodes the static CRT (`/MT`) — LNK2038.
+On Windows, run the [container image](#docker) instead.
+
 ## Docker
 
 The [`Dockerfile`](./Dockerfile) builds the smallest image this router can
@@ -153,7 +160,7 @@ probed in that order:
 |---|---|
 | Linux | `$XDG_CONFIG_HOME/hyper-mcp-router/config.{toml,yaml,yml,json}` (or `~/.config/...`), then `/etc/hyper-mcp-router/config.{toml,yaml,yml,json}` |
 | macOS | `~/Library/Application Support/hyper-mcp-router/config.{toml,yaml,yml,json}`, then `/etc/hyper-mcp-router/config.{toml,yaml,yml,json}` |
-| Windows | `%APPDATA%\hyper-mcp-router\config.{toml,yaml,yml,json}` |
+| Windows | `%APPDATA%\hyper-mcp-router\config.{toml,yaml,yml,json}` (note: no native Windows build currently — see [Building](#building); in Docker the Linux paths apply) |
 
 A missing config is a fatal error. See
 [`config.example.toml`](./config.example.toml) for a fully-annotated example
