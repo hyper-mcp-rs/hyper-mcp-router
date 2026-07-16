@@ -201,19 +201,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # No Windows target: pyke's prebuilt ONNX Runtime uses the dynamic
+        # MSVC CRT (/MD) while esaxx-rs (via tokenizers) hardcodes the static
+        # CRT (/MT) — an unlinkable combination (LNK2038). Windows users can
+        # run the container image instead.
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            ext: ""
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            ext: ""
           - os: macos-latest
             target: aarch64-apple-darwin
-            ext: ""
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            ext: ".exe"
 
     runs-on: ${{ matrix.os }}
     permissions:
@@ -249,35 +247,21 @@ jobs:
           set -euo pipefail
           mkdir -p dist
 
-          bin="hyper-mcp-router${EXT}"
-          src="target/${TARGET}/release/${bin}"
+          bin="hyper-mcp-router"
+          tar -czf "dist/hyper-mcp-router-${TARGET}.tar.gz" -C "target/${TARGET}/release" "${bin}"
+          pkg="dist/hyper-mcp-router-${TARGET}.tar.gz"
 
-          if [[ "${RUNNER_OS}" == "Windows" ]]; then
-            # Use PowerShell's Compress-Archive? We'll keep it simple with tar if available;
-            # but Windows runners have bsdtar via Git. Use zip for compatibility.
-            7z a "dist/hyper-mcp-router-${TARGET}.zip" "${src}"
-            pkg="dist/hyper-mcp-router-${TARGET}.zip"
-          else
-            tar -czf "dist/hyper-mcp-router-${TARGET}.tar.gz" -C "target/${TARGET}/release" "${bin}"
-            pkg="dist/hyper-mcp-router-${TARGET}.tar.gz"
-          fi
-
-          # checksums
+          # checksums (sha256sum on Linux, shasum on macOS)
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "${pkg}" > "dist/checksums-${TARGET}.txt"
           elif command -v shasum >/dev/null 2>&1; then
             shasum -a 256 "${pkg}" > "dist/checksums-${TARGET}.txt"
-          elif [[ "$RUNNER_OS" == "Windows" ]]; then
-            powershell.exe -NoProfile -Command \
-              "\$h=(Get-FileHash -Algorithm SHA256 '${pkg}').Hash.ToLower(); \"\$h  ${pkg}\" | Out-File -Encoding ascii 'dist/checksums-${TARGET}.txt'"
           else
             echo "No SHA256 tool found" >&2
             exit 1
           fi
         env:
           TARGET: ${{ matrix.target }}
-          EXT: ${{ matrix.ext }}
-          RUNNER_OS: ${{ runner.os }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -285,7 +269,6 @@ jobs:
           name: release-${{ matrix.target }}
           path: |
             dist/hyper-mcp-router-${{ matrix.target }}.tar.gz
-            dist/hyper-mcp-router-${{ matrix.target }}.zip
             dist/checksums-${{ matrix.target }}.txt
           if-no-files-found: error
 
@@ -378,7 +361,8 @@ jobs:
           - \`${SHA}\`
 
           Included:
-          - hyper-mcp-router binaries for Linux, macOS & Windows
+          - hyper-mcp-router binaries for Linux & macOS (Windows: use the
+            container image)
           - hyper-mcp-router container image: \`${IMAGE}:${TAG}\`
 
           ✅ Multi-arch digest (immutable, recommended for pinning):
