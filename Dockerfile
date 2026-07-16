@@ -48,6 +48,8 @@ RUN apk add --no-cache \
 
 # Keep in lockstep with the ort crate: ort-sys 2.0.0-rc.12 tracks upstream
 # ONNX Runtime 1.24.2 (see ort-sys build/download/dist.txt: "ms@1.24.2").
+# Deliberately NOT Renovate-managed — never bump this on its own; it moves
+# together with the `ort` dependency in Cargo.toml.
 ARG ONNXRUNTIME_VERSION=v1.24.2
 
 RUN git clone --depth 1 --shallow-submodules --recursive \
