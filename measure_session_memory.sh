@@ -109,7 +109,7 @@ LOADED_KB=()
 for pool in "${POOLS[@]}"; do
   echo "── pool_size=$pool ──────────────────────────────────" >&2
   write_config "$pool"
-  "$BIN" serve --config "$TMP/config.toml" --log-stdout >/dev/null 2>&1 &
+  "$BIN" serve --config "$TMP/config.toml" >/dev/null 2>&1 &
   ROUTER_PID=$!
   wait_healthy
   sleep 1 # let allocations settle

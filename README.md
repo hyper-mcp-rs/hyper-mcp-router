@@ -112,14 +112,14 @@ docker run -p 8080:8080 \
 ```
 
 Container caveats: the image runs as a non-root numeric user with no
-writable filesystem — always use `--log-stdout` (the default `CMD` does) —
-and `api_key = { source = "keyring" }` cannot work without an OS secret
-store; use `${ENV_VAR}`-expanded keys instead.
+writable filesystem (fine: logs always go to stdout), and `api_key =
+{ source = "keyring" }` cannot work without an OS secret store; use
+`${ENV_VAR}`-expanded keys instead.
 
 ## Running
 
 ```sh
-hyper-mcp-router serve [--config <path>] [--log-stdout]
+hyper-mcp-router serve [--config <path>]
 hyper-mcp-router validate [--config <path>]
 ```
 
@@ -127,8 +127,9 @@ hyper-mcp-router validate [--config <path>]
   missing or unparseable file is fatal (no fallback). The format is chosen by
   file extension: `.toml`, `.yaml`/`.yml`, or `.json` (anything else is an
   error).
-- `--log-stdout` — write structured JSON logs to stdout instead of the
-  well-known rolling file location (use this for Cloud Run / containers).
+
+Logs are structured JSON on **stdout**, always — redirect with the shell, a
+service manager, or the container runtime (see [Logging](#logging)).
 
 `validate` loads and validates a config, prints the classifier ladder and
 backend catalogue that `serve` would run, and exits — without starting the
@@ -550,11 +551,13 @@ rather than growing with the transcript.
 
 ## Logging
 
-Structured JSON (NDJSON) always. Level via `RUST_LOG`; the default is `info`
-with ONNX Runtime's verbose per-session logging quieted to `warn`
-(`info,ort=warn`), and a set `RUST_LOG` overrides that entirely. Log
-destination is the rolling daily file `{config dir}/hyper-mcp-router/logs/router.log`
-(directory overridable with `ROUTER_LOG_PATH`) or stdout with `--log-stdout`.
+Structured JSON (NDJSON) on **stdout**, always — the router is a standalone
+process and never manages log files itself. Redirect with the shell
+(`hyper-mcp-router serve > router.log 2>&1`), a service manager (systemd's
+journal), or the container runtime, all of which handle rotation and
+shipping better than an in-process file writer. Level via `RUST_LOG`; the
+default is `info` with ONNX Runtime's verbose per-session logging quieted to
+`warn` (`info,ort=warn`), and a set `RUST_LOG` overrides that entirely.
 Routing logs are metadata-only — modalities, tier, engine, prompt sizes,
 estimated tokens, latency — never user content.
 

@@ -1,11 +1,12 @@
 //! Command-line interface (clap derive). The binary exposes a `serve`
 //! subcommand and an offline `validate` subcommand.
 //!
-//! Deliberately minimal: the CLI selects **where the config lives and where
-//! logs go** — nothing else. All routing and classifier behaviour (including
-//! which classifier model runs, and its model-specific tuning) lives in the
-//! config file: different classifier models mean different configurations, so
-//! the config file is the single source of truth.
+//! Deliberately minimal: the CLI selects **where the config lives** — nothing
+//! else. Logs always go to stdout (redirect with the shell); all routing and
+//! classifier behaviour (including which classifier model runs, and its
+//! model-specific tuning) lives in the config file: different classifier
+//! models mean different configurations, so the config file is the single
+//! source of truth.
 
 use std::path::PathBuf;
 
@@ -33,11 +34,6 @@ pub struct ServeArgs {
     /// unparseable file is fatal (no fallback to well-known locations).
     #[arg(long)]
     pub config: Option<PathBuf>,
-
-    /// Write structured JSON logs to stdout instead of the well-known rolling
-    /// file location (use this for Cloud Run and other container deployments).
-    #[arg(long)]
-    pub log_stdout: bool,
 }
 
 #[derive(Debug, Args)]
@@ -69,10 +65,25 @@ mod tests {
     }
 
     #[test]
-    fn validate_subcommand_rejects_serve_only_flags() {
-        // `--log-stdout` selects where logs go; validate never initialises
-        // logging, so the flag must not silently parse there.
-        let err = Cli::try_parse_from(["hyper-mcp-router", "validate", "--log-stdout"]);
+    fn serve_subcommand_parses_with_and_without_config() {
+        let cli = Cli::try_parse_from(["hyper-mcp-router", "serve"]).unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!("expected the serve subcommand");
+        };
+        assert_eq!(args.config, None);
+
+        let cli = Cli::try_parse_from(["hyper-mcp-router", "serve", "--config", "c.toml"]).unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!("expected the serve subcommand");
+        };
+        assert_eq!(args.config, Some(PathBuf::from("c.toml")));
+    }
+
+    #[test]
+    fn removed_log_stdout_flag_is_rejected() {
+        // Logs always go to stdout now; the old flag must fail loudly rather
+        // than silently parse, so stale deployment scripts surface at once.
+        let err = Cli::try_parse_from(["hyper-mcp-router", "serve", "--log-stdout"]);
         assert!(err.is_err());
     }
 }

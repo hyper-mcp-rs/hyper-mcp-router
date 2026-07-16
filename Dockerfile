@@ -168,8 +168,8 @@ COPY --from=builder /hyper-mcp-router /hyper-mcp-router
 #   docker run -v ./config.toml:/etc/hyper-mcp-router/config.toml:ro \
 #     -p 8080:8080 hyper-mcp-router
 # (`server.host` must be "0.0.0.0" to be reachable from outside the
-# container.) Logs go to stdout — there is no writable filesystem here, and
-# no shell: use `serve --config /path` as arguments if you mount elsewhere.
+# container.) Logs always go to stdout — exactly what a container wants; use
+# `serve --config /path` as arguments if you mount the config elsewhere.
 #
 # For `api_key = { source = "google-adc" }` backends (and the Vertex AI
 # classifier engines), mount Application Default Credentials and point the
@@ -186,4 +186,4 @@ USER 65532:65532
 EXPOSE 8080
 
 ENTRYPOINT ["/hyper-mcp-router"]
-CMD ["serve", "--log-stdout"]
+CMD ["serve"]

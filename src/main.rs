@@ -70,8 +70,8 @@ fn validate(args: ValidateArgs) -> anyhow::Result<()> {
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // 1. Logging first, so every subsequent startup step (including failures)
-    //    is captured. Hold the guard for the process lifetime.
-    let _guard = logging::init(args.log_stdout)?;
+    //    is captured. Always stdout; the operator redirects with the shell.
+    logging::init();
 
     // 2. Resolve, expand, parse, and validate config (fatal on any problem).
     let config_path = config::resolve_config_path(args.config)?;

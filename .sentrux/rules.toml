@@ -19,8 +19,8 @@
 #
 #   cli.rs and logging.rs are cross-cutting infrastructure leaves used only by
 #   main. Since classifier selection became config-only, cli.rs imports
-#   NOTHING from this crate — it is pure argument parsing (--config,
-#   --log-stdout) and must stay that way.
+#   NOTHING from this crate — it is pure argument parsing (--config) and must
+#   stay that way.
 #
 # Dependencies must always flow downward. These rules make that non-negotiable.
 # The load-bearing inversion: classifier (the trait hub) must NEVER import
