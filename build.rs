@@ -40,8 +40,24 @@ fn main() {
     // Only re-run when the build script itself changes; the pinned artifacts
     // are verified by digest on every build, so they cannot drift.
     println!("cargo:rerun-if-changed=build.rs");
+    // …and when toggling a docs.rs-style build, so stubs and real artifacts
+    // can never be mistaken for each other across builds (the digest check
+    // below re-downloads over a stub regardless).
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
+
+    // docs.rs builds run with NO network access, so the downloads below can
+    // never succeed there. Rustdoc never executes the model, so empty stubs
+    // keep `include_bytes!` compiling. (`ort-sys` handles DOCS_RS the same
+    // way and skips its own binary download.)
+    if std::env::var_os("DOCS_RS").is_some() {
+        for (name, _, _) in ARTIFACTS {
+            std::fs::write(Path::new(&out_dir).join(name), [])
+                .unwrap_or_else(|e| panic!("failed to write docs.rs stub {name}: {e}"));
+        }
+        return;
+    }
 
     for (name, repo_path, expected_sha256) in ARTIFACTS {
         let dest = Path::new(&out_dir).join(name);
