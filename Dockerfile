@@ -119,9 +119,14 @@ ENV ORT_LIB_PATH=/opt/onnxruntime \
     ORT_SKIP_DOWNLOAD=1
 
 # +crt-static: fully static executable (overrides the rust:alpine default of
-# -crt-static). strip=symbols: smallest binary. These flags apply only to
-# --target units — host build scripts / proc-macros are unaffected.
-ENV RUSTFLAGS="-C target-feature=+crt-static -C strip=symbols"
+# -crt-static). strip=symbols: smallest binary. link-arg=-lgcc: ONNX
+# Runtime's x86 cpuid_info.cc uses GCC's __builtin_cpu_supports, whose
+# runtime symbols (__cpu_model / __cpu_features2) live in libgcc's cpuinfo.o
+# — rustc links its own compiler-builtins instead of libgcc on static musl
+# targets and lacks them, so the amd64 link fails without this (aarch64 has
+# no such init path; the extra arg is harmless there). These flags apply
+# only to --target units — host build scripts / proc-macros are unaffected.
+ENV RUSTFLAGS="-C target-feature=+crt-static -C strip=symbols -C link-arg=-lgcc"
 
 COPY rust-toolchain.toml Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
