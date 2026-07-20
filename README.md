@@ -583,6 +583,12 @@ end-to-end (e.g. during an evaluation period):
   image-generation score against its threshold: a decision reads as "how
   close was the call", the data for tuning hypotheses and thresholds.
   Scores only, never premise text.
+- **`embedding prototype similarities`** (remote engines) — the same
+  breakdown for the Gemini/Vertex families: per-tier cosine similarity, the
+  winning tier, and both halves of the image decision (the image similarity
+  vs. its strongest tier opponent, and the threshold), tagged with the
+  engine name since several rungs of a ladder may score. Similarities only,
+  never premise text.
 - **`upstream token usage`** — on buffered (non-streaming) success
   responses, the router's routing estimate next to the upstream's
   authoritative `usage` counts, calibrating the ~4 chars/token context-fit

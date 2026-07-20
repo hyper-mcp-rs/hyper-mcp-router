@@ -131,7 +131,12 @@ pub fn build_prototypes(embeddings: &[Vec<f32>]) -> anyhow::Result<Prototypes> {
 /// Fold prototype similarities into a [`Classification`] (see module docs for
 /// the exact rules). `image_embedding` is `None` when the current turn was
 /// empty — image intent is then only reachable via the lexical prefilter.
+///
+/// `engine` names the calling engine in the debug-level similarity log — this
+/// module is shared by every remote family (and several rungs of a ladder
+/// may run it), so the event must say which one scored.
 pub fn combine_similarities(
+    engine: &str,
     complexity_embedding: &[f32],
     image_embedding: Option<&[f32]>,
     prototypes: &Prototypes,
@@ -159,18 +164,50 @@ pub fn combine_similarities(
         }
     }
 
+    // `(image similarity, max tier similarity)` of the current-turn
+    // embedding; image intent requires the image prototype to win the argmax
+    // AND clear the threshold.
+    let image_axis = image_embedding.map(|emb| {
+        let image_sim = cosine(emb, &prototypes.image);
+        let max_tier_sim = [
+            cosine(emb, &prototypes.fast),
+            cosine(emb, &prototypes.balanced),
+            cosine(emb, &prototypes.frontier),
+        ]
+        .into_iter()
+        .fold(f32::NEG_INFINITY, f32::max);
+        (image_sim, max_tier_sim)
+    });
     let image_generation = lexical_image_match
-        || image_embedding.is_some_and(|emb| {
-            let image_sim = cosine(emb, &prototypes.image);
-            let max_tier_sim = [
-                cosine(emb, &prototypes.fast),
-                cosine(emb, &prototypes.balanced),
-                cosine(emb, &prototypes.frontier),
-            ]
-            .into_iter()
-            .fold(f32::NEG_INFINITY, f32::max);
+        || image_axis.is_some_and(|(image_sim, max_tier_sim)| {
             image_sim > max_tier_sim && image_sim >= image_gen_threshold
         });
+
+    // Debug-level score breakdown — the remote analogue of the embedded
+    // engine's "NLI hypothesis scores" event: every tier's cosine similarity
+    // plus both halves of the image decision (argmax opponent and
+    // threshold), so a routing decision reads as "how close was the call".
+    // Similarities only, never premise text. The `enabled!` guard skips the
+    // rendering allocation on the hot path when debug is off.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let similarities: Vec<(&'static str, f32)> = vec![
+            ("fast", tiers[0].1),
+            ("balanced", tiers[1].1),
+            ("frontier", tiers[2].1),
+        ];
+        tracing::debug!(
+            engine,
+            similarities = ?similarities,
+            complexity = ?best.0,
+            complexity_similarity = best.1,
+            image_similarity = image_axis.map(|(s, _)| s),
+            image_max_tier_similarity = image_axis.map(|(_, m)| m),
+            image_gen_threshold,
+            lexical_image_match,
+            image_generation,
+            "embedding prototype similarities"
+        );
+    }
 
     Classification {
         complexity: best.0,
@@ -301,6 +338,7 @@ impl<T: EmbedTexts> ClassifierEngine for RemoteEmbeddingEngine<T> {
         };
 
         Ok(combine_similarities(
+            self.spec.name,
             &embeddings[0],
             image_embedding,
             &self.prototypes,
@@ -528,7 +566,7 @@ mod tests {
             (vec![0.1, 0.9, 0.2, 0.0], ModelTier::Balanced),
             (vec![0.1, 0.2, 0.9, 0.0], ModelTier::Frontier),
         ] {
-            let c = combine_similarities(&emb, None, &p, false, 0.5);
+            let c = combine_similarities("test-engine", &emb, None, &p, false, 0.5);
             assert_eq!(c.complexity, want);
         }
     }
@@ -537,7 +575,7 @@ mod tests {
     fn complexity_ties_resolve_to_the_lower_tier() {
         let p = protos();
         // Equidistant from fast and frontier: prefer the cheaper tier.
-        let c = combine_similarities(&[0.5, 0.0, 0.5, 0.0], None, &p, false, 0.5);
+        let c = combine_similarities("test-engine", &[0.5, 0.0, 0.5, 0.0], None, &p, false, 0.5);
         assert_eq!(c.complexity, ModelTier::Fast);
     }
 
@@ -546,6 +584,7 @@ mod tests {
         let p = protos();
         // Image dominant and above threshold => image intent.
         let c = combine_similarities(
+            "test-engine",
             &[0.9, 0.0, 0.0, 0.0],
             Some(&[0.1, 0.0, 0.0, 0.9]),
             &p,
@@ -558,6 +597,7 @@ mod tests {
         // genuinely *angled away* from the prototype, not just small:
         // cos([0.5, 0, 0, 0.86], image) ≈ 0.86, under a 0.9 threshold.
         let c = combine_similarities(
+            "test-engine",
             &[0.9, 0.0, 0.0, 0.0],
             Some(&[0.5, 0.0, 0.0, 0.86]),
             &p,
@@ -567,6 +607,7 @@ mod tests {
         assert!(!c.image_generation);
         // Image similar but NOT the argmax => no image intent.
         let c = combine_similarities(
+            "test-engine",
             &[0.9, 0.0, 0.0, 0.0],
             Some(&[0.9, 0.0, 0.0, 0.8]),
             &p,
@@ -575,9 +616,9 @@ mod tests {
         );
         assert!(!c.image_generation);
         // No current-turn embedding => image only via lexical.
-        let c = combine_similarities(&[0.9, 0.0, 0.0, 0.0], None, &p, false, 0.5);
+        let c = combine_similarities("test-engine", &[0.9, 0.0, 0.0, 0.0], None, &p, false, 0.5);
         assert!(!c.image_generation);
-        let c = combine_similarities(&[0.9, 0.0, 0.0, 0.0], None, &p, true, 0.5);
+        let c = combine_similarities("test-engine", &[0.9, 0.0, 0.0, 0.0], None, &p, true, 0.5);
         assert!(c.image_generation);
     }
 
@@ -585,15 +626,58 @@ mod tests {
     fn image_axis_never_affects_complexity() {
         let p = protos();
         let with_image = combine_similarities(
+            "test-engine",
             &[0.0, 0.9, 0.1, 0.0],
             Some(&[0.0, 0.0, 0.0, 1.0]),
             &p,
             false,
             0.5,
         );
-        let without = combine_similarities(&[0.0, 0.9, 0.1, 0.0], None, &p, false, 0.5);
+        let without =
+            combine_similarities("test-engine", &[0.0, 0.9, 0.1, 0.0], None, &p, false, 0.5);
         assert_eq!(with_image.complexity, without.complexity);
         assert!(with_image.image_generation && !without.image_generation);
+    }
+
+    #[test]
+    fn similarities_logged_per_tier_at_debug() {
+        let p = protos();
+        // Orthogonal unit vectors give exact cosines — stable log rendering.
+        let out = crate::test_support::captured_log(tracing::Level::DEBUG, || {
+            combine_similarities(
+                "test-engine",
+                &[1.0, 0.0, 0.0, 0.0],
+                Some(&[0.0, 0.0, 0.0, 1.0]),
+                &p,
+                false,
+                0.5,
+            );
+        });
+        assert!(
+            out.contains("embedding prototype similarities"),
+            "got: {out}"
+        );
+        // The engine is named — this module is shared across remote families.
+        assert!(out.contains("test-engine"), "got: {out}");
+        // Every tier's similarity…
+        assert!(out.contains(r#"("fast", 1.0)"#), "got: {out}");
+        assert!(out.contains(r#"("balanced", 0.0)"#), "got: {out}");
+        assert!(out.contains(r#"("frontier", 0.0)"#), "got: {out}");
+        // …and both halves of the image decision, plus the outcome.
+        assert!(out.contains("image_similarity=1.0"), "got: {out}");
+        assert!(out.contains("image_max_tier_similarity=0.0"), "got: {out}");
+        assert!(out.contains("image_gen_threshold=0.5"), "got: {out}");
+        assert!(out.contains("complexity=Fast"), "got: {out}");
+        assert!(out.contains("image_generation=true"), "got: {out}");
+    }
+
+    #[test]
+    fn similarities_stay_silent_below_debug() {
+        let p = protos();
+        let out = crate::test_support::captured_log(tracing::Level::INFO, || {
+            combine_similarities("test-engine", &[1.0, 0.0, 0.0, 0.0], None, &p, false, 0.5);
+        });
+        assert!(out.is_empty(), "got: {out}");
     }
 
     #[test]
