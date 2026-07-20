@@ -74,7 +74,9 @@ async fn vertex_text_embedding_005_classifies_live_at_region_and_multiregion() {
         panic!("set VERTEX_TEST_PROJECT to run this test");
     };
     // Optional static override; omitted means Application Default Credentials.
-    let access_token = std::env::var("GOOGLE_ACCESS_TOKEN").ok();
+    let access_token = std::env::var("GOOGLE_ACCESS_TOKEN")
+        .ok()
+        .map(hyper_mcp_router::config::StaticSecret::from);
     // Optional quota/billing project (sent as x-goog-user-project).
     let quota_project = std::env::var("VERTEX_TEST_QUOTA_PROJECT").ok();
 
@@ -103,7 +105,9 @@ async fn gemini_embedding_2_on_vertex_classifies_live_at_us_and_global() {
     let Ok(project) = std::env::var("VERTEX_TEST_PROJECT") else {
         panic!("set VERTEX_TEST_PROJECT to run this test");
     };
-    let access_token = std::env::var("GOOGLE_ACCESS_TOKEN").ok();
+    let access_token = std::env::var("GOOGLE_ACCESS_TOKEN")
+        .ok()
+        .map(hyper_mcp_router::config::StaticSecret::from);
 
     for location in ["us", "global"] {
         let cfg = ClassifierConfig {
@@ -130,7 +134,9 @@ async fn gemini_embedding_001_on_vertex_classifies_live_at_region_and_multiregio
     let Ok(project) = std::env::var("VERTEX_TEST_PROJECT") else {
         panic!("set VERTEX_TEST_PROJECT to run this test");
     };
-    let access_token = std::env::var("GOOGLE_ACCESS_TOKEN").ok();
+    let access_token = std::env::var("GOOGLE_ACCESS_TOKEN")
+        .ok()
+        .map(hyper_mcp_router::config::StaticSecret::from);
 
     for location in ["us-central1", "us"] {
         let cfg = ClassifierConfig {

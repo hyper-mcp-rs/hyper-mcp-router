@@ -14,11 +14,12 @@
 //! window and current turn) to the Vertex AI API.
 
 use crate::config::ClassifierConfig;
+use crate::engines::embedding::{RemoteEmbeddingEngine, RemoteSpec};
 
-use super::{VertexEmbedding, VertexSpec};
+use super::VertexPredictTransport;
 
 /// Model-specific parameters for `gemini-embedding-001` on Vertex AI.
-pub const SPEC: VertexSpec = VertexSpec {
+pub const SPEC: RemoteSpec = RemoteSpec {
     name: "gemini-embedding-001",
     api_model: "gemini-embedding-001",
     // 2048-token input limit; ~4 chars/token with headroom (the model is the
@@ -42,12 +43,14 @@ const _: () = {
 
 /// Build the engine from the Vertex slice of its
 /// `[classifier.gemini-embedding-001]` table.
-pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<VertexEmbedding> {
+pub async fn build(
+    cfg: &ClassifierConfig,
+) -> anyhow::Result<RemoteEmbeddingEngine<VertexPredictTransport>> {
     let threshold = cfg
         .gemini_embedding_001
         .image_generation_threshold
         .unwrap_or(cfg.image_generation_threshold);
-    VertexEmbedding::connect(&SPEC, &cfg.gemini_embedding_001.to_vertex(), threshold).await
+    super::connect_predict(&SPEC, &cfg.gemini_embedding_001.to_vertex(), threshold).await
 }
 
 #[cfg(test)]

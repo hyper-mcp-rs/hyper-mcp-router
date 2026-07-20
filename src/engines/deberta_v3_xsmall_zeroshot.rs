@@ -20,6 +20,7 @@ use tokenizers::{
     PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection,
     TruncationParams, TruncationStrategy,
 };
+use tokio::sync::Semaphore;
 
 use crate::classifier::{Classification, ClassifierEngine, ModelTier};
 use crate::config::ClassifierConfig;
@@ -62,10 +63,17 @@ enum HypothesisKind {
 /// session; the pool holds N independent sessions and hands out exclusive
 /// access, allowing up to N inferences to run at once.
 ///
-/// Checkout is **blocking** by design: inference already runs inside
-/// `spawn_blocking` (see [`DebertaV3XsmallZeroshot::classify`]), so parking
-/// that blocking-pool thread until a session frees up is correct and needs no
-/// async machinery.
+/// Admission is **two-layered**. The async `classify` wrapper acquires a
+/// permit from an N-permit `tokio::sync::Semaphore` *before* calling
+/// `spawn_blocking`, so under a burst the excess callers queue as cheap
+/// async futures and at most `pool_size` blocking threads ever exist —
+/// without this, hundreds of blocking threads would park on the condvar
+/// below and starve `spawn_blocking` process-wide. This condvar checkout is
+/// kept as the RAII layer and correctness backstop (it hands out exclusive
+/// `&mut Session` access and returns sessions on drop, including on panic);
+/// with admission bounded upstream it never meaningfully blocks. Direct
+/// `classify_sync` callers (tests/benchmarks) bypass the semaphore and rely
+/// on the condvar alone, which is still correct — just blocking.
 struct SessionPool {
     idle: Mutex<Vec<Session>>,
     available: Condvar,
@@ -148,6 +156,11 @@ impl std::ops::DerefMut for PooledSession<'_> {
 /// must not stall an async worker).
 pub struct DebertaV3XsmallZeroshot {
     inner: Arc<Inner>,
+    /// Async admission gate with exactly `pool_size` permits — the first
+    /// layer of the two-layer scheme described on [`SessionPool`]. Acquired
+    /// in [`ClassifierEngine::classify`] before `spawn_blocking` so waiters
+    /// queue as futures, not parked blocking threads.
+    admission: Arc<Semaphore>,
 }
 
 struct Inner {
@@ -313,14 +326,17 @@ impl DebertaV3XsmallZeroshot {
                 hypotheses,
                 image_gen_threshold,
             }),
+            admission: Arc::new(Semaphore::new(pool_size)),
         })
     }
 
     /// Synchronous classification (one batched forward pass). CPU-bound —
     /// callers on an async runtime should go through the
     /// [`ClassifierEngine::classify`] wrapper, which moves this onto the
-    /// blocking pool. Exposed for tests and benchmarks.
-    pub fn classify_sync(
+    /// blocking pool. Exposed crate-internally for tests and benchmarks
+    /// only; bypasses the async admission semaphore (see [`SessionPool`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn classify_sync(
         &self,
         complexity_premise: &str,
         image_premise: &str,
@@ -359,17 +375,29 @@ impl ClassifierEngine for DebertaV3XsmallZeroshot {
     /// The two premises ride in one batch (different premise per row).
     ///
     /// The pass is CPU-bound, so it runs on tokio's blocking pool — never on
-    /// an async worker.
+    /// an async worker. Admission is bounded **before** `spawn_blocking` by
+    /// the `pool_size`-permit semaphore (see [`SessionPool`] for the
+    /// two-layer scheme): excess callers wait as cheap async futures instead
+    /// of parked blocking threads, so a classification burst can never
+    /// exhaust tokio's blocking pool. The permit moves into the closure and
+    /// is released when inference finishes.
     async fn classify(
         &self,
         complexity_premise: &str,
         image_premise: &str,
         lexical_image_match: bool,
     ) -> anyhow::Result<Classification> {
+        let permit = Arc::clone(&self.admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("classification admission semaphore closed"))?;
         let inner = Arc::clone(&self.inner);
         let complexity_premise = complexity_premise.to_owned();
         let image_premise = image_premise.to_owned();
         tokio::task::spawn_blocking(move || {
+            // Hold the admission permit for the duration of the inference;
+            // dropping it here (after the pass) reopens one slot.
+            let _permit = permit;
             inner.classify_sync(&complexity_premise, &image_premise, lexical_image_match)
         })
         .await
@@ -454,9 +482,12 @@ impl Inner {
             .map_err(|e| anyhow::anyhow!("ort run: {e}"))?;
 
         // logits shape [batch, 2], row-major; label order [entailment, not].
-        let (_shape, logits) = outputs["logits"]
+        let (shape, logits) = outputs["logits"]
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow::anyhow!("ort extract logits: {e}"))?;
+        // Validate before indexing: a model emitting any other shape must be
+        // a descriptive error, never a slice-index panic.
+        check_logits_shape(shape, batch)?;
 
         let scores = self
             .hypotheses
@@ -505,6 +536,16 @@ fn combine(
         complexity: best_tier,
         image_generation: lexical_image_match || image_gen_score >= image_gen_threshold,
     }
+}
+
+/// Verify the extracted logits tensor is exactly `[batch, 2]` — the shape
+/// the binary NLI model must emit and the indexing in `score_hypotheses`
+/// assumes. Any mismatch is a descriptive error naming expected vs actual.
+fn check_logits_shape(shape: &[i64], batch: usize) -> anyhow::Result<()> {
+    if shape.len() != 2 || shape[0] != batch as i64 || shape[1] != 2 {
+        anyhow::bail!("NLI logits have unexpected shape: expected [{batch}, 2], got {shape:?}");
+    }
+    Ok(())
 }
 
 /// Numerically stable two-class softmax, returning P(entailment).
@@ -598,6 +639,74 @@ mod tests {
         // lexical match forces true even with a very low score
         let low = vec![(HypothesisKind::ImageGeneration, 0.01)];
         assert!(combine(&low, true, 0.5).image_generation);
+    }
+
+    // ── logits shape validation ───────────────────────────────────
+    #[test]
+    fn check_logits_shape_accepts_exactly_batch_by_two() {
+        check_logits_shape(&[8, 2], 8).unwrap();
+        check_logits_shape(&[1, 2], 1).unwrap();
+    }
+
+    #[test]
+    fn check_logits_shape_rejects_mismatches_descriptively() {
+        // Wrong batch, wrong class count, wrong rank — all loud errors
+        // naming expected vs actual.
+        for shape in [
+            vec![7i64, 2], // wrong batch
+            vec![8, 3],    // wrong class count
+            vec![16],      // wrong rank (flat)
+            vec![8, 2, 1], // wrong rank (extra dim)
+            vec![],        // scalar
+        ] {
+            let err = check_logits_shape(&shape, 8).unwrap_err().to_string();
+            assert!(
+                err.contains("expected [8, 2]") && err.contains(&format!("{shape:?}")),
+                "unhelpful error for shape {shape:?}: {err}"
+            );
+        }
+    }
+
+    // ── bounded admission (async classify) ───────────────────────────
+    #[test]
+    fn admission_semaphore_starts_with_pool_size_permits() {
+        let engine = DebertaV3XsmallZeroshot::new(DEFAULT_IMAGE_GEN_THRESHOLD, 1, 1).unwrap();
+        assert_eq!(engine.admission.available_permits(), 1);
+        let engine = DebertaV3XsmallZeroshot::new(DEFAULT_IMAGE_GEN_THRESHOLD, 2, 1).unwrap();
+        assert_eq!(engine.admission.available_permits(), 2);
+        // pool_size is clamped to at least 1; the semaphore must match.
+        let engine = DebertaV3XsmallZeroshot::new(DEFAULT_IMAGE_GEN_THRESHOLD, 0, 1).unwrap();
+        assert_eq!(engine.admission.available_permits(), 1);
+    }
+
+    /// A burst of concurrent `classify()` calls against a pool of one must
+    /// all succeed: waiters queue on the admission semaphore as async
+    /// futures (never as parked blocking threads), draining one at a time
+    /// through the single session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_classify_burst_succeeds_with_pool_of_one() {
+        use crate::classifier::ClassifierEngine as _;
+
+        let engine =
+            Arc::new(DebertaV3XsmallZeroshot::new(DEFAULT_IMAGE_GEN_THRESHOLD, 1, 1).unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..8 {
+            let engine = Arc::clone(&engine);
+            tasks.spawn(async move {
+                let prompt = format!("hi {i}");
+                engine.classify(&prompt, &prompt, false).await
+            });
+        }
+        let mut completed = 0;
+        while let Some(joined) = tasks.join_next().await {
+            joined
+                .expect("task must not panic")
+                .expect("classify must succeed");
+            completed += 1;
+        }
+        assert_eq!(completed, 8);
+        // All permits returned once the burst drains.
+        assert_eq!(engine.admission.available_permits(), 1);
     }
 
     // ── model-backed hypothesis calibration fixture (opt-in) ────────────

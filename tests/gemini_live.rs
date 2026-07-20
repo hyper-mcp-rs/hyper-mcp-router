@@ -72,7 +72,7 @@ async fn gemini_embedding_001_on_generative_language_classifies_live() {
     let cfg = ClassifierConfig {
         models: vec![ClassifierModel::GeminiEmbedding001],
         gemini_embedding_001: GoogleEmbeddingConfig {
-            api_key: Some(api_key()),
+            api_key: Some(api_key().into()),
             ..Default::default()
         },
         ..Default::default()
@@ -87,7 +87,7 @@ async fn gemini_embedding_2_on_generative_language_classifies_live() {
     let cfg = ClassifierConfig {
         models: vec![ClassifierModel::GeminiEmbedding2],
         gemini_embedding_2: GoogleEmbeddingConfig {
-            api_key: Some(api_key()),
+            api_key: Some(api_key().into()),
             ..Default::default()
         },
         ..Default::default()

@@ -1,16 +1,28 @@
 //! Configuration: the config **schema** — typed structs, custom
 //! deserializers, API-key resolution (plaintext / env / keyring), the model
-//! catalogue, model selection, and startup coverage validation. Loading —
-//! path discovery, TOML/YAML/JSON format selection, env expansion, parsing —
-//! lives in the `load` submodule.
+//! catalogue, and startup coverage validation. Loading — path discovery,
+//! TOML/YAML/JSON format selection, env expansion, parsing — lives in the
+//! `load` submodule; the model-selection *policy* over the parsed catalogue
+//! lives in `crate::selection`.
 //!
 //! Requests and responses elsewhere are handled as raw JSON; this module is the
 //! only place typed structs are used, and only for the operator's config file.
+//!
+//! ## Secrets
+//!
+//! Every resolved secret is held as a [`secrecy::SecretString`]: `Debug`
+//! prints `[REDACTED]`, so a stray `tracing::debug!(?cfg)` can never leak a
+//! credential, and every real access is an explicit, greppable
+//! `expose_secret()` call. Keyring references are parsed as **unresolved
+//! markers** and looked up only by [`RouterConfig::resolve_secrets`] after
+//! parsing — deserialization performs no I/O, and engine tables are resolved
+//! only for engines actually selected by `[classifier] model`.
 
-use std::cmp::Reverse;
 use std::fmt;
 use std::num::NonZeroU64;
 
+use anyhow::Context;
+use secrecy::{ExposeSecret, SecretString};
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
 use url::Url;
@@ -22,7 +34,7 @@ use crate::prompt::DEFAULT_TRIVIAL_MAX_WORDS;
 mod engines;
 pub use engines::{
     DebertaV3XsmallZeroshotConfig, GoogleApi, GoogleEmbeddingConfig, RemoteEmbeddingConfig,
-    VertexEmbeddingConfig,
+    StaticSecret, VertexEmbeddingConfig,
 };
 
 mod load;
@@ -36,6 +48,7 @@ const APP_NAME: &str = "hyper-mcp-router";
 // ───────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouterConfig {
     pub server: ServerConfig,
     #[serde(default)]
@@ -44,6 +57,7 @@ pub struct RouterConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: String,
@@ -103,6 +117,7 @@ fn default_max_body_bytes() -> usize {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClassifierConfig {
     /// Which classification model(s) to run — a single id, or a **list**
     /// forming a capacity ladder (see `classifier::EngineRoster`): engines
@@ -211,6 +226,7 @@ where
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// Model string sent upstream as `body["model"]`.
     pub name: String,
@@ -219,13 +235,16 @@ pub struct ModelConfig {
     /// per-request failure. `{base_url}/chat/completions` is the forward target.
     #[serde(deserialize_with = "deserialize_http_url")]
     pub base_url: Url,
-    /// Authentication material, or `None` for a keyless backend. A static
-    /// secret (plaintext / env / keyring) is resolved at load; `{ source =
+    /// Authentication material, or `None` for a keyless backend. A plaintext
+    /// / env-expanded string parses straight to a redacted static secret; a
+    /// keyring table parses to an **unresolved marker** looked up by
+    /// [`RouterConfig::resolve_secrets`] after parsing; `{ source =
     /// "google-adc" }` marks the model for per-request Google OAuth tokens
     /// (see [`ModelApiKey`]). An omitted field, an empty string, or a keyring
     /// value that resolves empty all mean "no auth": no `Authorization`
-    /// header is sent. Never logged.
-    #[serde(default, deserialize_with = "resolve_model_api_key")]
+    /// header is sent. Never logged — the secret is a [`SecretString`], so
+    /// even `Debug` output is redacted.
+    #[serde(default, deserialize_with = "deserialize_model_api_key")]
     pub api_key: Option<ModelApiKey>,
     /// Deserialised from `type` (a Rust reserved word).
     #[serde(rename = "type")]
@@ -295,12 +314,23 @@ fn parse_http_url(raw: &str) -> Result<Url, String> {
 // ───────────────────────────────────────────────────────────────────────
 
 /// A routed model's authentication material, as it stands after config load.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ModelApiKey {
-    /// A static secret — plaintext, `${ENV_VAR}`-expanded, or looked up from
-    /// the OS keyring — fully resolved at config load and sent verbatim as
-    /// `Authorization: Bearer`.
-    Static(String),
+    /// A static secret — plaintext, `${ENV_VAR}`-expanded, or resolved from
+    /// the OS keyring — sent verbatim as `Authorization: Bearer`. Held as a
+    /// [`SecretString`], so `Debug` output is redacted.
+    Static(SecretString),
+    /// `api_key = { source = "keyring", service, user }`: an **unresolved**
+    /// OS-keyring reference. Deserialization performs no I/O; the lookup
+    /// happens in [`RouterConfig::resolve_secrets`] (called by
+    /// `config::load`), which replaces this with [`Self::Static`] — or `None`
+    /// when the entry resolves empty.
+    Keyring {
+        /// Keyring service name.
+        service: String,
+        /// Keyring user/account name.
+        user: String,
+    },
     /// `api_key = { source = "google-adc" }`: authenticate with a Google
     /// OAuth 2.0 access token resolved **per request** via Application
     /// Default Credentials (for backends hosted on Vertex AI). Deliberately a
@@ -311,19 +341,44 @@ pub enum ModelApiKey {
     GoogleAdc,
 }
 
+/// Equality compares exposed secret values. Acceptable here: this is config
+/// equality (tests, drift guards), never an authentication check, so a
+/// non-constant-time comparison is fine.
+impl PartialEq for ModelApiKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ModelApiKey::Static(a), ModelApiKey::Static(b)) => {
+                a.expose_secret() == b.expose_secret()
+            }
+            (
+                ModelApiKey::Keyring { service, user },
+                ModelApiKey::Keyring {
+                    service: s2,
+                    user: u2,
+                },
+            ) => service == s2 && user == u2,
+            (ModelApiKey::GoogleAdc, ModelApiKey::GoogleAdc) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ModelApiKey {}
+
 /// Custom deserializer for a routed model's `api_key`. A TOML string yields
-/// the plaintext/env-expanded key verbatim; `{ source = "keyring", service,
-/// user }` triggers an OS keyring lookup at load time (only the resolved
-/// secret is retained); `{ source = "google-adc" }` records the per-request
-/// Google-token marker. An empty resolved value becomes `None` (keyless
-/// backend), so `""` is treated the same as omitting the field.
-fn resolve_model_api_key<'de, D>(deserializer: D) -> Result<Option<ModelApiKey>, D::Error>
+/// the plaintext/env-expanded key verbatim (as a redacted [`SecretString`]);
+/// `{ source = "keyring", service, user }` records an **unresolved** keyring
+/// reference (no I/O here — see [`RouterConfig::resolve_secrets`]);
+/// `{ source = "google-adc" }` records the per-request Google-token marker.
+/// An empty string becomes `None` (keyless backend), the same as omitting
+/// the field.
+fn deserialize_model_api_key<'de, D>(deserializer: D) -> Result<Option<ModelApiKey>, D::Error>
 where
     D: Deserializer<'de>,
 {
     /// Empty string => no auth.
     fn non_empty(s: String) -> Option<ModelApiKey> {
-        (!s.is_empty()).then_some(ModelApiKey::Static(s))
+        (!s.is_empty()).then(|| ModelApiKey::Static(SecretString::from(s)))
     }
 
     struct ApiKeyVisitor;
@@ -372,8 +427,9 @@ where
 }
 
 /// Dispatch a parsed `api_key` table (`source` + optional fields) to its
-/// resolution: keyring lookup, or the `google-adc` marker. String errors are
-/// wrapped by the caller into serde errors.
+/// marker: an unresolved keyring reference, or `google-adc`. **No I/O** —
+/// keyring lookups happen later in [`RouterConfig::resolve_secrets`]. String
+/// errors are wrapped by the caller into serde errors.
 fn api_key_from_table(
     source: Option<String>,
     service: Option<String>,
@@ -384,8 +440,7 @@ fn api_key_from_table(
         "keyring" => {
             let service = service.ok_or("missing field `service`")?;
             let user = user.ok_or("missing field `user`")?;
-            let secret = keyring_secret(&service, &user)?;
-            Ok((!secret.is_empty()).then_some(ModelApiKey::Static(secret)))
+            Ok(Some(ModelApiKey::Keyring { service, user }))
         }
         "google-adc" if service.is_some() || user.is_some() => {
             Err("api_key source `google-adc` takes no `service`/`user` fields".into())
@@ -411,14 +466,19 @@ fn keyring_secret(service: &str, user: &str) -> Result<String, String> {
 /// `api_key` — plaintext / `${ENV_VAR}` / keyring — **except** `google-adc`,
 /// which only makes sense for routed models (the engines own their auth:
 /// Gemini takes real API keys, and the vertex engine already defaults to
-/// ADC).
-fn resolve_api_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+/// ADC). Keyring references stay unresolved until
+/// [`RouterConfig::resolve_secrets`], which only resolves the tables of
+/// **selected** engines.
+fn deserialize_static_secret<'de, D>(deserializer: D) -> Result<Option<StaticSecret>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    match resolve_model_api_key(deserializer)? {
+    match deserialize_model_api_key(deserializer)? {
         None => Ok(None),
-        Some(ModelApiKey::Static(secret)) => Ok(Some(secret)),
+        Some(ModelApiKey::Static(secret)) => Ok(Some(StaticSecret::Resolved(secret))),
+        Some(ModelApiKey::Keyring { service, user }) => {
+            Ok(Some(StaticSecret::Keyring { service, user }))
+        }
         Some(ModelApiKey::GoogleAdc) => Err(de::Error::custom(
             "api_key source `google-adc` is only supported on routed models \
              (`[[models]] api_key`); this field takes a static secret \
@@ -428,8 +488,66 @@ where
 }
 
 impl RouterConfig {
-    /// Field-level and startup coverage validation. Fails fast with a clear
-    /// message on any incomplete configuration.
+    /// Resolve every **unresolved keyring reference** in place: the `api_key`
+    /// of every routed model, and the `api_key`/`access_token` of the engine
+    /// tables of engines actually **selected** by `[classifier] model` —
+    /// unselected tables are deliberately never touched, so a keyring entry
+    /// referenced by an inactive table can neither block loading (an OS
+    /// keyring lookup can prompt or fail) nor be read needlessly.
+    ///
+    /// Called by `config::load` after parse + [`validate`](Self::validate);
+    /// deserialization itself performs no I/O. A keyring entry that resolves
+    /// to an empty string becomes `None` ("no auth"), matching the empty
+    /// plaintext-string behavior.
+    pub fn resolve_secrets(&mut self) -> anyhow::Result<()> {
+        for model in &mut self.models {
+            if let Some(ModelApiKey::Keyring { service, user }) = &model.api_key {
+                let secret = keyring_secret(service, user)
+                    .map_err(anyhow::Error::msg)
+                    .with_context(|| format!("resolving api_key for model `{}`", model.name))?;
+                model.api_key =
+                    (!secret.is_empty()).then(|| ModelApiKey::Static(SecretString::from(secret)));
+            }
+        }
+
+        let selected = self.classifier.models.clone();
+        for engine in selected {
+            match engine {
+                // Embedded local engine: no secrets to resolve.
+                ClassifierModel::DebertaV3XsmallZeroshot => {}
+                ClassifierModel::GeminiEmbedding001 => {
+                    let table = &mut self.classifier.gemini_embedding_001;
+                    StaticSecret::resolve_slot(&mut table.api_key, "gemini-embedding-001")?;
+                    StaticSecret::resolve_slot(&mut table.access_token, "gemini-embedding-001")?;
+                }
+                ClassifierModel::GeminiEmbedding2 => {
+                    let table = &mut self.classifier.gemini_embedding_2;
+                    StaticSecret::resolve_slot(&mut table.api_key, "gemini-embedding-2")?;
+                    StaticSecret::resolve_slot(&mut table.access_token, "gemini-embedding-2")?;
+                }
+                ClassifierModel::TextEmbedding005 => {
+                    StaticSecret::resolve_slot(
+                        &mut self.classifier.text_embedding_005.access_token,
+                        "text-embedding-005",
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Schema-level validation: a non-empty model catalogue, a well-formed
+    /// classifier ladder list, per-model modality declarations, and text
+    /// coverage ([`validate_coverage`](Self::validate_coverage)). Fails fast
+    /// with a clear message.
+    ///
+    /// Deliberately **not** the whole story: per-engine table completeness
+    /// (API surface choice, required Vertex `project`/`location`, distinct
+    /// ladder budgets) is validated by `engines::validate_config` — those
+    /// rules are engine knowledge, and `config` cannot depend on `engines`.
+    /// Both `serve` (via `engines::build_roster`) and the `validate`
+    /// subcommand run that check; a config passing here alone may still be
+    /// rejected there.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.models.is_empty() {
             anyhow::bail!("no [[models]] configured");
@@ -472,115 +590,11 @@ impl RouterConfig {
         }
         Ok(())
     }
-
-    /// Pick the model whose declared modalities are a **superset** of
-    /// `required` and whose context window fits `estimated_tokens`, preferring
-    /// `complexity`. Returns `None` when no single model covers the whole
-    /// modality set (the proxy then returns 422).
-    ///
-    /// Ranking among fitting survivors: exact type match → nearest higher type
-    /// (escalation) → highest lower type. Ties break toward the first-declared
-    /// model in config. When no covering model fits, the largest-window one is
-    /// chosen as a best effort — see [`select_candidate`].
-    pub fn select_model(
-        &self,
-        required: &ModalitySet,
-        complexity: ModelTier,
-        estimated_tokens: u64,
-    ) -> Option<&ModelConfig> {
-        select_candidate(
-            self.models.iter(),
-            |m| m,
-            required,
-            complexity,
-            estimated_tokens,
-        )
-    }
-
-    /// How many models can serve `required` (declare a superset of it) within
-    /// their context window. When this is `<= 1` the complexity tier is
-    /// irrelevant — there is nothing to rank — so the proxy can skip
-    /// classification entirely and route directly.
-    pub fn candidate_count(&self, required: &ModalitySet, estimated_tokens: u64) -> usize {
-        count_candidates(self.models.iter(), |m| m, required, estimated_tokens)
-    }
 }
 
-/// The model-selection policy, generic over any collection of model-bearing
-/// items — the one implementation behind [`RouterConfig::select_model`]
-/// (pure config) and the proxy's runtime catalogue (config paired with
-/// resolved auth). `model_of` projects an item to its [`ModelConfig`].
-///
-/// 1. Filter by capability (superset), preserving declaration order.
-/// 2. Keep candidates whose context window fits `estimated_tokens` — a
-///    "fast" model with a small window must never receive a request that
-///    cannot fit in it, regardless of the complexity verdict.
-/// 3. Rank fitting survivors: exact type → nearest higher (escalation) →
-///    highest lower (fallback); `min_by_key` returns the first minimum, so a
-///    tie resolves toward the earlier-declared item.
-/// 4. When NO covering candidate fits, fall back to the largest declared
-///    window (best tier rank, then declaration order, break ties). The size
-///    estimate is a chars-per-token heuristic, so a hard local rejection
-///    could refuse requests the backend would actually accept — forwarding
-///    to the most capacious backend lets the upstream be the judge.
-pub(crate) fn select_candidate<'a, T: 'a>(
-    items: impl IntoIterator<Item = &'a T>,
-    model_of: impl Fn(&T) -> &ModelConfig,
-    required: &ModalitySet,
-    complexity: ModelTier,
-    estimated_tokens: u64,
-) -> Option<&'a T> {
-    let covering: Vec<&'a T> = items
-        .into_iter()
-        .filter(|item| model_of(item).modality_set().is_superset(required))
-        .collect();
-    covering
-        .iter()
-        .copied()
-        .filter(|item| model_of(item).fits_context(estimated_tokens))
-        .min_by_key(|item| tier_rank(model_of(item).tier, complexity))
-        .or_else(|| {
-            covering.into_iter().min_by_key(|item| {
-                let m = model_of(item);
-                (
-                    Reverse(m.context_window.get()),
-                    tier_rank(m.tier, complexity),
-                )
-            })
-        })
-}
-
-/// Companion to [`select_candidate`]: how many items could serve `required`
-/// within their context window. When this is `<= 1` the complexity tier is
-/// irrelevant (nothing to rank).
-pub(crate) fn count_candidates<'a, T: 'a>(
-    items: impl IntoIterator<Item = &'a T>,
-    model_of: impl Fn(&T) -> &ModelConfig,
-    required: &ModalitySet,
-    estimated_tokens: u64,
-) -> usize {
-    items
-        .into_iter()
-        .filter(|item| {
-            let m = model_of(item);
-            m.modality_set().is_superset(required) && m.fits_context(estimated_tokens)
-        })
-        .count()
-}
-
-/// Distance ranking for model selection. Lower is better:
-/// exact type (0) < escalation (nearest higher) < fallback (highest lower).
-fn tier_rank(tier: ModelTier, want: ModelTier) -> i32 {
-    let t = tier as i32;
-    let w = want as i32;
-    if t == w {
-        0
-    } else if t > w {
-        10 + (t - w) // escalate: prefer the nearest higher type
-    } else {
-        100 + (w - t) // fallback: prefer the highest lower type
-    }
-}
+// Model-selection policy (`select_candidate`, `count_candidates`, tier
+// ranking) lives in `crate::selection` — it is routing policy over the
+// parsed catalogue, not schema.
 
 #[cfg(test)]
 mod tests {
@@ -803,7 +817,24 @@ port = 8080
     }
 
     #[test]
-    fn api_key_keyring_when_store_available() {
+    fn api_key_keyring_parses_hermetically_without_io() {
+        // A keyring reference must parse to an UNRESOLVED marker with no OS
+        // keyring I/O — the entry deliberately does not exist, and parsing
+        // must still succeed. Resolution happens later, in resolve_secrets.
+        let cfg = parse_single_model(&format!(
+            "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"keyring\", service = \"hyper-mcp-router-no-such-service\", user = \"nobody\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
+        ));
+        assert_eq!(
+            cfg.models[0].api_key,
+            Some(ModelApiKey::Keyring {
+                service: "hyper-mcp-router-no-such-service".into(),
+                user: "nobody".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_secrets_resolves_model_keyring_when_store_available() {
         // Gate on store availability, as hyper-mcp does.
         let service = "hyper-mcp-router-test";
         let user = "keyring-probe";
@@ -813,14 +844,83 @@ port = 8080
             eprintln!("keyring store unavailable; skipping");
             return;
         };
-        let cfg = parse_single_model(&format!(
+        let mut cfg = parse_single_model(&format!(
             "{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key={{ source = \"keyring\", service = \"{service}\", user = \"{user}\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
         ));
+        cfg.resolve_secrets().expect("resolution should succeed");
         assert_eq!(
             cfg.models[0].api_key,
             Some(ModelApiKey::Static("sk-keyring-secret".into()))
         );
         let _ = entry.delete_credential();
+    }
+
+    #[test]
+    fn resolve_secrets_names_the_model_on_keyring_failure() {
+        // A nonexistent keyring entry on a ROUTED model is a resolution
+        // error naming the model (whatever the platform's store situation,
+        // looking up a missing entry cannot succeed).
+        let mut cfg = parse_single_model(&format!(
+            "{BASE}\n[[models]]\nname=\"frontier\"\nbase_url=\"http://u\"\napi_key={{ source = \"keyring\", service = \"hyper-mcp-router-no-such-service\", user = \"nobody\" }}\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
+        ));
+        let err = format!("{:#}", cfg.resolve_secrets().unwrap_err());
+        assert!(err.contains("frontier"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_secrets_skips_unselected_engine_tables() {
+        // The gemini table references a keyring entry that does not exist,
+        // but the engine is NOT selected ([classifier] model defaults to the
+        // embedded deberta), so resolution must neither fail nor touch the
+        // keyring — the reference stays unresolved.
+        let mut cfg = parse(&format!(
+            "{BASE}\n[classifier.gemini-embedding-2]\napi_key={{ source = \"keyring\", service = \"hyper-mcp-router-no-such-service\", user = \"nobody\" }}\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
+        ))
+        .unwrap();
+        cfg.resolve_secrets()
+            .expect("unselected engine tables must not be resolved");
+        assert!(matches!(
+            cfg.classifier.gemini_embedding_2.api_key,
+            Some(StaticSecret::Keyring { .. })
+        ));
+    }
+
+    // ── secret redaction (Debug must never print a credential) ────────
+    #[test]
+    fn debug_output_redacts_all_secrets() {
+        let cfg = parse(&format!(
+            "{BASE}\n[classifier.gemini-embedding-2]\napi_key=\"sk-engine-secret\"\n\
+             [classifier.text-embedding-005]\nproject=\"p\"\nlocation=\"us\"\naccess_token=\"ya29-token-secret\"\n\
+             [[models]]\nname=\"m\"\nbase_url=\"http://u\"\napi_key=\"sk-model-secret\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n"
+        ))
+        .unwrap();
+        let debug = format!("{cfg:?}");
+        for secret in ["sk-model-secret", "sk-engine-secret", "ya29-token-secret"] {
+            assert!(
+                !debug.contains(secret),
+                "Debug output leaked `{secret}`: {debug}"
+            );
+        }
+        assert!(debug.contains("REDACTED"), "got: {debug}");
+    }
+
+    // ── unknown-field rejection (typos must be loud) ──────────────────
+    #[test]
+    fn unknown_fields_are_rejected() {
+        let model_block = "[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n";
+        // Top-level, [server], [classifier] typo, [[models]] typo, and an
+        // unknown engine table must all fail to parse rather than be dropped.
+        let cases = [
+            format!("{BASE}\n[not_a_section]\nx=1\n{model_block}"),
+            format!("[server]\nhost=\"0.0.0.0\"\nport=1\nmax_body_byte=1\n{model_block}"),
+            format!("{BASE}\n[classifier]\ntrivial_max_word=3\n{model_block}"),
+            format!("{BASE}\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\ncontext_windows=1\n"),
+            format!("{BASE}\n[classifier.gemini-embeding-2]\napi_key=\"k\"\n{model_block}"),
+        ];
+        for case in cases {
+            assert!(parse(&case).is_err(), "should reject: {case}");
+        }
     }
 
     #[test]
@@ -887,9 +987,9 @@ port = 8080
         assert!(err.to_string().contains("http or https"), "got: {err}");
     }
 
-    // ── select_model ──────────────────────────────────────────────────────────
-    /// A model with an effectively unbounded window, for tests that exercise
-    /// the modality/tier axes without a capacity constraint.
+    // ── selection policy: see `crate::selection::tests` ────────────────
+
+    /// A model with an effectively unbounded window, for the coverage tests.
     fn model(name: &str, tier: ModelTier, mods: &[Modality]) -> ModelConfig {
         model_ctx(name, tier, mods, u64::MAX)
     }
@@ -899,7 +999,7 @@ port = 8080
         ModelConfig {
             name: name.to_string(),
             base_url: Url::parse("http://x").unwrap(),
-            api_key: Some(ModelApiKey::Static("k".to_string())),
+            api_key: Some(ModelApiKey::Static(SecretString::from("k"))),
             tier,
             modalities: mods.to_vec(),
             context_window: NonZeroU64::new(window).expect("nonzero window"),
@@ -912,122 +1012,6 @@ port = 8080
             classifier: ClassifierConfig::default(),
             models,
         }
-    }
-
-    fn req(mods: &[Modality]) -> ModalitySet {
-        mods.iter().copied().collect()
-    }
-
-    #[test]
-    fn select_superset_excludes_missing_modality() {
-        let cfg = catalogue(vec![
-            model("text-only", ModelTier::Balanced, &[Modality::Text]),
-            model(
-                "vision",
-                ModelTier::Balanced,
-                &[Modality::Text, Modality::ImageInput],
-            ),
-        ]);
-        let chosen = cfg
-            .select_model(
-                &req(&[Modality::Text, Modality::ImageInput]),
-                ModelTier::Balanced,
-                0,
-            )
-            .unwrap();
-        assert_eq!(chosen.name, "vision");
-    }
-
-    #[test]
-    fn select_exact_type_wins() {
-        let cfg = catalogue(vec![
-            model("fast", ModelTier::Fast, &[Modality::Text]),
-            model("balanced", ModelTier::Balanced, &[Modality::Text]),
-            model("frontier", ModelTier::Frontier, &[Modality::Text]),
-        ]);
-        let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Balanced, 0)
-            .unwrap();
-        assert_eq!(chosen.name, "balanced");
-    }
-
-    #[test]
-    fn select_escalates_to_nearest_higher() {
-        let cfg = catalogue(vec![
-            model("fast", ModelTier::Fast, &[Modality::Text]),
-            model("frontier", ModelTier::Frontier, &[Modality::Text]),
-        ]);
-        // want Balanced, none exact => nearest higher is Frontier.
-        let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Balanced, 0)
-            .unwrap();
-        assert_eq!(chosen.name, "frontier");
-    }
-
-    #[test]
-    fn select_falls_back_to_highest_lower() {
-        let cfg = catalogue(vec![
-            model("fast", ModelTier::Fast, &[Modality::Text]),
-            model("balanced", ModelTier::Balanced, &[Modality::Text]),
-        ]);
-        // want Frontier, nothing at/above => highest lower is Balanced.
-        let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Frontier, 0)
-            .unwrap();
-        assert_eq!(chosen.name, "balanced");
-    }
-
-    #[test]
-    fn select_first_declared_wins_on_tie() {
-        let cfg = catalogue(vec![
-            model("first", ModelTier::Balanced, &[Modality::Text]),
-            model("second", ModelTier::Balanced, &[Modality::Text]),
-        ]);
-        let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Balanced, 0)
-            .unwrap();
-        assert_eq!(chosen.name, "first");
-    }
-
-    #[test]
-    fn select_covers_combination() {
-        let cfg = catalogue(vec![model(
-            "voice",
-            ModelTier::Balanced,
-            &[Modality::Text, Modality::AudioInput, Modality::AudioOutput],
-        )]);
-        let chosen = cfg
-            .select_model(
-                &req(&[Modality::AudioInput, Modality::AudioOutput]),
-                ModelTier::Balanced,
-                0,
-            )
-            .unwrap();
-        assert_eq!(chosen.name, "voice");
-    }
-
-    #[test]
-    fn select_uncovered_combination_returns_none() {
-        let cfg = catalogue(vec![
-            model(
-                "audio-in",
-                ModelTier::Balanced,
-                &[Modality::Text, Modality::AudioInput],
-            ),
-            model(
-                "audio-out",
-                ModelTier::Balanced,
-                &[Modality::Text, Modality::AudioOutput],
-            ),
-        ]);
-        // No single model covers both directions.
-        assert!(cfg
-            .select_model(
-                &req(&[Modality::AudioInput, Modality::AudioOutput]),
-                ModelTier::Balanced,
-                0
-            )
-            .is_none());
     }
 
     // ── coverage validation ─────────────────────────────────────────────────
@@ -1066,7 +1050,7 @@ port = 8080
     #[test]
     fn coverage_passes_with_text_in_a_single_tier() {
         // Text is the only mandatory coverage, and it need exist in just one
-        // tier. Complexity requests fall back to it via `select_model`.
+        // tier. Complexity requests fall back to it via selection policy.
         let cfg = catalogue(vec![model("only", ModelTier::Balanced, &[Modality::Text])]);
         assert!(cfg.validate_coverage().is_ok());
     }
@@ -1093,150 +1077,12 @@ port = 8080
         assert!(err.to_string().contains("text"), "got: {err}");
     }
 
+    // ── context-window fit ────────────────────────────────────────
     #[test]
-    fn candidate_count_reflects_superset_matches() {
-        let cfg = catalogue(vec![
-            model("a", ModelTier::Fast, &[Modality::Text]),
-            model("b", ModelTier::Balanced, &[Modality::Text]),
-            model(
-                "vision",
-                ModelTier::Balanced,
-                &[Modality::Text, Modality::ImageInput],
-            ),
-        ]);
-        // Three text models can serve plain text.
-        assert_eq!(cfg.candidate_count(&req(&[Modality::Text]), 0), 3);
-        // Only the vision model can serve image input.
-        assert_eq!(
-            cfg.candidate_count(&req(&[Modality::Text, Modality::ImageInput]), 0),
-            1
-        );
-        // Nothing serves audio output.
-        assert_eq!(cfg.candidate_count(&req(&[Modality::AudioOutput]), 0), 0);
-    }
-
-    #[test]
-    fn select_tools_requires_tool_capable_model() {
-        let cfg = catalogue(vec![
-            model("plain", ModelTier::Balanced, &[Modality::Text]),
-            model(
-                "agent",
-                ModelTier::Frontier,
-                &[Modality::Text, Modality::Tools],
-            ),
-        ]);
-        // A tools request skips the non-tool model even though `plain` is the
-        // closer tier match; capability is a hard constraint.
-        let chosen = cfg
-            .select_model(
-                &req(&[Modality::Text, Modality::Tools]),
-                ModelTier::Balanced,
-                0,
-            )
-            .unwrap();
-        assert_eq!(chosen.name, "agent");
-        // Without the tools requirement, tier preference picks `plain`.
-        let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Balanced, 0)
-            .unwrap();
-        assert_eq!(chosen.name, "plain");
-    }
-
-    // ── context-window fit ────────────────────────────────────────────
-    #[test]
-    fn select_skips_models_whose_window_cannot_fit_the_request() {
-        // The fast model's tier matches, but its 8k window cannot hold a
-        // 100k-token request: capacity beats tier preference.
-        let cfg = catalogue(vec![
-            model_ctx("fast-small", ModelTier::Fast, &[Modality::Text], 8_000),
-            model_ctx(
-                "frontier-big",
-                ModelTier::Frontier,
-                &[Modality::Text],
-                200_000,
-            ),
-        ]);
-        let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Fast, 100_000)
-            .unwrap();
-        assert_eq!(chosen.name, "frontier-big");
-        // A small request still routes by tier preference.
-        let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Fast, 500)
-            .unwrap();
-        assert_eq!(chosen.name, "fast-small");
-    }
-
-    #[test]
-    fn select_window_boundary_is_inclusive() {
-        let cfg = catalogue(vec![model_ctx(
-            "m",
-            ModelTier::Fast,
-            &[Modality::Text],
-            8_000,
-        )]);
-        assert!(cfg.models[0].fits_context(8_000));
-        assert!(!cfg.models[0].fits_context(8_001));
-    }
-
-    #[test]
-    fn select_falls_back_to_largest_window_when_nothing_fits() {
-        // The estimate is a heuristic, so an oversized request is forwarded
-        // to the most capacious covering model (best effort) rather than
-        // rejected locally.
-        let cfg = catalogue(vec![
-            model_ctx("small", ModelTier::Fast, &[Modality::Text], 8_000),
-            model_ctx("medium", ModelTier::Balanced, &[Modality::Text], 32_000),
-            model_ctx("large", ModelTier::Frontier, &[Modality::Text], 128_000),
-        ]);
-        let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Fast, 1_000_000)
-            .unwrap();
-        assert_eq!(chosen.name, "large");
-    }
-
-    #[test]
-    fn select_fallback_still_respects_modalities() {
-        // Best-effort capacity fallback never overrides a capability
-        // constraint: an uncovered modality set stays a 422, whatever the size.
-        let cfg = catalogue(vec![model_ctx(
-            "small",
-            ModelTier::Fast,
-            &[Modality::Text],
-            8_000,
-        )]);
-        assert!(cfg
-            .select_model(&req(&[Modality::AudioOutput]), ModelTier::Fast, 1_000_000)
-            .is_none());
-    }
-
-    #[test]
-    fn select_fallback_breaks_window_ties_by_tier_then_declaration() {
-        let cfg = catalogue(vec![
-            model_ctx("fast-a", ModelTier::Fast, &[Modality::Text], 8_000),
-            model_ctx("balanced", ModelTier::Balanced, &[Modality::Text], 8_000),
-            model_ctx("fast-b", ModelTier::Fast, &[Modality::Text], 8_000),
-        ]);
-        // Nothing fits 100k; all windows tie at 8k → the wanted tier wins,
-        // then declaration order.
-        let chosen = cfg
-            .select_model(&req(&[Modality::Text]), ModelTier::Fast, 100_000)
-            .unwrap();
-        assert_eq!(chosen.name, "fast-a");
-    }
-
-    #[test]
-    fn candidate_count_reflects_context_fit() {
-        let cfg = catalogue(vec![
-            model_ctx("small", ModelTier::Fast, &[Modality::Text], 8_000),
-            model_ctx("large", ModelTier::Frontier, &[Modality::Text], 128_000),
-        ]);
-        assert_eq!(cfg.candidate_count(&req(&[Modality::Text]), 500), 2);
-        // Only the large model fits: a single candidate, so the proxy can
-        // skip classification — the tier cannot change the outcome.
-        assert_eq!(cfg.candidate_count(&req(&[Modality::Text]), 100_000), 1);
-        // Nothing fits: zero FITTING candidates (selection then falls back).
-        assert_eq!(cfg.candidate_count(&req(&[Modality::Text]), 1_000_000), 0);
+    fn context_window_boundary_is_inclusive() {
+        let m = model_ctx("m", ModelTier::Fast, &[Modality::Text], 8_000);
+        assert!(m.fits_context(8_000));
+        assert!(!m.fits_context(8_001));
     }
 
     #[test]

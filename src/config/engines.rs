@@ -4,24 +4,115 @@
 //! (including the auth-driven Google API surface choice); parsing, env
 //! expansion, key resolution, and the model catalogue stay in `config`.
 
+use anyhow::Context;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use url::Url;
 
-use super::{deserialize_opt_http_url, resolve_api_key};
+use super::{deserialize_opt_http_url, deserialize_static_secret, keyring_secret};
+
+/// A classifier engine table's static secret (`api_key` / `access_token`):
+/// either already **resolved** (plaintext or `${ENV_VAR}`-expanded, held
+/// redacted as a [`SecretString`]) or an **unresolved keyring reference**.
+/// Deserialization performs no I/O; `config::load` resolves the tables of
+/// engines actually selected by `[classifier] model` (see
+/// [`super::RouterConfig::resolve_secrets`]). Never logged — `Debug` output
+/// redacts the value.
+#[derive(Debug, Clone)]
+pub enum StaticSecret {
+    /// A resolved secret, ready to use.
+    Resolved(SecretString),
+    /// An OS-keyring reference, not yet looked up.
+    Keyring {
+        /// Keyring service name.
+        service: String,
+        /// Keyring user/account name.
+        user: String,
+    },
+}
+
+impl StaticSecret {
+    /// The resolved secret value. Errs on an unresolved keyring reference —
+    /// engines only ever see configs whose selected tables were resolved at
+    /// load, so hitting this means the config skipped `resolve_secrets`
+    /// (e.g. a caller wired an engine up manually).
+    pub fn resolved(&self) -> anyhow::Result<&SecretString> {
+        match self {
+            StaticSecret::Resolved(secret) => Ok(secret),
+            StaticSecret::Keyring { service, user } => Err(anyhow::anyhow!(
+                "keyring secret (service={service}, user={user}) was never resolved; \
+                 config::load resolves the tables of selected engines — call \
+                 RouterConfig::resolve_secrets after parsing"
+            )),
+        }
+    }
+
+    /// Resolve a slot in place: a keyring reference is looked up (empty ⇒
+    /// the slot becomes `None`, matching empty-plaintext behavior); resolved
+    /// values pass through. `engine` names the table in errors.
+    pub(crate) fn resolve_slot(
+        slot: &mut Option<StaticSecret>,
+        engine: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(StaticSecret::Keyring { service, user }) = slot {
+            let secret = keyring_secret(service, user)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("resolving a secret for [classifier.{engine}]"))?;
+            *slot =
+                (!secret.is_empty()).then(|| StaticSecret::Resolved(SecretString::from(secret)));
+        }
+        Ok(())
+    }
+}
+
+/// Equality compares exposed values — config equality for tests and drift
+/// guards, never an authentication check.
+impl PartialEq for StaticSecret {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (StaticSecret::Resolved(a), StaticSecret::Resolved(b)) => {
+                a.expose_secret() == b.expose_secret()
+            }
+            (
+                StaticSecret::Keyring { service, user },
+                StaticSecret::Keyring {
+                    service: s2,
+                    user: u2,
+                },
+            ) => service == s2 && user == u2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for StaticSecret {}
+
+impl From<&str> for StaticSecret {
+    fn from(s: &str) -> Self {
+        StaticSecret::Resolved(SecretString::from(s))
+    }
+}
+
+impl From<String> for StaticSecret {
+    fn from(s: String) -> Self {
+        StaticSecret::Resolved(SecretString::from(s))
+    }
+}
 
 /// Settings for a remote embedding engine on the Generative Language API
 /// (the transport slice consumed by `engines/gemini`). Remote engines have no
 /// local session pool; their "sessions" are concurrent in-flight API
 /// requests.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteEmbeddingConfig {
     /// API key for the provider. **Required when the engine is selected**
     /// (engine construction fails at startup without it). Resolves exactly
     /// like a routed model's `api_key`: a plaintext/env-expanded string or a
     /// `{ source = "keyring", service, user }` table; an empty resolved value
-    /// counts as absent. Never logged.
-    #[serde(default, deserialize_with = "resolve_api_key")]
-    pub api_key: Option<String>,
+    /// counts as absent. Never logged (redacted [`StaticSecret`]).
+    #[serde(default, deserialize_with = "deserialize_static_secret")]
+    pub api_key: Option<StaticSecret>,
     /// Endpoint override (e.g. a proxy/gateway, or a mock in tests). Must be
     /// http/https. Defaults to the provider's public endpoint.
     #[serde(default, deserialize_with = "deserialize_opt_http_url")]
@@ -42,6 +133,7 @@ pub struct RemoteEmbeddingConfig {
 /// `access_token` instead of a plain `api_key`. Also the transport slice
 /// consumed by `engines/vertex` for every Vertex engine.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VertexEmbeddingConfig {
     /// GCP project id. **Required when the engine is selected** (engine
     /// construction fails at startup without it).
@@ -79,9 +171,9 @@ pub struct VertexEmbeddingConfig {
     /// quick tests (`gcloud auth print-access-token`), but such tokens expire
     /// in ~1h. Resolves exactly like a routed model's `api_key` (a
     /// plaintext/env-expanded string or a keyring table); an empty resolved
-    /// value counts as absent. Never logged.
-    #[serde(default, deserialize_with = "resolve_api_key")]
-    pub access_token: Option<String>,
+    /// value counts as absent. Never logged (redacted [`StaticSecret`]).
+    #[serde(default, deserialize_with = "deserialize_static_secret")]
+    pub access_token: Option<StaticSecret>,
     /// Endpoint override (e.g. a proxy/gateway, or a mock in tests). Must be
     /// http/https. Defaults to the regional Vertex host derived from
     /// `location`.
@@ -157,12 +249,13 @@ pub enum GoogleApi {
 /// [`Self::surface`]: `api_key` means Generative Language; `project` (with
 /// ADC or `access_token`) means Vertex. Setting both is a startup error.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GoogleEmbeddingConfig {
     /// Generative-Language credential. Setting it selects that surface.
     /// Resolves like a routed model's static key; empty counts as absent.
-    /// Never logged.
-    #[serde(default, deserialize_with = "resolve_api_key")]
-    pub api_key: Option<String>,
+    /// Never logged (redacted [`StaticSecret`]).
+    #[serde(default, deserialize_with = "deserialize_static_secret")]
+    pub api_key: Option<StaticSecret>,
     /// GCP project id. Setting it selects the **Vertex AI** surface.
     #[serde(default)]
     pub project: Option<String>,
@@ -179,8 +272,8 @@ pub struct GoogleEmbeddingConfig {
     /// Optional static Vertex token override of ADC (see
     /// [`VertexEmbeddingConfig::access_token`]). Ignored on the
     /// Generative-Language surface.
-    #[serde(default, deserialize_with = "resolve_api_key")]
-    pub access_token: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_static_secret")]
+    pub access_token: Option<StaticSecret>,
     /// Endpoint override for whichever surface is selected.
     #[serde(default, deserialize_with = "deserialize_opt_http_url")]
     pub base_url: Option<Url>,
@@ -255,6 +348,7 @@ impl GoogleEmbeddingConfig {
 /// for the embedded NLI engine (local ORT sessions). Other engines have
 /// their own concurrency models and their own tables.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DebertaV3XsmallZeroshotConfig {
     /// Concurrent ORT inference sessions. Omit for auto-sizing from the
     /// detected core count and memory budget (see
@@ -295,7 +389,7 @@ mod tests {
         assert_eq!(cfg.classifier.models, [ClassifierModel::GeminiEmbedding001]);
         let g1 = &cfg.classifier.gemini_embedding_001;
         // Env-expanded, exactly like a routed model's key.
-        assert_eq!(g1.api_key.as_deref(), Some("g-key"));
+        assert_eq!(g1.api_key, Some("g-key".into()));
         assert_eq!(
             g1.base_url.as_ref().unwrap().as_str(),
             "http://localhost:9/"
@@ -303,8 +397,8 @@ mod tests {
         assert_eq!(g1.max_concurrency, Some(8));
         assert_eq!(g1.request_timeout_secs, Some(5));
         assert_eq!(
-            cfg.classifier.gemini_embedding_2.api_key.as_deref(),
-            Some("plain-key")
+            cfg.classifier.gemini_embedding_2.api_key,
+            Some("plain-key".into())
         );
     }
 
@@ -323,7 +417,7 @@ mod tests {
         assert_eq!(te5.project.as_deref(), Some("my-proj"));
         assert_eq!(te5.location.as_deref(), Some("us-east1"));
         assert_eq!(te5.quota_project.as_deref(), Some("billing-proj"));
-        assert_eq!(te5.access_token.as_deref(), Some("te5-token"));
+        assert_eq!(te5.access_token, Some("te5-token".into()));
         assert_eq!(te5.max_concurrency, Some(16));
     }
 
@@ -423,7 +517,7 @@ mod tests {
         assert_eq!(v.project.as_deref(), Some("p"));
         assert_eq!(v.location.as_deref(), Some("europe-west4"));
         assert_eq!(v.quota_project.as_deref(), Some("q"));
-        assert_eq!(v.access_token.as_deref(), Some("tok"));
+        assert_eq!(v.access_token, Some("tok".into()));
         assert_eq!(v.max_concurrency, Some(4));
         // And the GL slice carries the GL fields (api_key absent here).
         assert_eq!(g.to_generative_language().api_key, None);

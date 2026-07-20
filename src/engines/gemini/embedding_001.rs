@@ -14,11 +14,12 @@
 //! window and current turn) to the Gemini API.
 
 use crate::config::ClassifierConfig;
+use crate::engines::embedding::{RemoteEmbeddingEngine, RemoteSpec};
 
-use super::{GeminiEmbedding, GeminiSpec};
+use super::GeminiTransport;
 
 /// Model-specific parameters for `gemini-embedding-001`.
-pub const SPEC: GeminiSpec = GeminiSpec {
+pub const SPEC: RemoteSpec = RemoteSpec {
     name: "gemini-embedding-001",
     api_model: "models/gemini-embedding-001",
     // 2048-token input limit; ~4 chars/token with headroom.
@@ -40,12 +41,14 @@ const _: () = {
 
 /// Build the engine from the Generative-Language slice of its
 /// `[classifier.gemini-embedding-001]` table.
-pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<GeminiEmbedding> {
+pub async fn build(
+    cfg: &ClassifierConfig,
+) -> anyhow::Result<RemoteEmbeddingEngine<GeminiTransport>> {
     let threshold = cfg
         .gemini_embedding_001
         .image_generation_threshold
         .unwrap_or(cfg.image_generation_threshold);
-    GeminiEmbedding::connect(
+    super::connect(
         &SPEC,
         &cfg.gemini_embedding_001.to_generative_language(),
         threshold,

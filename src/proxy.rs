@@ -22,14 +22,17 @@ use serde_json::{json, Value};
 
 use anyhow::Context;
 
+use secrecy::{ExposeSecret, SecretString};
+
 use crate::classifier::{Classification, ClassifierEngine, EngineRoster, ModelTier};
-use crate::config::{count_candidates, select_candidate, ModelApiKey, ModelConfig, RouterConfig};
+use crate::config::{ModelApiKey, ModelConfig, RouterConfig};
 use crate::gcp_auth::{self, AccessTokenCredentials};
 use crate::modality::{detect_required_modalities, Modality, ModalitySet};
 use crate::prompt::{
     build_classification_window, estimate_request_tokens, extract_prompt, has_nonempty_user_text,
     looks_like_image_generation, truncate_prompt,
 };
+use crate::selection::{count_candidates, select_candidate};
 
 /// Shared, cloneable server state. The classifiers are trait objects on a
 /// capacity ladder ([`EngineRoster`]) — the proxy is engine-agnostic; each
@@ -72,6 +75,15 @@ impl RoutedModel {
                 let auth = match &m.api_key {
                     None => ModelAuth::None,
                     Some(ModelApiKey::Static(key)) => ModelAuth::Static(key.clone()),
+                    // Keyring references are resolved by `config::load`
+                    // (RouterConfig::resolve_secrets) before the proxy is
+                    // built; one surviving here means a caller skipped it.
+                    Some(ModelApiKey::Keyring { service, user }) => anyhow::bail!(
+                        "model `{}` still carries an unresolved keyring reference \
+                         (service={service}, user={user}); call \
+                         RouterConfig::resolve_secrets after parsing",
+                        m.name
+                    ),
                     Some(ModelApiKey::GoogleAdc) => {
                         ModelAuth::GoogleAdc(shared_adc(&mut adc, &m.name)?)
                     }
@@ -92,8 +104,9 @@ impl RoutedModel {
 pub enum ModelAuth {
     /// Keyless backend: no `Authorization` header.
     None,
-    /// Static secret (plaintext / env / keyring), sent verbatim.
-    Static(String),
+    /// Static secret (plaintext / env / keyring), sent verbatim. Held
+    /// redacted; the only exposure is building the `Authorization` header.
+    Static(SecretString),
     /// A current Google OAuth token per request via Application Default
     /// Credentials (cached/refreshed by the auth library). Every `google-adc`
     /// model shares one process-wide credential — ADC identifies the process
@@ -109,7 +122,7 @@ impl ModelAuth {
     async fn bearer(&self, model: &str) -> Result<Option<String>, Box<Response>> {
         match self {
             ModelAuth::None => Ok(None),
-            ModelAuth::Static(key) => Ok(Some(key.clone())),
+            ModelAuth::Static(key) => Ok(Some(key.expose_secret().to_owned())),
             ModelAuth::GoogleAdc(credentials) => adc_bearer(credentials, model).await.map(Some),
         }
     }
@@ -518,7 +531,7 @@ fn try_require_image_output(
 ) -> bool {
     let mut with_image = *required;
     with_image.insert(Modality::ImageOutput);
-    if config.candidate_count(&with_image, estimated_tokens) > 0 {
+    if count_candidates(config.models.iter(), |m| m, &with_image, estimated_tokens) > 0 {
         *required = with_image;
         true
     } else {
@@ -798,7 +811,34 @@ mod tests {
         assert_eq!(routed[0].config.name, "keyless");
         assert!(matches!(routed[0].auth, ModelAuth::None));
         assert_eq!(routed[1].config.name, "keyed");
-        assert!(matches!(&routed[1].auth, ModelAuth::Static(k) if k == "sk-1"));
+        assert!(matches!(&routed[1].auth, ModelAuth::Static(k) if k.expose_secret() == "sk-1"));
+    }
+
+    #[test]
+    fn routed_models_reject_unresolved_keyring_references() {
+        // An unresolved keyring marker surviving to proxy construction is a
+        // programming error (config::load resolves them); it must be a loud
+        // boot failure naming the model, never a silent keyless backend.
+        let mut keyed = model("keyed", &[Modality::Text]);
+        keyed.api_key = Some(crate::config::ModelApiKey::Keyring {
+            service: "svc".into(),
+            user: "u".into(),
+        });
+        let cfg = crate::config::RouterConfig {
+            server: Default::default(),
+            classifier: Default::default(),
+            models: vec![keyed],
+        };
+        // (`match` rather than `unwrap_err`: `RoutedModel` has no `Debug` —
+        // deliberately, it carries a resolved credential.)
+        let err = match RoutedModel::resolve_all(&cfg) {
+            Ok(_) => panic!("unresolved keyring reference must fail resolution"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("keyed") && err.contains("unresolved"),
+            "got: {err}"
+        );
     }
 
     // ── n validation ──────────────────────────────────────────────────

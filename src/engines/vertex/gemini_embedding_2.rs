@@ -7,19 +7,21 @@
 //! Unlike its `-001` sibling this model has **no `:predict` surface** on
 //! Vertex; it is served only through `:embedContent`, and only at the `us`
 //! multi-region and `global` locations (both live-verified — regional
-//! locations return NOT_FOUND). It therefore rides the [`VertexEmbedContent`]
-//! transport flavor: one text per request, concurrent fan-out for batches.
+//! locations return NOT_FOUND). It therefore rides the
+//! [`VertexEmbedContentTransport`] flavor: one text per request, concurrent
+//! fan-out for batches.
 //! Configure `location = "us"` (or `"global"`).
 //!
 //! Privacy note: selecting this engine sends prompt text (the classification
 //! window and current turn) to the Vertex AI API.
 
 use crate::config::ClassifierConfig;
+use crate::engines::embedding::{RemoteEmbeddingEngine, RemoteSpec};
 
-use super::{VertexEmbedContent, VertexSpec};
+use super::VertexEmbedContentTransport;
 
 /// Model-specific parameters for `gemini-embedding-2` on Vertex AI.
-pub const SPEC: VertexSpec = VertexSpec {
+pub const SPEC: RemoteSpec = RemoteSpec {
     name: "gemini-embedding-2",
     api_model: "gemini-embedding-2",
     // 8192-token input limit; ~4 chars/token with headroom (same model as the
@@ -43,12 +45,14 @@ const _: () = {
 
 /// Build the engine from the Vertex slice of its
 /// `[classifier.gemini-embedding-2]` table.
-pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<VertexEmbedContent> {
+pub async fn build(
+    cfg: &ClassifierConfig,
+) -> anyhow::Result<RemoteEmbeddingEngine<VertexEmbedContentTransport>> {
     let threshold = cfg
         .gemini_embedding_2
         .image_generation_threshold
         .unwrap_or(cfg.image_generation_threshold);
-    VertexEmbedContent::connect(&SPEC, &cfg.gemini_embedding_2.to_vertex(), threshold).await
+    super::connect_embed_content(&SPEC, &cfg.gemini_embedding_2.to_vertex(), threshold).await
 }
 
 #[cfg(test)]

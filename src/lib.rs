@@ -23,6 +23,7 @@ pub mod modality;
 pub mod planning;
 pub mod prompt;
 pub mod proxy;
+pub mod selection;
 
 /// The quantized ONNX NLI model for the zero-shot engine, embedded at build
 /// time (see `build.rs` and `engines/zero_shot.rs`).

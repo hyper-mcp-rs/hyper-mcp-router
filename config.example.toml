@@ -83,11 +83,11 @@ trivial_max_words = 6
 #               override; location is then REQUIRED (a region, or "global"),
 #               quota_project optional — as for text-embedding-005 below
 # Setting both (or neither) fails fast at startup.
-# (The ":-" empty default below keeps config loading working when the env
-# var is unset — env expansion runs over the whole file, comments included;
-# a selected engine with an empty key still fails fast with a clear error.)
+# (Env expansion runs over parsed string VALUES only — commented-out lines
+# can never break loading, and an unset variable is only an error on a line
+# that is actually active.)
 #[classifier.gemini-embedding-001]
-#api_key = "${GEMINI_API_KEY:-}"   # Generative Language API…
+#api_key = "${GEMINI_API_KEY}"   # Generative Language API…
 ##project = "my-gcp-project"       # …OR Vertex AI (never both)
 ##location = "us-central1"         # REQUIRED with project (a region/"global")
 #base_url = "https://generativelanguage.googleapis.com"  # optional override
@@ -96,7 +96,7 @@ trivial_max_words = 6
 #image_generation_threshold = 0.5  # per-engine override (similarity scale)
 
 #[classifier.gemini-embedding-2]
-#api_key = "${GEMINI_API_KEY:-}"
+#api_key = "${GEMINI_API_KEY}"
 
 # text-embedding-005 is published only on Vertex AI (a different API), so it
 # takes a GCP project and a location instead of an api_key. location is

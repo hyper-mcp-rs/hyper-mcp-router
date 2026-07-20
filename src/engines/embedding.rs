@@ -1,6 +1,8 @@
 //! Anchor-prototype classification support shared by every embedding-based
 //! engine, regardless of provider. **Not a model** — provider families
-//! (`gemini/`, `vertex/`) own their transport; this module owns the method.
+//! (`gemini/`, `vertex/`) own their transport; this module owns the method
+//! and the provider-neutral engine built on top of it
+//! ([`RemoteEmbeddingEngine`]).
 //!
 //! ## How embedding classification works
 //!
@@ -21,8 +23,26 @@
 //!
 //! Anchors and premises must be embedded by the **same model** for their
 //! similarities to be comparable; prototypes are never shared across engines.
+//!
+//! ## How a provider family plugs in
+//!
+//! A family (`gemini/`, `vertex/`) implements [`EmbedTexts`] — "embed these
+//! texts, return one vector per text, in order" — owning everything
+//! provider-specific: wire format, auth, endpoint layout, and concurrency
+//! bounds. Each model file declares a [`RemoteSpec`] `const`. The family's
+//! build path hands both to [`RemoteEmbeddingEngine::connect`], which embeds
+//! the anchors (with bounded retry on transient upstream failures), builds
+//! the prototypes, and returns a ready engine — an engine therefore never
+//! exists in a half-initialized, prototype-less state.
 
-use crate::classifier::{Classification, ModelTier};
+use std::future::Future;
+use std::time::Duration;
+
+use anyhow::Context as _;
+use async_trait::async_trait;
+use serde_json::Value;
+
+use crate::classifier::{Classification, ClassifierEngine, ModelTier};
 
 /// Anchor exemplars per class. Deliberately short, unambiguous, and diverse;
 /// these calibrate the prototypes for every embedding engine, so edit with
@@ -66,10 +86,9 @@ pub fn anchor_texts() -> Vec<&'static str> {
         .collect()
 }
 
-/// Class prototype vectors (normalized). Constructed via [`build_prototypes`];
-/// the [`Default`] value is an empty placeholder used only during engine
-/// construction, before the anchors have been embedded.
-#[derive(Default)]
+/// Class prototype vectors (normalized). Constructed only via
+/// [`build_prototypes`], so a `Prototypes` value always carries real,
+/// anchor-derived vectors.
 pub struct Prototypes {
     fast: Vec<f32>,
     balanced: Vec<f32>,
@@ -78,7 +97,7 @@ pub struct Prototypes {
 }
 
 impl Prototypes {
-    /// Embedding dimensionality (0 for the unbuilt placeholder).
+    /// Embedding dimensionality.
     pub fn dims(&self) -> usize {
         self.fast.len()
     }
@@ -159,6 +178,257 @@ pub fn combine_similarities(
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// The shared remote engine
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Everything that differs between remote embedding models, regardless of
+/// provider family. Each model file declares one of these as a `const`.
+pub struct RemoteSpec {
+    /// Engine id (matches `ClassifierModel::as_str`).
+    pub name: &'static str,
+    /// Model identifier sent to the API — a resource path for the Gemini
+    /// surface (`models/gemini-embedding-001`), a bare publisher model id
+    /// for Vertex (`text-embedding-005`).
+    pub api_model: &'static str,
+    /// Char budget for the complexity window (sized to the model's input
+    /// token limit).
+    pub context_char_budget: usize,
+    /// Char budget for the current turn (image premise / lexical prefilter).
+    pub current_turn_char_budget: usize,
+    /// Default max concurrent embedding requests (the "session pool").
+    pub default_max_concurrency: usize,
+    /// Default per-call timeout, seconds.
+    pub default_request_timeout_secs: u64,
+}
+
+/// A provider transport: embed a batch of texts, returning one vector per
+/// text **in input order**. Implementations own everything provider-specific
+/// — wire format, auth, endpoint layout, concurrency bounds — and must never
+/// echo the texts into errors.
+#[async_trait]
+pub trait EmbedTexts: Send + Sync {
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;
+}
+
+/// The provider-neutral remote embedding engine: a [`RemoteSpec`], a
+/// transport, and the anchor prototypes built at [`connect`] time
+/// (see [`Self::connect`]). One classify body serves every remote family.
+pub struct RemoteEmbeddingEngine<T: EmbedTexts> {
+    spec: &'static RemoteSpec,
+    transport: T,
+    /// Cosine-similarity floor for the image axis (see module docs).
+    image_gen_threshold: f32,
+    prototypes: Prototypes,
+}
+
+impl<T: EmbedTexts> RemoteEmbeddingEngine<T> {
+    /// Embed the class anchors through `transport`, build the prototypes,
+    /// and only then construct the engine — a `RemoteEmbeddingEngine` never
+    /// exists with placeholder prototypes. Startup is the right place to
+    /// fail on a bad credential or unreachable endpoint; **transient**
+    /// upstream failures (429/5xx, send errors — see [`TransientUpstream`])
+    /// are retried a bounded number of times so a single blip at boot does
+    /// not kill the process.
+    pub async fn connect(
+        spec: &'static RemoteSpec,
+        transport: T,
+        image_gen_threshold: f32,
+    ) -> anyhow::Result<Self> {
+        let anchors = anchor_texts();
+        let embeddings = retry_transient(spec.name, || transport.embed(&anchors))
+            .await
+            .with_context(|| format!("embedding class anchors for `{}`", spec.name))?;
+        let prototypes = build_prototypes(&embeddings)?;
+        Ok(RemoteEmbeddingEngine {
+            spec,
+            transport,
+            image_gen_threshold,
+            prototypes,
+        })
+    }
+
+    /// Embedding dimensionality of the built prototypes, for the family
+    /// "engine ready" startup logs.
+    pub fn prototype_dims(&self) -> usize {
+        self.prototypes.dims()
+    }
+}
+
+#[async_trait]
+impl<T: EmbedTexts> ClassifierEngine for RemoteEmbeddingEngine<T> {
+    fn name(&self) -> &'static str {
+        self.spec.name
+    }
+
+    fn is_local(&self) -> bool {
+        false // every remote transport sends prompt text to a provider API
+    }
+
+    fn context_char_budget(&self) -> usize {
+        self.spec.context_char_budget
+    }
+
+    fn current_turn_char_budget(&self) -> usize {
+        self.spec.current_turn_char_budget
+    }
+
+    async fn classify(
+        &self,
+        complexity_premise: &str,
+        image_premise: &str,
+        lexical_image_match: bool,
+    ) -> anyhow::Result<Classification> {
+        // An empty current turn cannot carry image intent; don't send an empty
+        // text to the API (some models reject empty content).
+        let image_text = image_premise.trim();
+        let texts: Vec<&str> = if image_text.is_empty() {
+            vec![complexity_premise]
+        } else {
+            vec![complexity_premise, image_text]
+        };
+
+        // Deliberately NO retry here (retry exists only around startup anchor
+        // embedding in `connect`): retrying per-request classification would
+        // duplicate billable embedding work and blur the failure signal — the
+        // proxy already degrades a failed classification to the balanced
+        // default, which is the intended behavior under upstream trouble.
+        let embeddings = self.transport.embed(&texts).await?;
+        let image_embedding = if image_text.is_empty() {
+            None
+        } else {
+            Some(embeddings[1].as_slice())
+        };
+
+        Ok(combine_similarities(
+            &embeddings[0],
+            image_embedding,
+            &self.prototypes,
+            lexical_image_match,
+            self.image_gen_threshold,
+        ))
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Transient-failure marking and startup retry
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Marker attached (via `anyhow` context) to transport errors that are worth
+/// retrying at **startup**: request send/transport failures and HTTP 429 or
+/// 5xx responses. Permanent failures (other 4xx, malformed JSON, shape
+/// mismatches) never carry it. Checked by [`retry_transient`] through
+/// `anyhow`'s downcast, which traverses context layers.
+#[derive(Debug)]
+pub(crate) struct TransientUpstream;
+
+impl std::fmt::Display for TransientUpstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("transient upstream failure")
+    }
+}
+
+impl std::error::Error for TransientUpstream {}
+
+/// Whether an HTTP status indicates a transient upstream condition
+/// (rate-limiting or a server-side failure) rather than a caller mistake.
+pub(crate) fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Build an error for a transient upstream failure: `message` stays the
+/// outermost (displayed) layer, with the [`TransientUpstream`] marker as its
+/// source so [`retry_transient`] can recognize it.
+pub(crate) fn transient_error(message: String) -> anyhow::Error {
+    anyhow::Error::new(TransientUpstream).context(message)
+}
+
+/// Whether any layer of the error chain carries the [`TransientUpstream`]
+/// marker.
+pub(crate) fn is_transient(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<TransientUpstream>().is_some()
+}
+
+/// Run `op` with bounded retry on [`TransientUpstream`]-marked failures:
+/// up to 3 attempts total, backing off ~500ms then ~1s (each plus a small
+/// `SystemTime`-derived jitter), so the worst-case added boot delay stays
+/// under ~2s. Permanent errors return immediately.
+///
+/// Used **only** for startup anchor embedding — per-request classification
+/// is deliberately never retried (see the note in
+/// [`RemoteEmbeddingEngine::classify`](ClassifierEngine::classify)).
+pub(crate) async fn retry_transient<T, F, Fut>(engine: &str, op: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    // ~500ms then ~1s: worst-case added boot delay stays under ~2s.
+    retry_transient_with_backoff(engine, &[500, 1000], op).await
+}
+
+/// [`retry_transient`] with an injectable backoff schedule (whose length + 1
+/// is the total attempt count) so unit tests need not sleep for real.
+async fn retry_transient_with_backoff<T, F, Fut>(
+    engine: &str,
+    backoff_ms: &[u64],
+    mut op: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let max_attempts = backoff_ms.len() as u32 + 1;
+    let mut attempt: u32 = 1;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < max_attempts && is_transient(&err) => {
+                let backoff = backoff_ms[attempt as usize - 1] + jitter_ms();
+                tracing::warn!(
+                    engine,
+                    attempt,
+                    backoff_ms = backoff,
+                    error = format!("{err:#}"),
+                    "transient failure embedding startup anchors; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Small backoff jitter (0–99ms) derived from the system clock — enough to
+/// de-synchronize engines retrying simultaneously, without a new dependency.
+fn jitter_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0)
+        % 100
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Shared JSON helpers
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Convert a JSON array of embedding components into an `f32` vector,
+/// erroring on any non-numeric element instead of silently coercing it to
+/// zero (which would corrupt similarities undetectably). The message names
+/// the offending index only — never the content.
+pub(crate) fn numeric_vector(values: &[Value]) -> anyhow::Result<Vec<f32>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, x)| {
+            x.as_f64().map(|f| f as f32).ok_or_else(|| {
+                anyhow::anyhow!("embedding vector element at index {index} is not a number")
+            })
+        })
+        .collect()
+}
+
 /// Mean-pool a set of vectors and L2-normalize the result.
 fn mean_normalized(vectors: &[Vec<f32>]) -> Vec<f32> {
     let Some(first) = vectors.first() else {
@@ -199,6 +469,9 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Mutex;
+
     use super::*;
 
     fn protos() -> Prototypes {
@@ -244,11 +517,6 @@ mod tests {
         // Wrong count is a loud error.
         assert!(build_prototypes(&embeddings[..n - 1]).is_err());
         assert!(build_prototypes(&[]).is_err());
-    }
-
-    #[test]
-    fn default_prototypes_are_an_empty_placeholder() {
-        assert_eq!(Prototypes::default().dims(), 0);
     }
 
     // ── classification combination ──────────────────────────────────────────
@@ -342,5 +610,265 @@ mod tests {
         let all = anchor_texts();
         let unique: std::collections::HashSet<&str> = all.iter().copied().collect();
         assert_eq!(all.len(), unique.len());
+    }
+
+    // ── the generic remote engine ───────────────────────────────────────────
+
+    static TEST_SPEC: RemoteSpec = RemoteSpec {
+        name: "fake-embedding-engine",
+        api_model: "models/fake",
+        context_char_budget: 6000,
+        current_turn_char_budget: 2000,
+        default_max_concurrency: 4,
+        default_request_timeout_secs: 10,
+    };
+
+    /// Premise texts with fixed fake embeddings (dims =
+    /// [fast, balanced, frontier, image], matching the one-hot prototypes
+    /// the anchor mapping below produces).
+    const FRONTIER_PREMISE: &str = "premise: frontier-flavored";
+    const IMAGE_TURN: &str = "turn: image-flavored";
+
+    fn fake_embedding(text: &str) -> Vec<f32> {
+        if FAST_ANCHORS.contains(&text) {
+            return vec![1.0, 0.0, 0.0, 0.0];
+        }
+        if BALANCED_ANCHORS.contains(&text) {
+            return vec![0.0, 1.0, 0.0, 0.0];
+        }
+        if FRONTIER_ANCHORS.contains(&text) {
+            return vec![0.0, 0.0, 1.0, 0.0];
+        }
+        if IMAGE_ANCHORS.contains(&text) {
+            return vec![0.0, 0.0, 0.0, 1.0];
+        }
+        match text {
+            FRONTIER_PREMISE => vec![0.1, 0.2, 0.9, 0.0],
+            IMAGE_TURN => vec![0.2, 0.0, 0.0, 0.9],
+            _ => vec![0.0, 1.0, 0.0, 0.0],
+        }
+    }
+
+    /// Deterministic in-memory transport: records the text count of every
+    /// embed call and can be switched into a failing mode.
+    #[derive(Default)]
+    struct FakeTransport {
+        calls: Mutex<Vec<usize>>,
+        fail: AtomicBool,
+    }
+
+    #[async_trait]
+    impl EmbedTexts for FakeTransport {
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.calls.lock().unwrap().push(texts.len());
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("fake transport outage");
+            }
+            Ok(texts.iter().map(|t| fake_embedding(t)).collect())
+        }
+    }
+
+    async fn connected_engine() -> RemoteEmbeddingEngine<FakeTransport> {
+        RemoteEmbeddingEngine::connect(&TEST_SPEC, FakeTransport::default(), 0.5)
+            .await
+            .expect("connect against the fake transport")
+    }
+
+    #[tokio::test]
+    async fn connect_embeds_anchors_in_one_call_and_builds_prototypes() {
+        let engine = connected_engine().await;
+        assert_eq!(engine.prototype_dims(), 4);
+        assert_eq!(
+            *engine.transport.calls.lock().unwrap(),
+            vec![anchor_texts().len()],
+            "anchors must go out as one batched embed"
+        );
+        // Trait plumbing comes straight from the spec.
+        assert_eq!(engine.name(), "fake-embedding-engine");
+        assert!(!engine.is_local());
+        assert_eq!(engine.context_char_budget(), 6000);
+        assert_eq!(engine.current_turn_char_budget(), 2000);
+    }
+
+    #[tokio::test]
+    async fn classify_sends_two_texts_with_image_premise_one_without() {
+        let engine = connected_engine().await;
+
+        engine
+            .classify(FRONTIER_PREMISE, IMAGE_TURN, false)
+            .await
+            .unwrap();
+        engine.classify(FRONTIER_PREMISE, "", false).await.unwrap();
+        engine
+            .classify(FRONTIER_PREMISE, "   \n\t", false)
+            .await
+            .unwrap();
+
+        let calls = engine.transport.calls.lock().unwrap();
+        // calls[0] is the anchor batch from connect.
+        assert_eq!(calls[1], 2, "non-empty image premise rides along");
+        assert_eq!(calls[2], 1, "empty image premise must not be sent");
+        assert_eq!(calls[3], 1, "whitespace image premise must not be sent");
+    }
+
+    #[tokio::test]
+    async fn classify_matches_combine_similarities_expectations() {
+        let engine = connected_engine().await;
+
+        // Frontier-flavored premise with an image-flavored current turn:
+        // complexity argmax = frontier, image strict-argmax above threshold.
+        let c = engine
+            .classify(FRONTIER_PREMISE, IMAGE_TURN, false)
+            .await
+            .unwrap();
+        assert_eq!(c.complexity, ModelTier::Frontier);
+        assert!(c.image_generation);
+
+        // Same premise, no current turn: image only reachable lexically.
+        let c = engine.classify(FRONTIER_PREMISE, "", false).await.unwrap();
+        assert_eq!(c.complexity, ModelTier::Frontier);
+        assert!(!c.image_generation);
+        let c = engine.classify(FRONTIER_PREMISE, "", true).await.unwrap();
+        assert!(c.image_generation);
+    }
+
+    #[tokio::test]
+    async fn classify_propagates_transport_errors() {
+        let engine = connected_engine().await;
+        engine.transport.fail.store(true, Ordering::SeqCst);
+        let err = engine
+            .classify(FRONTIER_PREMISE, IMAGE_TURN, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("fake transport outage"));
+    }
+
+    // ── transient marking and startup retry ─────────────────────────────────
+
+    #[test]
+    fn transient_marker_survives_added_context_layers() {
+        let err = transient_error("upstream returned 503".into());
+        assert!(is_transient(&err));
+        assert_eq!(err.to_string(), "upstream returned 503");
+        // anyhow downcast traverses context layers added on top.
+        let wrapped = err.context("embedding class anchors for `x`");
+        assert!(is_transient(&wrapped));
+        // Unmarked errors are permanent.
+        assert!(!is_transient(&anyhow::anyhow!("bad request")));
+    }
+
+    #[test]
+    fn transient_statuses_are_429_and_5xx_only() {
+        use reqwest::StatusCode;
+        assert!(is_transient_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_transient_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_transient_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_transient_status(StatusCode::BAD_REQUEST));
+        assert!(!is_transient_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_transient_status(StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn retry_recovers_after_transient_failures() {
+        // Zero backoff: tokio's paused clock needs a feature the crate does
+        // not enable, so the schedule is injected instead of slept through.
+        let attempts = AtomicU32::new(0);
+        let value = retry_transient_with_backoff("test-engine", &[0, 0], || {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(transient_error(format!("blip {n}")))
+                } else {
+                    Ok(42)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn permanent_errors_are_never_retried() {
+        let attempts = AtomicU32::new(0);
+        let err = retry_transient_with_backoff::<u32, _, _>("test-engine", &[0, 0], || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err(anyhow::anyhow!("bad request")) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "exactly one attempt");
+        assert!(err.to_string().contains("bad request"));
+    }
+
+    #[tokio::test]
+    async fn persistent_transient_failure_gives_up_after_three_attempts() {
+        let attempts = AtomicU32::new(0);
+        let err = retry_transient_with_backoff::<u32, _, _>("test-engine", &[0, 0], || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err(transient_error("still down".into())) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(is_transient(&err));
+    }
+
+    // Exercises the real production schedule through `connect` (~1.7s of
+    // real sleep — accepted for this one end-to-end retry test).
+    #[tokio::test]
+    async fn connect_retries_transient_anchor_failures() {
+        /// Fails the first two embeds with a transient error, then succeeds.
+        struct FlakyTransport {
+            attempts: AtomicU32,
+        }
+
+        #[async_trait]
+        impl EmbedTexts for FlakyTransport {
+            async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    return Err(transient_error("startup blip".into()));
+                }
+                Ok(texts.iter().map(|t| fake_embedding(t)).collect())
+            }
+        }
+
+        let transport = FlakyTransport {
+            attempts: AtomicU32::new(0),
+        };
+        let engine = RemoteEmbeddingEngine::connect(&TEST_SPEC, transport, 0.5)
+            .await
+            .expect("connect must survive two transient blips");
+        assert_eq!(engine.transport.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(engine.prototype_dims(), 4);
+    }
+
+    // ── shared JSON helpers ─────────────────────────────────────────────────
+
+    #[test]
+    fn numeric_vector_parses_numbers_and_rejects_anything_else() {
+        let ok = [
+            serde_json::json!(1.0),
+            serde_json::json!(-2),
+            serde_json::json!(0.5),
+        ];
+        assert_eq!(numeric_vector(&ok).unwrap(), vec![1.0, -2.0, 0.5]);
+
+        for bad in [
+            serde_json::json!("0.5"),
+            serde_json::json!(null),
+            serde_json::json!([1.0]),
+            serde_json::json!({"v": 1.0}),
+            serde_json::json!(true),
+        ] {
+            let values = [serde_json::json!(1.0), bad];
+            let err = numeric_vector(&values).unwrap_err().to_string();
+            assert!(
+                err.contains("index 1") && err.contains("not a number"),
+                "got: {err}"
+            );
+        }
     }
 }

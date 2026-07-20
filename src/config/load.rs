@@ -1,13 +1,18 @@
 //! Config **loading**: well-known path discovery, extension-driven format
 //! selection (TOML / YAML / JSON), environment-variable expansion, and
 //! parsing into [`RouterConfig`]. The schema itself (structs, custom
-//! deserializers, validation, model selection) lives in the parent module;
-//! this file owns everything between "a path or raw text" and "a parsed
-//! config".
+//! deserializers, validation) lives in the parent module; this file owns
+//! everything between "a path or raw text" and "a parsed config".
+//!
+//! Env expansion runs over the **string values of the parsed document**,
+//! never the raw file text: comments cannot reference (or break on) unset
+//! variables, and a variable's value is spliced into an existing string — it
+//! can never alter the document's structure, whatever characters it holds.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use anyhow::Context;
 use directories::ProjectDirs;
 use regex::Regex;
 
@@ -17,12 +22,28 @@ use super::{RouterConfig, APP_NAME};
 // Environment-variable expansion
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Expand `${VAR}` / `${VAR:-default}` references in the raw config text
-/// before parsing (any format — expansion runs on the raw text). `$${VAR}` is
+/// Expand `${VAR}` / `${VAR:-default}` references in one string. `$${VAR}` is
 /// an escape hatch for a literal `${VAR}`, and bare `$VAR` is left untouched.
 /// All missing (no-default) variables are collected and reported together in
-/// a single error.
+/// a single error. Applied to every **string value** of the parsed config
+/// document by [`parse_with_format`] — never to raw file text, so comments
+/// and document structure are untouchable.
 pub fn expand_env(input: &str) -> anyhow::Result<String> {
+    let mut missing: Vec<String> = Vec::new();
+    let out = expand_env_collecting(input, &mut missing);
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "unset environment variable(s) with no default: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(out)
+}
+
+/// The workhorse behind [`expand_env`]: expands what it can and pushes the
+/// names of missing no-default variables into `missing` (so a whole-document
+/// walk can report every problem at once).
+fn expand_env_collecting(input: &str, missing: &mut Vec<String>) -> String {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"\$(\$?)\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?\}")
             .expect("valid env-expansion regex")
@@ -30,7 +51,6 @@ pub fn expand_env(input: &str) -> anyhow::Result<String> {
 
     let mut out = String::with_capacity(input.len());
     let mut last = 0;
-    let mut missing: Vec<String> = Vec::new();
 
     for caps in RE.captures_iter(input) {
         let m = caps.get(0).unwrap();
@@ -62,14 +82,44 @@ pub fn expand_env(input: &str) -> anyhow::Result<String> {
         }
     }
     out.push_str(&input[last..]);
+    out
+}
 
+/// Walk a parsed document and expand env references in every **string
+/// value** (keys and non-string scalars are structural and never expanded).
+/// Missing variables from the whole document are reported in one error.
+fn expand_env_in_tree(value: &mut serde_json::Value) -> anyhow::Result<()> {
+    fn walk(value: &mut serde_json::Value, missing: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(s) => {
+                let expanded = expand_env_collecting(s, missing);
+                if expanded != *s {
+                    *s = expanded;
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, missing);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (_key, item) in map.iter_mut() {
+                    walk(item, missing);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut missing = Vec::new();
+    walk(value, &mut missing);
     if !missing.is_empty() {
         anyhow::bail!(
             "unset environment variable(s) with no default: {}",
             missing.join(", ")
         );
     }
-    Ok(out)
+    Ok(())
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -145,28 +195,50 @@ fn format_for_path(path: &Path) -> anyhow::Result<config::FileFormat> {
 // Loading and parsing
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Load, env-expand, parse, and validate the config at `path`. The format is
-/// chosen by file extension (`.toml`, `.yaml`/`.yml`, or `.json`).
+/// Load, parse, env-expand, validate, and **resolve** the config at `path`:
+/// the one entry point that yields a ready-to-serve configuration. The
+/// format is chosen by file extension (`.toml`, `.yaml`/`.yml`, or `.json`).
+/// Keyring-sourced secrets are resolved last (routed models, plus the tables
+/// of selected classifier engines only) — parsing itself performs no I/O.
 pub fn load(path: &Path) -> anyhow::Result<RouterConfig> {
     let format = format_for_path(path)?;
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read config `{}`: {e}", path.display()))?;
-    let cfg = parse_with_format(&raw, format)?;
+    let mut cfg = parse_with_format(&raw, format)?;
     cfg.validate()?;
+    cfg.resolve_secrets()?;
     Ok(cfg)
 }
 
-/// Env-expand then TOML-parse config text. Split out for unit testing.
+/// Parse (TOML) and env-expand config text. Split out for unit testing.
+/// Hermetic: no keyring I/O (see [`load`] for full resolution).
 pub fn parse(raw: &str) -> anyhow::Result<RouterConfig> {
     parse_with_format(raw, config::FileFormat::Toml)
 }
 
-/// Env-expand then parse config text in the given format. Env expansion runs
-/// on the raw text, so `${VAR}` works identically in TOML, YAML, and JSON.
+/// Parse config text in the given format, expanding env references in its
+/// **string values**: the document is parsed as-is, every string value is
+/// expanded ([`expand_env`] semantics, all formats identical), and the
+/// expanded document is deserialized into the schema. Expanding values
+/// rather than raw text means comments can never break loading and an env
+/// value can never alter document structure.
 pub fn parse_with_format(raw: &str, format: config::FileFormat) -> anyhow::Result<RouterConfig> {
-    let expanded = expand_env(raw)?;
+    // Pass 1: parse the document shape without touching the schema's custom
+    // deserializers (they must only ever see expanded values).
+    let mut tree: serde_json::Value = config::Config::builder()
+        .add_source(config::File::from_str(raw, format))
+        .build()?
+        .try_deserialize()
+        .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
+
+    expand_env_in_tree(&mut tree)?;
+
+    // Pass 2: deserialize the expanded document into the schema, going back
+    // through the `config` crate so its lenient scalar coercions (e.g. a
+    // `"${PORT}"` string expanding to a number) keep working.
+    let expanded = serde_json::to_string(&tree).context("re-serializing expanded config")?;
     let cfg: RouterConfig = config::Config::builder()
-        .add_source(config::File::from_str(&expanded, format))
+        .add_source(config::File::from_str(&expanded, config::FileFormat::Json))
         .build()?
         .try_deserialize()
         .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
@@ -224,6 +296,45 @@ mod tests {
         assert!(msg.contains("ROUTER_TEST_MISS_2"));
     }
 
+    const MODEL_BLOCK: &str = "[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n";
+
+    #[test]
+    fn expansion_ignores_comments() {
+        // A missing variable referenced ONLY in a comment must not break
+        // loading — expansion runs over parsed string values, never raw text.
+        std::env::remove_var("ROUTER_TEST_COMMENT_ONLY");
+        let cfg = parse(&format!(
+            "# api_key = \"${{ROUTER_TEST_COMMENT_ONLY}}\"\n[server]\nhost=\"0.0.0.0\"\nport=1\n{MODEL_BLOCK}"
+        ));
+        assert!(cfg.is_ok(), "got: {:?}", cfg.err());
+    }
+
+    #[test]
+    fn expansion_cannot_alter_document_structure() {
+        // An env value full of quotes/newlines is spliced into the string
+        // VALUE verbatim — it can never terminate the string and inject
+        // config structure.
+        std::env::set_var("ROUTER_TEST_INJECT", "evil\"\nport = 9999\nx = \"");
+        let cfg = parse(&format!(
+            "[server]\nhost=\"${{ROUTER_TEST_INJECT}}\"\nport=1\n{MODEL_BLOCK}"
+        ))
+        .expect("structured injection must not be possible");
+        assert_eq!(cfg.server.port, 1);
+        assert_eq!(cfg.server.host, "evil\"\nport = 9999\nx = \"");
+    }
+
+    #[test]
+    fn expansion_coerces_numeric_values() {
+        // A numeric field supplied via env as a quoted string still parses
+        // (the config crate's lenient scalar coercion).
+        std::env::set_var("ROUTER_TEST_PORT", "4242");
+        let cfg = parse(&format!(
+            "[server]\nhost=\"0.0.0.0\"\nport=\"${{ROUTER_TEST_PORT}}\"\n{MODEL_BLOCK}"
+        ))
+        .expect("env-supplied numeric string should coerce");
+        assert_eq!(cfg.server.port, 4242);
+    }
+
     // ── config file formats ───────────────────────────────────────────
     #[test]
     fn format_for_path_maps_known_extensions() {
@@ -269,7 +380,7 @@ mod tests {
         assert_eq!(cfg.models.len(), 2);
         assert_eq!(
             cfg.models[0].api_key,
-            Some(ModelApiKey::Static("yaml-key".to_string()))
+            Some(ModelApiKey::Static("yaml-key".into()))
         );
         // A map-shaped api_key (YAML mapping instead of a TOML inline table)
         // must hit the same custom deserializer path.
@@ -300,7 +411,7 @@ mod tests {
         assert_eq!(cfg.models.len(), 1);
         assert_eq!(
             cfg.models[0].api_key,
-            Some(ModelApiKey::Static("json-key".to_string()))
+            Some(ModelApiKey::Static("json-key".into()))
         );
     }
 

@@ -139,7 +139,7 @@ pub const CONTEXT_FIT_CHARS_PER_TOKEN: usize = 4;
 /// images/audio) are not counted and real tokenizers vary by model. Model
 /// selection therefore treats context fit as a strong preference with a
 /// best-effort fallback, never a local rejection (see
-/// `config::select_candidate`).
+/// `selection::select_candidate`).
 pub fn estimate_request_tokens(body: &serde_json::Value) -> u64 {
     let chars: usize = body
         .get("messages")

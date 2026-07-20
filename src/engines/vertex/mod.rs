@@ -1,15 +1,16 @@
 //! The Vertex AI embedding engine family: shared transport here in `mod.rs`,
 //! **one file per model** in this directory (`text_embedding_005.rs`,
-//! `gemini_embedding_001.rs`, `gemini_embedding_2.rs`), each defining a
-//! [`VertexSpec`] and delegating to one of the two transport flavors:
+//! `gemini_embedding_001.rs`, `gemini_embedding_2.rs`), each declaring a
+//! [`RemoteSpec`](crate::engines::embedding::RemoteSpec) and building the
+//! provider-neutral engine over one of the two transport flavors:
 //!
-//! - [`VertexEmbedding`] — the legacy `PredictionService` flavor
+//! - [`VertexPredictTransport`] — the legacy `PredictionService` flavor
 //!   (`:predict`, `instances`/`predictions`, true batching). Serves the
 //!   gecko-lineage models (`text-embedding-005`) and `gemini-embedding-001`.
-//! - [`VertexEmbedContent`] — the Gemini-API flavor (`:embedContent`,
-//!   `content.parts`/`embedding.values`, **one text per request** — batches
-//!   fan out as concurrent calls). Gemini-native models such as
-//!   `gemini-embedding-2` are served **only** through this method
+//! - [`VertexEmbedContentTransport`] — the Gemini-API flavor
+//!   (`:embedContent`, `content.parts`/`embedding.values`, **one text per
+//!   request** — batches fan out as concurrent calls). Gemini-native models
+//!   such as `gemini-embedding-2` are served **only** through this method
 //!   (live-verified: `:predict` is 404 for them everywhere).
 //!
 //! The gemini-embedding models also exist on the Generative Language API
@@ -23,13 +24,14 @@
 //! `publishers/google/models/<model>` endpoint layout (regional, multi-region
 //! and global hosts), both wire formats, and OAuth Bearer auth.
 //!
-//! The classification *method* (anchor prototypes, cosine scoring) is
-//! provider-neutral and lives in `crate::engines::embedding`.
+//! The classification *method* (anchor prototypes, cosine scoring) and the
+//! shared engine ([`RemoteEmbeddingEngine`]) are provider-neutral and live in
+//! `crate::engines::embedding`.
 //!
 //! Anchor embedding happens once at startup and **fails fast** on any API
-//! problem (bad token, wrong project, unreachable endpoint), so
-//! misconfiguration is a clear boot error, not a silent stream of
-//! balanced-default fallbacks.
+//! problem (bad token, wrong project, unreachable endpoint) — after a
+//! bounded retry on transient upstream failures — so misconfiguration is a
+//! clear boot error, not a silent stream of balanced-default fallbacks.
 //!
 //! ## Auth
 //!
@@ -68,12 +70,15 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::header::HeaderValue;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
-use crate::classifier::{Classification, ClassifierEngine};
 use crate::config::VertexEmbeddingConfig;
-use crate::engines::embedding::{anchor_texts, build_prototypes, combine_similarities, Prototypes};
+use crate::engines::embedding::{
+    anchor_texts, is_transient_status, numeric_vector, transient_error, EmbedTexts,
+    RemoteEmbeddingEngine, RemoteSpec, TransientUpstream,
+};
 use crate::gcp_auth::{self, AccessTokenCredentials};
 
 /// Task type sent with every embed request; anchors and premises must use the
@@ -90,7 +95,8 @@ const QUOTA_PROJECT_HEADER: &str = "x-goog-user-project";
 /// refresh are handled by `google-cloud-auth`.
 enum TokenSource {
     /// A single operator-supplied token; used verbatim, never refreshed.
-    Static(String),
+    /// Held redacted; exposed only to build the `Authorization` header.
+    Static(SecretString),
     /// Application Default Credentials; a current token is resolved per call
     /// (cached and auto-refreshed by the auth library).
     Adc(AccessTokenCredentials),
@@ -117,7 +123,7 @@ impl TokenSource {
     /// library, which serves a cached token until it nears expiry.
     async fn bearer(&self) -> anyhow::Result<String> {
         match self {
-            TokenSource::Static(token) => Ok(token.clone()),
+            TokenSource::Static(token) => Ok(token.expose_secret().to_owned()),
             TokenSource::Adc(credentials) => gcp_auth::bearer(credentials).await,
         }
     }
@@ -129,43 +135,6 @@ impl TokenSource {
             TokenSource::Adc(_) => "adc",
         }
     }
-}
-
-/// Everything that differs between Vertex embedding models. Each model file
-/// declares one of these as a `const`.
-pub struct VertexSpec {
-    /// Engine id (matches `ClassifierModel::as_str`).
-    pub name: &'static str,
-    /// Publisher model id sent in the endpoint path, e.g. `text-embedding-005`
-    /// (no `models/` prefix — that is part of the URL template).
-    pub api_model: &'static str,
-    /// Char budget for the complexity window (sized to the model's input
-    /// token limit).
-    pub context_char_budget: usize,
-    /// Char budget for the current turn (image premise / lexical prefilter).
-    pub current_turn_char_budget: usize,
-    /// Default max concurrent embedding requests (the "session pool").
-    pub default_max_concurrency: usize,
-    /// Default per-call timeout, seconds.
-    pub default_request_timeout_secs: u64,
-}
-
-/// A remote Vertex AI embedding engine (shared by every Vertex model file).
-pub struct VertexEmbedding {
-    spec: &'static VertexSpec,
-    http: reqwest::Client,
-    /// Full regional `:predict` URL.
-    url: String,
-    token: TokenSource,
-    /// Pre-validated `x-goog-user-project` header value, when configured.
-    quota_project: Option<HeaderValue>,
-    /// Bounds concurrent in-flight embedding requests — this engine's
-    /// equivalent of the embedded engine's session pool.
-    permits: Semaphore,
-    /// Cosine-similarity floor for the image axis (see
-    /// `crate::engines::embedding`).
-    image_gen_threshold: f32,
-    prototypes: Prototypes,
 }
 
 /// Everything both transport flavors need before their first request:
@@ -186,7 +155,7 @@ impl VertexSetup {
     /// Validate config and resolve auth (`project` and `location` are
     /// **required** when the engine is selected; auth is ADC unless a static
     /// `access_token` is set). Fails fast with actionable messages.
-    fn establish(spec: &'static VertexSpec, cfg: &VertexEmbeddingConfig) -> anyhow::Result<Self> {
+    fn establish(spec: &'static RemoteSpec, cfg: &VertexEmbeddingConfig) -> anyhow::Result<Self> {
         // `project` and `location` first (pure config checks — the same
         // helper the offline `validate` subcommand runs), so a config problem
         // fails before credential discovery.
@@ -195,8 +164,8 @@ impl VertexSetup {
         // Static token if configured, otherwise Application Default
         // Credentials — built before the HTTP client so a credential
         // discovery problem is the next thing to fail.
-        let token = match cfg.access_token.clone() {
-            Some(token) => TokenSource::Static(token),
+        let token = match &cfg.access_token {
+            Some(secret) => TokenSource::Static(secret.resolved()?.clone()),
             None => TokenSource::adc(spec.name)?,
         };
 
@@ -235,10 +204,12 @@ impl VertexSetup {
 }
 
 /// The setup facts worth echoing in the startup log, retained past the point
-/// where [`VertexSetup`]'s other fields move into the engine.
+/// where [`VertexSetup`]'s other fields move into the transport.
 struct SetupSummary {
     project: String,
     location: String,
+    auth: &'static str,
+    quota_project: Option<HeaderValue>,
     max_concurrency: usize,
     timeout: u64,
 }
@@ -249,6 +220,8 @@ impl VertexSetup {
         SetupSummary {
             project: self.project.clone(),
             location: self.location.clone(),
+            auth: self.token.mode(),
+            quota_project: self.quota_project.clone(),
             max_concurrency: self.max_concurrency,
             timeout: self.timeout,
         }
@@ -257,11 +230,9 @@ impl VertexSetup {
 
 /// Emit the shared "engine ready" startup log (never the token).
 fn log_ready(
-    spec: &VertexSpec,
+    spec: &RemoteSpec,
     transport: &'static str,
     summary: &SetupSummary,
-    auth: &'static str,
-    quota_project: Option<&HeaderValue>,
     dims: usize,
     anchor_count: usize,
 ) {
@@ -270,8 +241,10 @@ fn log_ready(
         transport,
         project = summary.project.as_str(),
         location = summary.location.as_str(),
-        auth,
-        quota_project = quota_project
+        auth = summary.auth,
+        quota_project = summary
+            .quota_project
+            .as_ref()
             .and_then(|v| v.to_str().ok())
             .unwrap_or("(unset)"),
         embedding_dims = dims,
@@ -284,7 +257,9 @@ fn log_ready(
 
 /// POST an embedding request with Bearer auth and the optional quota-project
 /// header; check the status and parse the JSON body. Shared by both Vertex
-/// transport flavors. Never echoes user text into errors.
+/// transport flavors. Never echoes user text into errors. Transport failures
+/// and 429/5xx statuses carry the [`TransientUpstream`] marker so startup
+/// anchor embedding can retry them.
 async fn post_embed(
     http: &reqwest::Client,
     url: &str,
@@ -299,6 +274,7 @@ async fn post_embed(
     let resp = request
         .send()
         .await
+        .context(TransientUpstream)
         .context("vertex embeddings request failed")?;
 
     let status = resp.status();
@@ -311,61 +287,73 @@ async fn post_embed(
             .chars()
             .take(300)
             .collect();
-        anyhow::bail!("vertex embeddings returned {status}: {detail}");
+        let message = format!("vertex embeddings returned {status}: {detail}");
+        return Err(if is_transient_status(status) {
+            transient_error(message)
+        } else {
+            anyhow::anyhow!(message)
+        });
     }
     resp.json()
         .await
         .context("vertex embeddings response was not JSON")
 }
 
-impl VertexEmbedding {
-    /// Build the engine and embed the class anchors in one `:predict` batch —
-    /// failing fast on any config or API problem.
-    pub async fn connect(
-        spec: &'static VertexSpec,
-        cfg: &VertexEmbeddingConfig,
-        image_gen_threshold: f32,
-    ) -> anyhow::Result<Self> {
-        let setup = VertexSetup::establish(spec, cfg)?;
-        let summary = setup.summary();
-        let url = build_predict_url(&setup.base, &setup.project, &setup.location, spec.api_model);
+// ───────────────────────────────────────────────────────────────────────
+// The `:predict` transport flavor
+// ───────────────────────────────────────────────────────────────────────
 
-        let mut engine = VertexEmbedding {
-            spec,
-            http: setup.http,
-            url,
-            token: setup.token,
-            quota_project: setup.quota_project,
-            permits: Semaphore::new(setup.max_concurrency),
-            image_gen_threshold,
-            prototypes: Prototypes::default(),
-        };
+/// The `PredictionService` transport: every embed is one `:predict` call
+/// whose `instances` array batches all texts.
+pub struct VertexPredictTransport {
+    http: reqwest::Client,
+    /// Full regional `:predict` URL.
+    url: String,
+    token: TokenSource,
+    /// Pre-validated `x-goog-user-project` header value, when configured.
+    quota_project: Option<HeaderValue>,
+    /// Bounds concurrent in-flight embedding requests — this engine's
+    /// equivalent of the embedded engine's session pool.
+    permits: Semaphore,
+}
 
-        // Embed every anchor in one batch and pool per class. Startup is the
-        // right place to fail on a bad token or unreachable endpoint.
-        let anchors = anchor_texts();
-        let embeddings = engine
-            .embed_batch(&anchors)
-            .await
-            .with_context(|| format!("embedding class anchors for `{}`", spec.name))?;
-        engine.prototypes = build_prototypes(&embeddings)?;
+/// Build a `:predict`-flavored engine: validate config, resolve auth, then
+/// hand the transport to [`RemoteEmbeddingEngine::connect`] — which embeds
+/// the class anchors in one batch, failing fast on any config or API problem.
+pub async fn connect_predict(
+    spec: &'static RemoteSpec,
+    cfg: &VertexEmbeddingConfig,
+    image_gen_threshold: f32,
+) -> anyhow::Result<RemoteEmbeddingEngine<VertexPredictTransport>> {
+    let setup = VertexSetup::establish(spec, cfg)?;
+    let summary = setup.summary();
+    let url = build_predict_url(&setup.base, &setup.project, &setup.location, spec.api_model);
 
-        log_ready(
-            spec,
-            "predict",
-            &summary,
-            engine.token.mode(),
-            engine.quota_project.as_ref(),
-            engine.prototypes.dims(),
-            anchors.len(),
-        );
-        Ok(engine)
-    }
+    let transport = VertexPredictTransport {
+        http: setup.http,
+        url,
+        token: setup.token,
+        quota_project: setup.quota_project,
+        permits: Semaphore::new(setup.max_concurrency),
+    };
 
+    let engine = RemoteEmbeddingEngine::connect(spec, transport, image_gen_threshold).await?;
+    log_ready(
+        spec,
+        "predict",
+        &summary,
+        engine.prototype_dims(),
+        anchor_texts().len(),
+    );
+    Ok(engine)
+}
+
+#[async_trait]
+impl EmbedTexts for VertexPredictTransport {
     /// Embed `texts` in one `:predict` call (an `instances` array batches every
     /// text into one request), bounded by the concurrency semaphore. Never
     /// echoes the texts into errors.
-    async fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let _permit = self
             .permits
             .acquire()
@@ -386,68 +374,17 @@ impl VertexEmbedding {
     }
 }
 
-#[async_trait]
-impl ClassifierEngine for VertexEmbedding {
-    fn name(&self) -> &'static str {
-        self.spec.name
-    }
-
-    fn is_local(&self) -> bool {
-        false // prompt text is sent to the Vertex AI API
-    }
-
-    fn context_char_budget(&self) -> usize {
-        self.spec.context_char_budget
-    }
-
-    fn current_turn_char_budget(&self) -> usize {
-        self.spec.current_turn_char_budget
-    }
-
-    async fn classify(
-        &self,
-        complexity_premise: &str,
-        image_premise: &str,
-        lexical_image_match: bool,
-    ) -> anyhow::Result<Classification> {
-        // An empty current turn cannot carry image intent; don't send an empty
-        // text to the API (the embeddings endpoint rejects empty content).
-        let image_text = image_premise.trim();
-        let texts: Vec<&str> = if image_text.is_empty() {
-            vec![complexity_premise]
-        } else {
-            vec![complexity_premise, image_text]
-        };
-
-        let embeddings = self.embed_batch(&texts).await?;
-        let image_embedding = if image_text.is_empty() {
-            None
-        } else {
-            Some(embeddings[1].as_slice())
-        };
-
-        Ok(combine_similarities(
-            &embeddings[0],
-            image_embedding,
-            &self.prototypes,
-            lexical_image_match,
-            self.image_gen_threshold,
-        ))
-    }
-}
-
 // ───────────────────────────────────────────────────────────────────────
-// The `embedContent` transport flavor
+// The `:embedContent` transport flavor
 // ───────────────────────────────────────────────────────────────────────
 
-/// A Vertex engine for Gemini-native embedding models served **only**
-/// through the `embedContent` method (`gemini-embedding-2`): no `:predict`,
-/// no batch method — every request embeds exactly one text, and multi-text
-/// embeds (the startup anchors, the two per-request premises) fan out as
-/// concurrent calls bounded by the semaphore. Live-verified at the `us`
-/// multi-region and `global` locations.
-pub struct VertexEmbedContent {
-    spec: &'static VertexSpec,
+/// The transport for Gemini-native embedding models served **only** through
+/// the `embedContent` method (`gemini-embedding-2`): no `:predict`, no batch
+/// method — every request embeds exactly one text, and multi-text embeds
+/// (the startup anchors, the two per-request premises) fan out as concurrent
+/// calls bounded by the semaphore. Live-verified at the `us` multi-region and
+/// `global` locations.
+pub struct VertexEmbedContentTransport {
     http: reqwest::Client,
     /// Full `:embedContent` URL.
     url: String,
@@ -457,60 +394,47 @@ pub struct VertexEmbedContent {
     /// Bounds concurrent in-flight embedding requests. `Arc` because the
     /// fan-out spawns owned tasks.
     permits: Arc<Semaphore>,
-    /// Cosine-similarity floor for the image axis (see
-    /// `crate::engines::embedding`).
-    image_gen_threshold: f32,
-    prototypes: Prototypes,
 }
 
-impl VertexEmbedContent {
-    /// Build the engine and embed the class anchors as a concurrent fan-out
-    /// of single-text calls — failing fast on any config or API problem.
-    pub async fn connect(
-        spec: &'static VertexSpec,
-        cfg: &VertexEmbeddingConfig,
-        image_gen_threshold: f32,
-    ) -> anyhow::Result<Self> {
-        let setup = VertexSetup::establish(spec, cfg)?;
-        let summary = setup.summary();
-        let url =
-            build_embed_content_url(&setup.base, &setup.project, &setup.location, spec.api_model);
+/// Build an `:embedContent`-flavored engine: validate config, resolve auth,
+/// then hand the transport to [`RemoteEmbeddingEngine::connect`] — which
+/// embeds the class anchors as a concurrent fan-out of single-text calls,
+/// failing fast on any config or API problem.
+pub async fn connect_embed_content(
+    spec: &'static RemoteSpec,
+    cfg: &VertexEmbeddingConfig,
+    image_gen_threshold: f32,
+) -> anyhow::Result<RemoteEmbeddingEngine<VertexEmbedContentTransport>> {
+    let setup = VertexSetup::establish(spec, cfg)?;
+    let summary = setup.summary();
+    let url = build_embed_content_url(&setup.base, &setup.project, &setup.location, spec.api_model);
 
-        let mut engine = VertexEmbedContent {
-            spec,
-            http: setup.http,
-            url,
-            token: setup.token,
-            quota_project: setup.quota_project,
-            permits: Arc::new(Semaphore::new(setup.max_concurrency)),
-            image_gen_threshold,
-            prototypes: Prototypes::default(),
-        };
+    let transport = VertexEmbedContentTransport {
+        http: setup.http,
+        url,
+        token: setup.token,
+        quota_project: setup.quota_project,
+        permits: Arc::new(Semaphore::new(setup.max_concurrency)),
+    };
 
-        let anchors = anchor_texts();
-        let embeddings = engine
-            .embed_all(&anchors)
-            .await
-            .with_context(|| format!("embedding class anchors for `{}`", spec.name))?;
-        engine.prototypes = build_prototypes(&embeddings)?;
+    let engine = RemoteEmbeddingEngine::connect(spec, transport, image_gen_threshold).await?;
+    log_ready(
+        spec,
+        "embed-content",
+        &summary,
+        engine.prototype_dims(),
+        anchor_texts().len(),
+    );
+    Ok(engine)
+}
 
-        log_ready(
-            spec,
-            "embed-content",
-            &summary,
-            engine.token.mode(),
-            engine.quota_project.as_ref(),
-            engine.prototypes.dims(),
-            anchors.len(),
-        );
-        Ok(engine)
-    }
-
+#[async_trait]
+impl EmbedTexts for VertexEmbedContentTransport {
     /// Embed every text as its own `:embedContent` call, concurrently,
     /// bounded by the semaphore; results return in input order. The Bearer
     /// token is resolved once per fan-out. Never echoes the texts into
     /// errors.
-    async fn embed_all(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let bearer = self.token.bearer().await?;
         let mut tasks = tokio::task::JoinSet::new();
         for (index, text) in texts.iter().enumerate() {
@@ -536,56 +460,6 @@ impl VertexEmbedContent {
             out[index] = values;
         }
         Ok(out)
-    }
-}
-
-#[async_trait]
-impl ClassifierEngine for VertexEmbedContent {
-    fn name(&self) -> &'static str {
-        self.spec.name
-    }
-
-    fn is_local(&self) -> bool {
-        false // prompt text is sent to the Vertex AI API
-    }
-
-    fn context_char_budget(&self) -> usize {
-        self.spec.context_char_budget
-    }
-
-    fn current_turn_char_budget(&self) -> usize {
-        self.spec.current_turn_char_budget
-    }
-
-    async fn classify(
-        &self,
-        complexity_premise: &str,
-        image_premise: &str,
-        lexical_image_match: bool,
-    ) -> anyhow::Result<Classification> {
-        // An empty current turn cannot carry image intent; don't send an empty
-        // text to the API (the embeddings endpoint rejects empty content).
-        let image_text = image_premise.trim();
-        let texts: Vec<&str> = if image_text.is_empty() {
-            vec![complexity_premise]
-        } else {
-            vec![complexity_premise, image_text]
-        };
-
-        let embeddings = self.embed_all(&texts).await?;
-        let image_embedding = if image_text.is_empty() {
-            None
-        } else {
-            Some(embeddings[1].as_slice())
-        };
-
-        Ok(combine_similarities(
-            &embeddings[0],
-            image_embedding,
-            &self.prototypes,
-            lexical_image_match,
-            self.image_gen_threshold,
-        ))
     }
 }
 
@@ -662,10 +536,7 @@ fn parse_embed_content(value: &Value) -> anyhow::Result<Vec<f32>> {
     if values.is_empty() {
         anyhow::bail!("vertex returned an empty embedding vector");
     }
-    Ok(values
-        .iter()
-        .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-        .collect())
+    numeric_vector(values).context("vertex embedding vector is malformed")
 }
 
 /// Build the `:predict` request body. An `instances` array batches every text
@@ -712,10 +583,7 @@ fn parse_embeddings(value: &Value, expected: usize) -> anyhow::Result<Vec<Vec<f3
             if values.is_empty() {
                 anyhow::bail!("vertex returned an empty embedding vector");
             }
-            Ok(values
-                .iter()
-                .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-                .collect())
+            numeric_vector(values).context("vertex embedding vector is malformed")
         })
         .collect()
 }
@@ -726,7 +594,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_token_source_returns_the_token() {
-        let source = TokenSource::Static("tok-123".to_string());
+        let source = TokenSource::Static(SecretString::from("tok-123"));
         assert_eq!(source.bearer().await.unwrap(), "tok-123");
         assert_eq!(source.mode(), "static-token");
     }
@@ -821,6 +689,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_embed_content_rejects_non_numeric_elements() {
+        // A string (or null) element must be a loud error, never a silent 0.0.
+        let bad = serde_json::json!({"embedding": {"values": [1.0, "2.0"]}});
+        let err = parse_embed_content(&bad).unwrap_err();
+        assert!(format!("{err:#}").contains("not a number"), "got: {err:#}");
+        let null = serde_json::json!({"embedding": {"values": [1.0, null]}});
+        assert!(parse_embed_content(&null).is_err());
+    }
+
+    #[test]
     fn parse_embeddings_happy_path_and_errors() {
         let ok = serde_json::json!({"predictions": [
             {"embeddings": {"values": [1.0, 2.0], "statistics": {"token_count": 2}}},
@@ -837,5 +715,15 @@ mod tests {
         assert!(parse_embeddings(&no_values, 1).is_err());
         let empty = serde_json::json!({"predictions": [{"embeddings": {"values": []}}]});
         assert!(parse_embeddings(&empty, 1).is_err());
+    }
+
+    #[test]
+    fn parse_embeddings_rejects_non_numeric_elements() {
+        // A string (or null) element must be a loud error, never a silent 0.0.
+        let bad = serde_json::json!({"predictions": [{"embeddings": {"values": [1.0, "2.0"]}}]});
+        let err = parse_embeddings(&bad, 1).unwrap_err();
+        assert!(format!("{err:#}").contains("not a number"), "got: {err:#}");
+        let null = serde_json::json!({"predictions": [{"embeddings": {"values": [1.0, null]}}]});
+        assert!(parse_embeddings(&null, 1).is_err());
     }
 }

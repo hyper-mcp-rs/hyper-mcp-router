@@ -1,19 +1,22 @@
 //! The Gemini Developer API engine family: shared transport here in `mod.rs`,
 //! **one file per model** in this directory (`embedding_001.rs`,
-//! `embedding_2.rs`), each defining a [`GeminiSpec`] and delegating to the
-//! shared [`GeminiEmbedding`] engine.
+//! `embedding_2.rs`), each declaring a
+//! [`RemoteSpec`](crate::engines::embedding::RemoteSpec) and building the
+//! provider-neutral engine over the shared [`GeminiTransport`].
 //!
 //! Note: `text-embedding-005` is **not** here — it is published only on
 //! Vertex AI (a different API), so it lives in the `vertex/` family.
 //!
-//! The classification *method* (anchor prototypes, cosine scoring) is
-//! provider-neutral and lives in `crate::engines::embedding`; this file owns
-//! only what is Gemini-specific: the `batchEmbedContents` wire format, the
-//! `x-goog-api-key` auth header, and the endpoint layout.
+//! The classification *method* (anchor prototypes, cosine scoring) and the
+//! shared engine ([`RemoteEmbeddingEngine`]) are provider-neutral and live in
+//! `crate::engines::embedding`; this file owns only what is Gemini-specific:
+//! the `batchEmbedContents` wire format, the `x-goog-api-key` auth header,
+//! and the endpoint layout.
 //!
 //! Anchor embedding happens once at startup and **fails fast** on any API
-//! problem (bad key, unreachable endpoint), so misconfiguration is a clear
-//! boot error, not a silent stream of balanced-default fallbacks.
+//! problem (bad key, unreachable endpoint) — after a bounded retry on
+//! transient upstream failures — so misconfiguration is a clear boot error,
+//! not a silent stream of balanced-default fallbacks.
 //!
 //! ## Privacy and failure notes
 //!
@@ -28,12 +31,15 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
-use crate::classifier::{Classification, ClassifierEngine};
 use crate::config::RemoteEmbeddingConfig;
-use crate::engines::embedding::{anchor_texts, build_prototypes, combine_similarities, Prototypes};
+use crate::engines::embedding::{
+    anchor_texts, is_transient_status, numeric_vector, transient_error, EmbedTexts,
+    RemoteEmbeddingEngine, RemoteSpec, TransientUpstream,
+};
 
 /// Default public Gemini API endpoint.
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -42,125 +48,103 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 /// same one for their similarities to be comparable.
 const TASK_TYPE: &str = "SEMANTIC_SIMILARITY";
 
-/// Everything that differs between Gemini embedding models. Each model file
-/// declares one of these as a `const`.
-pub struct GeminiSpec {
-    /// Engine id (matches `ClassifierModel::as_str`).
-    pub name: &'static str,
-    /// Model resource path sent to the API, e.g. `models/gemini-embedding-001`.
-    pub api_model: &'static str,
-    /// Char budget for the complexity window (sized to the model's input
-    /// token limit).
-    pub context_char_budget: usize,
-    /// Char budget for the current turn (image premise / lexical prefilter).
-    pub current_turn_char_budget: usize,
-    /// Default max concurrent embedding requests (the "session pool").
-    pub default_max_concurrency: usize,
-    /// Default per-call timeout, seconds.
-    pub default_request_timeout_secs: u64,
-}
-
-/// A remote Gemini embedding engine (shared by every Gemini model file).
-pub struct GeminiEmbedding {
-    spec: &'static GeminiSpec,
+/// The Gemini Developer API transport: one `batchEmbedContents` call per
+/// embed, authenticated via the `x-goog-api-key` header.
+pub struct GeminiTransport {
+    /// Model resource path baked into each request body.
+    api_model: &'static str,
     http: reqwest::Client,
     /// Full `:batchEmbedContents` URL.
     url: String,
-    api_key: String,
+    /// Redacted; exposed only to build the `x-goog-api-key` header.
+    api_key: SecretString,
     /// Bounds concurrent in-flight embedding requests — this engine's
     /// equivalent of the embedded engine's session pool.
     permits: Semaphore,
-    /// Cosine-similarity floor for the image axis (see
-    /// `crate::engines::embedding`).
-    image_gen_threshold: f32,
-    prototypes: Prototypes,
 }
 
-impl GeminiEmbedding {
-    /// Build the engine: validate config (the API key is **required**, exactly
-    /// like a routed model's key but mandatory), construct the HTTP client,
-    /// and embed the class anchors — failing fast on any API problem.
-    pub async fn connect(
-        spec: &'static GeminiSpec,
-        cfg: &RemoteEmbeddingConfig,
-        image_gen_threshold: f32,
-    ) -> anyhow::Result<Self> {
-        let Some(api_key) = cfg.api_key.clone() else {
-            anyhow::bail!(
-                "classifier engine `{}` requires an API key: set `api_key` in \
-                 [classifier.{}] (plaintext, ${{ENV_VAR}}, or a keyring table)",
-                spec.name,
-                spec.name,
-            );
-        };
-
-        let base = cfg
-            .base_url
-            .as_ref()
-            .map(|u| u.as_str().trim_end_matches('/').to_string())
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        let url = format!("{base}/v1beta/{}:batchEmbedContents", spec.api_model);
-
-        let timeout = cfg
-            .request_timeout_secs
-            .unwrap_or(spec.default_request_timeout_secs);
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(timeout))
-            .build()?;
-
-        let max_concurrency = cfg
-            .max_concurrency
-            .unwrap_or(spec.default_max_concurrency)
-            .max(1);
-
-        let mut engine = GeminiEmbedding {
-            spec,
-            http,
-            url,
-            api_key,
-            permits: Semaphore::new(max_concurrency),
-            image_gen_threshold,
-            prototypes: Prototypes::default(),
-        };
-
-        // Embed every anchor in one batch and pool per class. Startup is the
-        // right place to fail on a bad key or unreachable endpoint.
-        let anchors = anchor_texts();
-        let embeddings = engine
-            .embed_batch(&anchors)
-            .await
-            .with_context(|| format!("embedding class anchors for `{}`", spec.name))?;
-        engine.prototypes = build_prototypes(&embeddings)?;
-
-        tracing::info!(
-            engine = spec.name,
-            embedding_dims = engine.prototypes.dims(),
-            anchor_count = anchors.len(),
-            max_concurrency,
-            request_timeout_secs = timeout,
-            "gemini embedding engine ready"
+/// Build the family's engine: validate config (the API key is **required**,
+/// exactly like a routed model's key but mandatory), construct the transport,
+/// and hand it to [`RemoteEmbeddingEngine::connect`] — which embeds the class
+/// anchors, failing fast on any API problem.
+pub async fn connect(
+    spec: &'static RemoteSpec,
+    cfg: &RemoteEmbeddingConfig,
+    image_gen_threshold: f32,
+) -> anyhow::Result<RemoteEmbeddingEngine<GeminiTransport>> {
+    let Some(api_key) = cfg.api_key.as_ref() else {
+        anyhow::bail!(
+            "classifier engine `{}` requires an API key: set `api_key` in \
+             [classifier.{}] (plaintext, ${{ENV_VAR}}, or a keyring table)",
+            spec.name,
+            spec.name,
         );
-        Ok(engine)
-    }
+    };
+    let api_key = api_key.resolved()?.clone();
 
+    let base = cfg
+        .base_url
+        .as_ref()
+        .map(|u| u.as_str().trim_end_matches('/').to_string())
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+    let url = format!("{base}/v1beta/{}:batchEmbedContents", spec.api_model);
+
+    let timeout = cfg
+        .request_timeout_secs
+        .unwrap_or(spec.default_request_timeout_secs);
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(timeout))
+        .build()?;
+
+    let max_concurrency = cfg
+        .max_concurrency
+        .unwrap_or(spec.default_max_concurrency)
+        .max(1);
+
+    let transport = GeminiTransport {
+        api_model: spec.api_model,
+        http,
+        url,
+        api_key,
+        permits: Semaphore::new(max_concurrency),
+    };
+
+    let engine = RemoteEmbeddingEngine::connect(spec, transport, image_gen_threshold).await?;
+
+    tracing::info!(
+        engine = spec.name,
+        embedding_dims = engine.prototype_dims(),
+        anchor_count = anchor_texts().len(),
+        max_concurrency,
+        request_timeout_secs = timeout,
+        "gemini embedding engine ready"
+    );
+    Ok(engine)
+}
+
+#[async_trait]
+impl EmbedTexts for GeminiTransport {
     /// Embed `texts` in one `batchEmbedContents` call, bounded by the
-    /// concurrency semaphore. Never echoes the texts into errors.
-    async fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    /// concurrency semaphore. Never echoes the texts into errors. Transport
+    /// failures and 429/5xx statuses carry the [`TransientUpstream`] marker
+    /// so startup anchor embedding can retry them.
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let _permit = self
             .permits
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("embedding concurrency semaphore closed"))?;
 
-        let body = build_batch_request(self.spec.api_model, texts);
+        let body = build_batch_request(self.api_model, texts);
         let resp = self
             .http
             .post(&self.url)
-            .header("x-goog-api-key", &self.api_key)
+            .header("x-goog-api-key", self.api_key.expose_secret())
             .json(&body)
             .send()
             .await
+            .context(TransientUpstream)
             .context("gemini embeddings request failed")?;
 
         let status = resp.status();
@@ -173,7 +157,12 @@ impl GeminiEmbedding {
                 .chars()
                 .take(300)
                 .collect();
-            anyhow::bail!("gemini embeddings returned {status}: {detail}");
+            let message = format!("gemini embeddings returned {status}: {detail}");
+            return Err(if is_transient_status(status) {
+                transient_error(message)
+            } else {
+                anyhow::anyhow!(message)
+            });
         }
 
         let value: Value = resp
@@ -181,56 +170,6 @@ impl GeminiEmbedding {
             .await
             .context("gemini embeddings response was not JSON")?;
         parse_embeddings(&value, texts.len())
-    }
-}
-
-#[async_trait]
-impl ClassifierEngine for GeminiEmbedding {
-    fn name(&self) -> &'static str {
-        self.spec.name
-    }
-
-    fn is_local(&self) -> bool {
-        false // prompt text is sent to the Generative Language API
-    }
-
-    fn context_char_budget(&self) -> usize {
-        self.spec.context_char_budget
-    }
-
-    fn current_turn_char_budget(&self) -> usize {
-        self.spec.current_turn_char_budget
-    }
-
-    async fn classify(
-        &self,
-        complexity_premise: &str,
-        image_premise: &str,
-        lexical_image_match: bool,
-    ) -> anyhow::Result<Classification> {
-        // An empty current turn cannot carry image intent; don't send an empty
-        // text to the API (some models reject it).
-        let image_text = image_premise.trim();
-        let texts: Vec<&str> = if image_text.is_empty() {
-            vec![complexity_premise]
-        } else {
-            vec![complexity_premise, image_text]
-        };
-
-        let embeddings = self.embed_batch(&texts).await?;
-        let image_embedding = if image_text.is_empty() {
-            None
-        } else {
-            Some(embeddings[1].as_slice())
-        };
-
-        Ok(combine_similarities(
-            &embeddings[0],
-            image_embedding,
-            &self.prototypes,
-            lexical_image_match,
-            self.image_gen_threshold,
-        ))
     }
 }
 
@@ -275,10 +214,7 @@ fn parse_embeddings(value: &Value, expected: usize) -> anyhow::Result<Vec<Vec<f3
             if values.is_empty() {
                 anyhow::bail!("gemini returned an empty embedding vector");
             }
-            Ok(values
-                .iter()
-                .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-                .collect())
+            numeric_vector(values).context("gemini embedding vector is malformed")
         })
         .collect()
 }
@@ -312,5 +248,15 @@ mod tests {
         assert!(parse_embeddings(&serde_json::json!({}), 1).is_err());
         let empty = serde_json::json!({"embeddings": [{"values": []}]});
         assert!(parse_embeddings(&empty, 1).is_err());
+    }
+
+    #[test]
+    fn parse_embeddings_rejects_non_numeric_elements() {
+        // A string (or null) element must be a loud error, never a silent 0.0.
+        let bad = serde_json::json!({"embeddings": [{"values": [1.0, "2.0"]}]});
+        let err = parse_embeddings(&bad, 1).unwrap_err();
+        assert!(format!("{err:#}").contains("not a number"), "got: {err:#}");
+        let null = serde_json::json!({"embeddings": [{"values": [1.0, null]}]});
+        assert!(parse_embeddings(&null, 1).is_err());
     }
 }

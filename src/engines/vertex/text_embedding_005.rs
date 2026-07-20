@@ -18,11 +18,12 @@
 //! window and current turn) to the Vertex AI API.
 
 use crate::config::ClassifierConfig;
+use crate::engines::embedding::{RemoteEmbeddingEngine, RemoteSpec};
 
-use super::{VertexEmbedding, VertexSpec};
+use super::VertexPredictTransport;
 
 /// Model-specific parameters for `text-embedding-005`.
-pub const SPEC: VertexSpec = VertexSpec {
+pub const SPEC: RemoteSpec = RemoteSpec {
     name: "text-embedding-005",
     api_model: "text-embedding-005",
     // 2048-token input limit; ~4 chars/token with headroom.
@@ -42,12 +43,14 @@ const _: () = {
 };
 
 /// Build the engine from its `[classifier.text-embedding-005]` table.
-pub async fn build(cfg: &ClassifierConfig) -> anyhow::Result<VertexEmbedding> {
+pub async fn build(
+    cfg: &ClassifierConfig,
+) -> anyhow::Result<RemoteEmbeddingEngine<VertexPredictTransport>> {
     let threshold = cfg
         .text_embedding_005
         .image_generation_threshold
         .unwrap_or(cfg.image_generation_threshold);
-    VertexEmbedding::connect(&SPEC, &cfg.text_embedding_005, threshold).await
+    super::connect_predict(&SPEC, &cfg.text_embedding_005, threshold).await
 }
 
 #[cfg(test)]

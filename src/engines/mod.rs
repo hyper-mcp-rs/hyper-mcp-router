@@ -19,11 +19,17 @@
 //!
 //! ## Adding a new engine
 //!
-//! 1. Add the model file implementing [`ClassifierEngine`] — inside an
-//!    existing family directory (e.g. `gemini/<model>.rs`, delegating to the
-//!    family's shared engine), or as a new top-level file / family directory
-//!    (construct it from [`crate::config::ClassifierConfig`], owning any
-//!    model-specific sizing/warnings).
+//! 1. Add the model file — for a **remote embedding model**, inside an
+//!    existing family directory (e.g. `gemini/<model>.rs`): declare a
+//!    `pub const SPEC: RemoteSpec` (see `crate::engines::embedding`) and a
+//!    `build()` that calls the family's connect function, which pairs the
+//!    spec with the family's [`EmbedTexts`](embedding::EmbedTexts) transport
+//!    and returns a ready `RemoteEmbeddingEngine`. A new **provider family**
+//!    adds a directory whose `mod.rs` owns everything provider-specific
+//!    (wire format, auth, endpoint layout) as an `EmbedTexts` transport. A
+//!    **local engine** is a top-level file implementing [`ClassifierEngine`]
+//!    directly (construct it from [`crate::config::ClassifierConfig`],
+//!    owning any model-specific sizing/warnings).
 //! 2. If it needs settings, add a `[classifier.<model>]` table struct in
 //!    `crate::config` (see `DebertaV3XsmallZeroshotConfig`).
 //! 3. Add a variant to [`ClassifierModel`] in `crate::classifier` (its

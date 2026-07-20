@@ -35,6 +35,9 @@ ndarray    = "0.17"   # must match the ndarray version `ort` re-exports
 ort        = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
 regex      = "1.13"
 reqwest    = { version = "0.13", features = ["stream", "json"] }
+# Redacting wrapper for resolved credentials: `Debug` never prints the value
+# and every access site is an explicit, greppable `expose_secret()` call.
+secrecy    = "0.10"
 serde      = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
