@@ -9,9 +9,21 @@
 //! and for cached copies — so a partial download, a corrupted cache, or an
 //! upstream change can never be silently embedded. Files are written via a
 //! temp-file + rename so the final path never holds a partial file.
+//!
+//! Offline / air-gapped builds: set `HYPER_MCP_ROUTER_ARTIFACT_DIR` to a
+//! directory containing pre-fetched copies of the artifacts under their
+//! destination names (`router_model.onnx`, `tokenizer.json`) and they are
+//! read from there instead of downloaded. Vendored files go through the
+//! same SHA-256 verification — a mismatching file fails the build.
+//!
+//! Note on a second download channel: this script only pins the *model*
+//! artifacts. The `ort` crate's `download-binaries` feature separately
+//! fetches the ONNX Runtime shared library at build time, with its own
+//! checksum verification, outside this script's pinning regime.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -44,6 +56,9 @@ fn main() {
     // can never be mistaken for each other across builds (the digest check
     // below re-downloads over a stub regardless).
     println!("cargo:rerun-if-env-changed=DOCS_RS");
+    // …and when the vendored-artifact directory changes, so switching between
+    // offline and online sourcing is picked up.
+    println!("cargo:rerun-if-env-changed=HYPER_MCP_ROUTER_ARTIFACT_DIR");
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
 
@@ -59,6 +74,11 @@ fn main() {
         return;
     }
 
+    // Vendored-artifact escape hatch for air-gapped/offline builds: read the
+    // artifacts from this directory instead of downloading. Verification
+    // below still applies — vendoring bypasses the network, not the pinning.
+    let vendor_dir = std::env::var_os("HYPER_MCP_ROUTER_ARTIFACT_DIR").map(PathBuf::from);
+
     for (name, repo_path, expected_sha256) in ARTIFACTS {
         let dest = Path::new(&out_dir).join(name);
 
@@ -70,25 +90,18 @@ fn main() {
             if sha256_hex(&cached) == expected_sha256 {
                 continue;
             }
-            println!("cargo:warning={name}: cached copy failed checksum; re-downloading");
+            println!("cargo:warning={name}: cached copy failed checksum; re-fetching");
         }
 
-        let url = format!("https://huggingface.co/{REPO}/resolve/{REVISION}/{repo_path}");
-        let mut response = ureq::get(&url)
-            .call()
-            .unwrap_or_else(|e| panic!("failed to download {name} from {url}: {e}"));
-
-        let mut bytes = Vec::new();
-        response
-            .body_mut()
-            .as_reader()
-            .read_to_end(&mut bytes)
-            .unwrap_or_else(|e| panic!("failed to read {name} response body: {e}"));
+        let (bytes, source) = match &vendor_dir {
+            Some(dir) => read_vendored(dir, name),
+            None => download(name, repo_path),
+        };
 
         let actual = sha256_hex(&bytes);
         assert_eq!(
             actual, expected_sha256,
-            "{name} downloaded from {url} failed SHA-256 verification \
+            "{name} from {source} failed SHA-256 verification \
              (expected {expected_sha256}, got {actual})"
         );
 
@@ -99,6 +112,48 @@ fn main() {
         std::fs::rename(&tmp, &dest)
             .unwrap_or_else(|e| panic!("failed to move {} into place: {e}", dest.display()));
     }
+}
+
+/// Read a vendored artifact from `HYPER_MCP_ROUTER_ARTIFACT_DIR`. Returns the
+/// bytes and a source description for error messages. The caller still
+/// verifies the digest — a wrong or stale vendored file fails the build.
+fn read_vendored(dir: &Path, name: &str) -> (Vec<u8>, String) {
+    let path = dir.join(name);
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "HYPER_MCP_ROUTER_ARTIFACT_DIR is set but {} could not be read: {e}",
+            path.display()
+        )
+    });
+    (bytes, path.display().to_string())
+}
+
+/// Download an artifact from the pinned HuggingFace revision. Returns the
+/// bytes and the URL for error messages. The caller verifies the digest.
+fn download(name: &str, repo_path: &str) -> (Vec<u8>, String) {
+    let url = format!("https://huggingface.co/{REPO}/resolve/{REVISION}/{repo_path}");
+
+    // A global timeout so a stalled connection can never hang the build
+    // indefinitely; 10 minutes is generous for the ~87 MB model on a slow
+    // link (~1.2 Mbit/s sustained).
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(600)))
+        .build()
+        .into();
+
+    let mut response = agent
+        .get(&url)
+        .call()
+        .unwrap_or_else(|e| panic!("failed to download {name} from {url}: {e}"));
+
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .read_to_end(&mut bytes)
+        .unwrap_or_else(|e| panic!("failed to read {name} response body: {e}"));
+
+    (bytes, url)
 }
 
 /// Lowercase hex SHA-256 of `bytes`.

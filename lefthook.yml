@@ -32,10 +32,8 @@ pre-commit:
 
     clippy:
       tags: rust lint
-      # Templates and Cargo.toml affect compilation just as much as .rs:
-      # askama's macro reads .html at build time, so a typo in a template
-      # is a clippy/build error.
-      glob: "*.{rs,html,toml}"
+      # Cargo.toml affects compilation just as much as .rs files do.
+      glob: "*.{rs,toml}"
       run: cargo clippy --all-targets --all-features --locked -- -D warnings
       fail_text: |
         Clippy reported warnings. Fix them or add a justified

@@ -56,6 +56,10 @@ the first build (network access required once); subsequent builds reuse the
 cached files. Artifacts are fetched from a **pinned revision** and verified
 against pinned SHA-256 digests — on download and on every cache hit — so a
 partial download or upstream change can never be silently embedded.
+Separately, the `ort` crate downloads the ONNX Runtime binary at build time
+(with its own checksum verification); for offline builds, set
+`HYPER_MCP_ROUTER_ARTIFACT_DIR` to a directory holding pre-fetched
+`router_model.onnx` and `tokenizer.json` to skip the model download.
 
 ```sh
 cargo build --release

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-hyper-mcp is a Rust-based Model Context Protocol server that loads and manages plugins (WASM binaries) at runtime.
+hyper-mcp-router is an adaptive, OpenAI Chat Completions-compatible LLM router written in Rust. It classifies each incoming prompt (using an embedded zero-shot NLI model by default, with remote embedding engines pluggable) and forwards the request to an appropriate backend model tier.
 
 ## Tooling
 
