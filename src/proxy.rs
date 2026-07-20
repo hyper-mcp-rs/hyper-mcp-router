@@ -391,7 +391,7 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
     if streaming && status.is_success() {
         stream_passthrough(resp)
     } else {
-        buffered_passthrough(resp).await
+        buffered_passthrough(resp, &backend.config.name, route.estimated_tokens).await
     }
 }
 
@@ -505,13 +505,17 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
         }
     }
 
-    let classified: Option<ModelTier> = if count_candidates(
+    let candidates = count_candidates(
         state.models.iter(),
         |routed| &routed.config,
         &required,
         estimated_tokens,
-    ) <= 1
-    {
+    );
+    let classified: Option<ModelTier> = if candidates <= 1 {
+        tracing::debug!(
+            candidates,
+            "classification skipped: at most one candidate serves the request; nothing to rank"
+        );
         None
     } else {
         let classification = classify_or_default(
@@ -614,16 +618,7 @@ async fn classify_or_default(
 ) -> Classification {
     let Some(window) = window else {
         // Nothing substantive to classify.
-        return if has_nonempty_user_text(body) {
-            // The user did say something, but all of it was trivial: pure
-            // chit-chat → Fast.
-            Classification {
-                complexity: ModelTier::Fast,
-                image_generation: false,
-            }
-        } else {
-            Classification::balanced_default()
-        };
+        return classify_without_model(body);
     };
 
     match engine.classify(window, current_turn, lexical_image).await {
@@ -639,7 +634,27 @@ async fn classify_or_default(
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
+/// The model-free classification for an empty window, with the reason logged
+/// at debug so an evaluation log distinguishes "the classifier judged this
+/// Fast" from "the fast path fired without inference".
+fn classify_without_model(body: &Value) -> Classification {
+    if has_nonempty_user_text(body) {
+        // The user did say something, but all of it was trivial: pure
+        // chit-chat → Fast.
+        tracing::debug!(
+            "classification skipped: user text is all trivial filler; routing Fast without inference"
+        );
+        Classification {
+            complexity: ModelTier::Fast,
+            image_generation: false,
+        }
+    } else {
+        tracing::debug!("classification skipped: no user text to judge; using balanced default");
+        Classification::balanced_default()
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // Response construction
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -695,13 +710,22 @@ fn stream_passthrough(resp: reqwest::Response) -> Response {
 }
 
 /// Forward a non-streaming (or error) upstream response verbatim: same status,
-/// same body, preserved end-to-end headers.
-async fn buffered_passthrough(resp: reqwest::Response) -> Response {
+/// same body, preserved end-to-end headers. Successful responses additionally
+/// feed the debug-level usage log (see [`log_upstream_usage`]) — the body is
+/// already fully buffered here, so the peek is free.
+async fn buffered_passthrough(
+    resp: reqwest::Response,
+    model: &str,
+    estimated_tokens: u64,
+) -> Response {
     let status = resp.status();
     let upstream_headers = resp.headers().clone();
 
     match resp.bytes().await {
         Ok(bytes) => {
+            if status.is_success() {
+                log_upstream_usage(model, estimated_tokens, &bytes);
+            }
             let mut builder = Response::builder().status(status);
             if let Some(dst) = builder.headers_mut() {
                 copy_end_to_end_headers(&upstream_headers, dst);
@@ -718,6 +742,35 @@ async fn buffered_passthrough(resp: reqwest::Response) -> Response {
             upstream_error(StatusCode::BAD_GATEWAY, "upstream_body_error")
         }
     }
+}
+
+/// Debug-level estimated-vs-actual token accounting: the router's routing
+/// estimate (message chars at ~4/token PLUS the requested completion budget —
+/// see [`estimate_request_tokens`]) next to the upstream's authoritative
+/// `usage` object. Watching the two side by side over an evaluation period
+/// calibrates the context-fit heuristic. Non-JSON bodies and responses
+/// without a `usage` object (e.g. SSE chunks never reach here) are skipped
+/// silently; the `enabled!` guard avoids parsing the full response body when
+/// debug is off.
+fn log_upstream_usage(model: &str, estimated_tokens: u64, body: &[u8]) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let Ok(parsed) = serde_json::from_slice::<Value>(body) else {
+        return;
+    };
+    let Some(usage) = parsed.get("usage") else {
+        return;
+    };
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64);
+    tracing::debug!(
+        model,
+        estimated_tokens,
+        prompt_tokens = count("prompt_tokens"),
+        completion_tokens = count("completion_tokens"),
+        total_tokens = count("total_tokens"),
+        "upstream token usage"
+    );
 }
 
 fn bad_request(message: &str) -> Response {
@@ -929,42 +982,8 @@ mod tests {
         assert!(dst.get(header::CONTENT_LENGTH).is_none());
     }
 
-    // ── debug completion-request logging ──────────────────────────
-    /// A cloneable in-memory sink for `tracing_subscriber::fmt`, so tests can
-    /// assert on exactly what a log event emitted.
-    #[derive(Clone, Default)]
-    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-        type Writer = CaptureWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Run `f` under a thread-local subscriber capped at `max_level` and
-    /// return everything it logged.
-    fn captured_log(max_level: tracing::Level, f: impl FnOnce()) -> String {
-        let writer = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(max_level)
-            .with_writer(writer.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let bytes = writer.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
-    }
+    // ── debug completion-request logging ──────────────────────
+    use crate::test_support::captured_log;
 
     fn route_resolution(
         classified: Option<ModelTier>,
@@ -1044,6 +1063,78 @@ mod tests {
             "got: {out}"
         );
         assert!(!out.contains("completion request"), "got: {out}");
+    }
+
+    // ── debug upstream-usage logging ────────────────────────────
+    #[test]
+    fn upstream_usage_logged_estimated_vs_actual_at_debug() {
+        let body = json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let out = captured_log(tracing::Level::DEBUG, || {
+            log_upstream_usage("backend-model", 200, &bytes);
+        });
+        assert!(out.contains("upstream token usage"), "got: {out}");
+        assert!(out.contains("estimated_tokens=200"), "got: {out}");
+        assert!(out.contains("prompt_tokens=120"), "got: {out}");
+        assert!(out.contains("completion_tokens=30"), "got: {out}");
+        assert!(out.contains("total_tokens=150"), "got: {out}");
+    }
+
+    #[test]
+    fn upstream_usage_skips_bodies_without_usage_or_non_json() {
+        // A well-formed body without `usage`, and a non-JSON body: neither
+        // may emit (or worse, error) — the log is best-effort only.
+        let no_usage = serde_json::to_vec(&json!({"choices": []})).unwrap();
+        let out = captured_log(tracing::Level::DEBUG, || {
+            log_upstream_usage("backend-model", 200, &no_usage);
+            log_upstream_usage("backend-model", 200, b"data: [DONE]\n\n");
+        });
+        assert!(out.is_empty(), "got: {out}");
+    }
+
+    #[test]
+    fn upstream_usage_not_parsed_below_debug() {
+        let body = serde_json::to_vec(&json!({"usage": {"total_tokens": 1}})).unwrap();
+        let out = captured_log(tracing::Level::INFO, || {
+            log_upstream_usage("backend-model", 200, &body);
+        });
+        assert!(out.is_empty(), "got: {out}");
+    }
+
+    // ── classification skip reasons ─────────────────────────────
+    #[test]
+    fn trivial_only_text_routes_fast_and_logs_the_reason() {
+        let body = json!({"messages": [{"role": "user", "content": "ok thanks"}]});
+        let mut result = Classification::balanced_default();
+        let out = captured_log(tracing::Level::DEBUG, || {
+            result = classify_without_model(&body);
+        });
+        assert_eq!(result.complexity, ModelTier::Fast);
+        assert!(!result.image_generation);
+        assert!(
+            out.contains("trivial filler; routing Fast without inference"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn no_user_text_defaults_balanced_and_logs_the_reason() {
+        let body = json!({"messages": [{"role": "system", "content": "be terse"}]});
+        let mut result = Classification {
+            complexity: ModelTier::Fast,
+            image_generation: true,
+        };
+        let out = captured_log(tracing::Level::DEBUG, || {
+            result = classify_without_model(&body);
+        });
+        assert_eq!(result, Classification::balanced_default());
+        assert!(
+            out.contains("no user text to judge; using balanced default"),
+            "got: {out}"
+        );
     }
 
     // ── inferred image-output soft insertion ─────────────────────

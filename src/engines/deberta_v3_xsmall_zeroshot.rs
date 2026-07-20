@@ -532,9 +532,44 @@ fn combine(
         }
     }
 
+    let image_generation = lexical_image_match || image_gen_score >= image_gen_threshold;
+
+    // Debug-level score breakdown: every hypothesis's P(entailment) plus the
+    // image-gen score against its threshold, so a routing decision can be
+    // read as "how close was the call" rather than just its outcome — the
+    // data needed to tune hypotheses/threshold during an evaluation period.
+    // Scores only, never premise text. The `enabled!` guard skips the
+    // rendering allocation on the (per-request) hot path when debug is off.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let hypothesis_scores: Vec<(&'static str, f32)> = scores
+            .iter()
+            .map(|&(kind, p)| (kind_label(kind), p))
+            .collect();
+        tracing::debug!(
+            scores = ?hypothesis_scores,
+            complexity = ?best_tier,
+            complexity_score = best_score,
+            image_gen_score,
+            image_gen_threshold,
+            lexical_image_match,
+            image_generation,
+            "NLI hypothesis scores"
+        );
+    }
+
     Classification {
         complexity: best_tier,
-        image_generation: lexical_image_match || image_gen_score >= image_gen_threshold,
+        image_generation,
+    }
+}
+
+/// Stable log label for a hypothesis kind (several hypotheses may share one).
+fn kind_label(kind: HypothesisKind) -> &'static str {
+    match kind {
+        HypothesisKind::Complexity(ModelTier::Fast) => "fast",
+        HypothesisKind::Complexity(ModelTier::Balanced) => "balanced",
+        HypothesisKind::Complexity(ModelTier::Frontier) => "frontier",
+        HypothesisKind::ImageGeneration => "image-generation",
     }
 }
 
@@ -639,6 +674,34 @@ mod tests {
         // lexical match forces true even with a very low score
         let low = vec![(HypothesisKind::ImageGeneration, 0.01)];
         assert!(combine(&low, true, 0.5).image_generation);
+    }
+
+    #[test]
+    fn combine_logs_per_hypothesis_scores_at_debug() {
+        let mut scores = complexity_scores();
+        scores.push((HypothesisKind::ImageGeneration, 0.4));
+        let out = crate::test_support::captured_log(tracing::Level::DEBUG, || {
+            combine(&scores, false, 0.5);
+        });
+        assert!(out.contains("NLI hypothesis scores"), "got: {out}");
+        // Every hypothesis appears with its label and score…
+        assert!(out.contains(r#"("fast", 0.2)"#), "got: {out}");
+        assert!(out.contains(r#"("balanced", 0.3)"#), "got: {out}");
+        assert!(out.contains(r#"("frontier", 0.9)"#), "got: {out}");
+        assert!(out.contains(r#"("image-generation", 0.4)"#), "got: {out}");
+        // …alongside the resulting decision and the threshold in force.
+        assert!(out.contains("complexity=Frontier"), "got: {out}");
+        assert!(out.contains("image_gen_threshold=0.5"), "got: {out}");
+        assert!(out.contains("image_generation=false"), "got: {out}");
+    }
+
+    #[test]
+    fn combine_stays_silent_below_debug() {
+        let scores = complexity_scores();
+        let out = crate::test_support::captured_log(tracing::Level::INFO, || {
+            combine(&scores, false, 0.5);
+        });
+        assert!(out.is_empty(), "got: {out}");
     }
 
     // ── logits shape validation ───────────────────────────────────

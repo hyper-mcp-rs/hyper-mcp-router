@@ -25,6 +25,9 @@ pub mod prompt;
 pub mod proxy;
 pub mod selection;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 /// The quantized ONNX NLI model for the zero-shot engine, embedded at build
 /// time (see `build.rs` and `engines/zero_shot.rs`).
 pub(crate) static MODEL_BYTES: &[u8] =
