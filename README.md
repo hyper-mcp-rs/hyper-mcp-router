@@ -17,7 +17,9 @@ No external state, no database, no runtime model downloads.
   at build time; nothing is fetched at runtime.
 - **Zero customer-data collection** — the default embedded model needs no
   fine-tuning and no telemetry, and classification is fully local.
-  Operational logs contain routing metadata only, never user content.
+  At the default log level, operational logs contain routing metadata only,
+  never user content (prompt text appears only at opt-in `debug` — see
+  [Logging](#logging)).
 - **Pluggable classification** — the classifier is a trait; models live one
   file per engine under `src/engines/` and are selected with the
   `[classifier] model` config setting (see
@@ -562,8 +564,43 @@ journal), or the container runtime, all of which handle rotation and
 shipping better than an in-process file writer. Level via `RUST_LOG`; the
 default is `info` with ONNX Runtime's verbose per-session logging quieted to
 `warn` (`info,ort=warn`), and a set `RUST_LOG` overrides that entirely.
-Routing logs are metadata-only — modalities, tier, engine, prompt sizes,
-estimated tokens, latency — never user content.
+
+At the default `info` level, routing logs are metadata-only — modalities,
+tier, engine, prompt sizes, estimated tokens, latency — never user content.
+
+### Debug logging
+
+The `debug` level adds per-request events for observing routing decisions
+end-to-end (e.g. during an evaluation period):
+
+- **`completion request`** — the ENTIRE current-turn prompt (untruncated)
+  and the compiled classification window (the pruned multi-turn text the
+  complexity classifier consumed, char-for-char), alongside the selected
+  model, tier, engine, and metrics. **This is the one place user content
+  reaches the logs, and only at `debug`** — the level is the opt-in.
+- **`NLI hypothesis scores`** (embedded engine) — every hypothesis's
+  P(entailment) with its tier label, the winning tier and score, and the
+  image-generation score against its threshold: a decision reads as "how
+  close was the call", the data for tuning hypotheses and thresholds.
+  Scores only, never premise text.
+- **`upstream token usage`** — on buffered (non-streaming) success
+  responses, the router's routing estimate next to the upstream's
+  authoritative `usage` counts, calibrating the ~4 chars/token context-fit
+  heuristic. Best-effort: bodies without a `usage` object are skipped.
+- **Classification skip reasons** — explicit events when classification did
+  not run: at most one candidate could serve the request (nothing to rank),
+  all user text was trivial filler (fast-path to the fast tier), or there
+  was no user text at all (balanced default).
+
+Enable with, for example:
+
+```sh
+RUST_LOG=info,hyper_mcp_router=debug,ort=warn hyper-mcp-router serve
+```
+
+Because `completion request` events carry prompt text verbatim, treat
+`debug`-level logs as customer data: restrict access and retention
+accordingly, and return to the default level after the evaluation.
 
 ## License
 
