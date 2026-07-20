@@ -42,13 +42,13 @@ serde      = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tokenizers = "0.23"
-tokio      = { version = "1.52", features = ["full"] }
+tokio      = { version = "1.53", features = ["full"] }
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url        = "2.5"
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = "0.11"
 ureq = "3.3"
 
 [package.metadata.release]
