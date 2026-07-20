@@ -338,6 +338,10 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
         "routing request"
     );
 
+    // Debug-level companion carrying the full prompt text — see
+    // [`log_completion_request`].
+    log_completion_request(&route, &backend.config.name, streaming);
+
     // 6. Forward to `{base_url}/chat/completions`. The total request timeout
     //    applies only to non-streaming requests; streams are bounded by the
     //    client-level idle (read) timeout instead.
@@ -398,6 +402,19 @@ struct RouteResolution {
     required: ModalitySet,
     classified: Option<ModelTier>,
     image_source: Option<&'static str>,
+    /// The ENTIRE current-turn prompt (the last user message's text),
+    /// untruncated — extracted once during resolution and reused by the
+    /// debug-level request log. Empty when no user message exists.
+    prompt: String,
+    /// The compiled classification window exactly as fed to the complexity
+    /// classifier: substantive user turns newest→oldest under the roster's
+    /// top char budget (see [`build_classification_window`]). `None` when
+    /// nothing substantive existed to classify. Kept for the debug-level
+    /// request log — built once during resolution either way.
+    window: Option<String>,
+    /// Chars of the current turn AS THE CLASSIFIER SAW IT — i.e. after
+    /// truncation to the selected engine's per-turn budget; may be shorter
+    /// than `prompt`.
     prompt_chars: usize,
     /// Estimated context-window occupancy of the FULL request (all message
     /// text plus the requested completion budget), in tokens — see
@@ -408,6 +425,29 @@ struct RouteResolution {
     /// length). Recorded even when classification is skipped — `classified:
     /// None` already says the engine did not run.
     classifier_engine: &'static str,
+}
+
+/// Debug-level request log: the ENTIRE current-turn prompt (untruncated) AND
+/// the compiled classification window — the pruned multi-turn text the
+/// complexity classifier actually consumed — alongside the model selection
+/// and routing metrics, so the router's behaviour can be watched end-to-end
+/// during an evaluation period. The info-level "routing request" event stays
+/// metadata-only; user content is emitted at debug ONLY, so operators opt in
+/// via the log filter. Both texts ride on [`RouteResolution`], produced once
+/// during route resolution — nothing here re-reads the request body.
+fn log_completion_request(route: &RouteResolution, model: &str, streaming: bool) {
+    tracing::debug!(
+        model,
+        modalities = ?route.required.to_kebab_vec(),
+        complexity = ?route.classified,
+        classifier_engine = route.classifier_engine,
+        streaming,
+        prompt_chars = route.prompt_chars,
+        estimated_tokens = route.estimated_tokens,
+        prompt = %route.prompt,
+        classification_window = route.window.as_deref().unwrap_or(""),
+        "completion request"
+    );
 }
 
 /// Resolve a request's route along both axes.
@@ -442,11 +482,12 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
     );
     let window_chars = window.as_deref().map_or(0, |w| w.chars().count());
     let engine = state.classifiers.select(window_chars);
-    // How much of the current turn the classifier (and the lexical prefilter)
-    // sees is model-specific — the *selected* engine declares its budget.
-    let current_turn = extract_prompt(body)
-        .map(|p| truncate_prompt(&p, engine.current_turn_char_budget()))
-        .unwrap_or_default();
+    // The current turn is extracted ONCE: kept whole (in the resolution, for
+    // the debug request log) and truncated to the selected engine's per-turn
+    // budget for classification — how much of the turn the classifier (and
+    // the lexical prefilter) sees is model-specific.
+    let prompt = extract_prompt(body).unwrap_or_default();
+    let current_turn = truncate_prompt(&prompt, engine.current_turn_char_budget());
     let lexical_image = looks_like_image_generation(&current_turn);
     let mut image_source: Option<&'static str> = if required.contains(Modality::ImageOutput) {
         Some("explicit")
@@ -473,8 +514,14 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
     {
         None
     } else {
-        let classification =
-            classify_or_default(engine.as_ref(), body, window, &current_turn, lexical_image).await;
+        let classification = classify_or_default(
+            engine.as_ref(),
+            body,
+            window.as_deref(),
+            &current_turn,
+            lexical_image,
+        )
+        .await;
         if classification.image_generation
             && !required.contains(Modality::ImageOutput)
             && !image_intent_dropped
@@ -503,6 +550,8 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
         classified,
         image_source,
         prompt_chars: current_turn.chars().count(),
+        prompt,
+        window,
         estimated_tokens,
         classifier_engine: engine.name(),
     }
@@ -559,7 +608,7 @@ fn try_require_image_output(
 async fn classify_or_default(
     engine: &dyn ClassifierEngine,
     body: &Value,
-    window: Option<String>,
+    window: Option<&str>,
     current_turn: &str,
     lexical_image: bool,
 ) -> Classification {
@@ -577,7 +626,7 @@ async fn classify_or_default(
         };
     };
 
-    match engine.classify(&window, current_turn, lexical_image).await {
+    match engine.classify(window, current_turn, lexical_image).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(
@@ -880,7 +929,124 @@ mod tests {
         assert!(dst.get(header::CONTENT_LENGTH).is_none());
     }
 
-    // ── inferred image-output soft insertion ─────────────────────────────
+    // ── debug completion-request logging ──────────────────────────
+    /// A cloneable in-memory sink for `tracing_subscriber::fmt`, so tests can
+    /// assert on exactly what a log event emitted.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` under a thread-local subscriber capped at `max_level` and
+    /// return everything it logged.
+    fn captured_log(max_level: tracing::Level, f: impl FnOnce()) -> String {
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(max_level)
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = writer.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn route_resolution(
+        classified: Option<ModelTier>,
+        prompt: &str,
+        window: Option<&str>,
+    ) -> RouteResolution {
+        RouteResolution {
+            required: [Modality::Text].into_iter().collect(),
+            classified,
+            image_source: None,
+            prompt: prompt.to_string(),
+            window: window.map(str::to_string),
+            prompt_chars: 12,
+            estimated_tokens: 34,
+            classifier_engine: "embedded-nli",
+        }
+    }
+
+    #[test]
+    fn completion_request_logged_with_full_prompt_at_debug() {
+        let out = captured_log(tracing::Level::DEBUG, || {
+            log_completion_request(
+                &route_resolution(
+                    Some(ModelTier::Frontier),
+                    "summarize the plot of Moby-Dick in one sentence",
+                    Some("earlier substantive turn\nsummarize the plot of Moby-Dick"),
+                ),
+                "backend-model",
+                true,
+            );
+        });
+        assert!(out.contains("completion request"), "got: {out}");
+        // The ENTIRE current-turn prompt, verbatim.
+        assert!(
+            out.contains("summarize the plot of Moby-Dick in one sentence"),
+            "got: {out}"
+        );
+        // The compiled window the complexity classifier consumed, verbatim.
+        assert!(out.contains("earlier substantive turn"), "got: {out}");
+        // Model selection and metrics ride along on the same event.
+        assert!(out.contains("backend-model"), "got: {out}");
+        assert!(out.contains("Frontier"), "got: {out}");
+        assert!(out.contains("estimated_tokens=34"), "got: {out}");
+    }
+
+    #[test]
+    fn completion_request_log_survives_missing_user_message() {
+        // No user turn: resolution carries an empty prompt and no window; the
+        // event still fires.
+        let out = captured_log(tracing::Level::DEBUG, || {
+            log_completion_request(&route_resolution(None, "", None), "backend-model", false);
+        });
+        assert!(out.contains("completion request"), "got: {out}");
+    }
+
+    #[test]
+    fn prompt_stays_out_of_logs_below_debug() {
+        // Privacy guard: at info and above the event (and with it, the user
+        // content) must not be emitted at all — debug is the opt-in.
+        let out = captured_log(tracing::Level::INFO, || {
+            log_completion_request(
+                &route_resolution(
+                    Some(ModelTier::Fast),
+                    "user-content-that-must-not-leak",
+                    Some("window-content-that-must-not-leak"),
+                ),
+                "backend-model",
+                false,
+            );
+        });
+        assert!(
+            !out.contains("user-content-that-must-not-leak"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("window-content-that-must-not-leak"),
+            "got: {out}"
+        );
+        assert!(!out.contains("completion request"), "got: {out}");
+    }
+
+    // ── inferred image-output soft insertion ─────────────────────
     fn config_with(models: Vec<crate::config::ModelConfig>) -> RouterConfig {
         RouterConfig {
             server: Default::default(),
