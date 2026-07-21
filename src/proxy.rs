@@ -34,7 +34,7 @@ use crate::prompt::{
 };
 use crate::selection::{count_candidates, select_candidate};
 use crate::telemetry::{attr, Metrics};
-use crate::usage::report_upstream_usage;
+use crate::usage::{report_upstream_usage, StreamUsageTap};
 
 use tracing::Instrument;
 
@@ -496,7 +496,12 @@ async fn chat_completions_inner(state: AppState, raw: Bytes) -> Response {
 
     // 7. Stream SSE bytes on success; otherwise forward the full body.
     if streaming && status.is_success() {
-        stream_passthrough(resp)
+        stream_passthrough(
+            resp,
+            &backend.config.name,
+            route.estimated_tokens,
+            state.usage_metrics.then(|| state.metrics.clone()),
+        )
     } else {
         let usage_metrics = state.usage_metrics.then_some(state.metrics.as_ref());
         buffered_passthrough(
@@ -900,10 +905,24 @@ fn copy_end_to_end_headers(src: &header::HeaderMap, dst: &mut header::HeaderMap)
     }
 }
 
-/// Pipe raw upstream SSE bytes straight to the client. No parsing, buffering,
-/// or model-field rewriting; upstream end-to-end headers are preserved, with
+/// Pipe raw upstream SSE bytes straight to the client. No buffering or
+/// model-field rewriting; upstream end-to-end headers are preserved, with
 /// SSE defaults filled in only when the upstream omitted them.
-fn stream_passthrough(resp: reqwest::Response) -> Response {
+///
+/// When someone is listening for token usage (debug logging on, or the
+/// usage counters enabled), the bytes are forwarded through a
+/// [`StreamUsageTap`]: still byte-for-byte untouched, but a bounded tail is
+/// retained so the trailing `usage` chunk (sent by OpenAI-compatible
+/// backends when the client requests `stream_options.include_usage`) is
+/// reported at end-of-stream — the streaming counterpart of
+/// [`buffered_passthrough`]'s usage peek. With nobody listening the stream
+/// passes through untapped.
+fn stream_passthrough(
+    resp: reqwest::Response,
+    model: &str,
+    estimated_tokens: u64,
+    usage_metrics: Option<Arc<Metrics>>,
+) -> Response {
     let status = resp.status();
     let upstream_headers = resp.headers().clone();
     let mut builder = Response::builder().status(status);
@@ -916,9 +935,18 @@ fn stream_passthrough(resp: reqwest::Response) -> Response {
     if !upstream_headers.contains_key(header::CACHE_CONTROL) {
         builder = builder.header(header::CACHE_CONTROL, "no-cache");
     }
-    builder
-        .body(Body::from_stream(resp.bytes_stream()))
-        .expect("valid streaming response")
+    let body = if tracing::enabled!(tracing::Level::DEBUG) || usage_metrics.is_some() {
+        Body::from_stream(StreamUsageTap::new(
+            resp.bytes_stream(),
+            model,
+            estimated_tokens,
+            tracing::Span::current(),
+            usage_metrics,
+        ))
+    } else {
+        Body::from_stream(resp.bytes_stream())
+    };
+    builder.body(body).expect("valid streaming response")
 }
 
 /// Forward a non-streaming (or error) upstream response verbatim: same status,

@@ -75,10 +75,12 @@ pub struct LoggingConfig {
     /// request's ENTIRE current-turn prompt and compiled classification
     /// window, alongside the routing decision. **Default `false`** — this is
     /// the only path by which user content reaches the logs, and it is
-    /// independent of `RUST_LOG`: a deployment can log every prompt without
-    /// enabling debug noise, or run full debug diagnostics without ever
-    /// logging a prompt. Treat logs produced under this flag as customer
-    /// data.
+    /// independent of `RUST_LOG` *verbosity*: a deployment can log every
+    /// prompt without enabling debug noise, or run full debug diagnostics
+    /// without ever logging a prompt. (The event itself is info-level, so a
+    /// filter quieter than `info` — e.g. `RUST_LOG=warn` — still suppresses
+    /// it; this flag opts prompts in, it does not exempt them from the level
+    /// filter.) Treat logs produced under this flag as customer data.
     ///
     /// Like the log level, this is execution-wide policy: `serve` installs it
     /// ONCE at startup as a process global (`logging::set_log_prompts`), and

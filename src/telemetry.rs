@@ -241,7 +241,11 @@ pub fn inject_context(span: &tracing::Span, headers: &mut http::HeaderMap) {
 /// - `tokens.estimated` (histogram): the router's context-fit estimate.
 /// - `tokens.prompt` / `tokens.completion` (counters): the upstream's
 ///   authoritative `usage` counts, by `model` — comparing rates against
-///   `tokens.estimated` calibrates the chars-per-token heuristic.
+///   `tokens.estimated` calibrates the chars-per-token heuristic. Buffered
+///   responses always report; streaming responses report only when the
+///   upstream emits a trailing `usage` chunk, which OpenAI-compatible
+///   backends do only if the client sent
+///   `stream_options: {"include_usage": true}` (see `crate::usage`).
 pub struct Metrics {
     pub requests: Counter<u64>,
     pub request_duration: Histogram<f64>,

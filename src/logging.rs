@@ -51,9 +51,11 @@ pub fn log_prompts_enabled() -> bool {
 ///   tracing, and vice versa.
 /// - It is restricted to **spans only** (`Metadata::is_span`). Log *events*
 ///   are never exported over OTLP — `tracing-opentelemetry` would otherwise
-///   attach them to spans as span events, and the debug-level events carry
-///   prompt text. The "user content reaches logs only at debug, only on
-///   stdout" guarantee must hold with telemetry on.
+///   attach them to spans as span events, and the config-gated
+///   `"completion request"` event (`[logging] log_prompts`, see
+///   [`set_log_prompts`]) carries prompt text. The "user content reaches
+///   logs only via the `log_prompts` opt-in, only on stdout" guarantee must
+///   hold with telemetry on.
 pub fn init(
     otel_layer: Option<
         tracing_opentelemetry::OpenTelemetryLayer<Registry, opentelemetry_sdk::trace::SdkTracer>,
@@ -82,6 +84,10 @@ pub fn init(
 }
 
 /// Route panics into the structured log stream, then chain the default hook.
+///
+/// The payload is logged **verbatim**, bypassing the `log_prompts` gate —
+/// panic messages must therefore never format user/prompt content into the
+/// panic payload (review rule for any `panic!`/`expect` on a prompt path).
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

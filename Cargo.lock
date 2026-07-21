@@ -1585,6 +1585,7 @@ dependencies = [
  "clap",
  "config",
  "directories",
+ "futures-core",
  "google-cloud-auth",
  "http",
  "keyring",
