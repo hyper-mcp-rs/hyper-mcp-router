@@ -29,6 +29,16 @@ stream_idle_timeout_secs = 300
 # image/audio/file payloads are large; raise this if yours are larger.
 max_body_bytes = 33554432
 
+# Optional logging content controls. Verbosity is RUST_LOG (an environment
+# concern); whether USER CONTENT may appear in logs is deployment policy and
+# lives here. With log_prompts = true, every request emits an info-level
+# "completion request" event carrying the full current-turn prompt and the
+# compiled classification window alongside the routing decision — without
+# requiring debug-level noise. Default false: prompts never reach the logs.
+# Treat logs produced under this flag as customer data (access + retention).
+#[logging]
+#log_prompts = false
+
 # Optional OpenTelemetry export (OTLP over HTTP/protobuf). Omit the whole
 # table to disable telemetry entirely (no exporters, no background threads,
 # no sockets). The endpoint carries NO credentials — point it at a local

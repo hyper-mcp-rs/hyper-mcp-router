@@ -53,12 +53,34 @@ pub struct RouterConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub classifier: ClassifierConfig,
+    /// Logging behavior beyond the `RUST_LOG` level — see [`LoggingConfig`].
+    #[serde(default)]
+    pub logging: LoggingConfig,
     /// OpenTelemetry export — **optional**: absent means telemetry is fully
     /// off (no exporters, no background tasks, no sockets). See
     /// [`TelemetryConfig`].
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
     pub models: Vec<ModelConfig>,
+}
+
+/// `[logging]` — content controls for the log stream. Verbosity is `RUST_LOG`
+/// (an environment concern); whether **user content** may appear in logs is a
+/// deployment policy, so it lives in the config file instead of being coupled
+/// to a log level.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingConfig {
+    /// Emit the info-level `"completion request"` event carrying each
+    /// request's ENTIRE current-turn prompt and compiled classification
+    /// window, alongside the routing decision. **Default `false`** — this is
+    /// the only path by which user content reaches the logs, and it is
+    /// independent of `RUST_LOG`: a deployment can log every prompt without
+    /// enabling debug noise, or run full debug diagnostics without ever
+    /// logging a prompt. Treat logs produced under this flag as customer
+    /// data.
+    #[serde(default)]
+    pub log_prompts: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -716,6 +738,20 @@ mod tests {
         assert!(cfg.telemetry.is_none());
     }
 
+    // ── [logging] ────────────────────────────────────────────────
+    #[test]
+    fn log_prompts_defaults_off_and_parses() {
+        // Absent table and absent field both mean "never log prompts".
+        let cfg = parse(MODELS_STANZA).unwrap();
+        assert!(!cfg.logging.log_prompts);
+        let cfg = parse(&format!("{MODELS_STANZA}[logging]\n")).unwrap();
+        assert!(!cfg.logging.log_prompts);
+        let cfg = parse(&format!("{MODELS_STANZA}[logging]\nlog_prompts=true\n")).unwrap();
+        assert!(cfg.logging.log_prompts);
+        // No silent typos.
+        assert!(parse(&format!("{MODELS_STANZA}[logging]\nlog_prompt=true\n")).is_err());
+    }
+
     #[test]
     fn telemetry_parses_with_defaults() {
         let toml = format!("{MODELS_STANZA}[telemetry]\notlp_endpoint=\"http://localhost:4318\"\n");
@@ -1152,6 +1188,7 @@ port = 8080
         RouterConfig {
             server: ServerConfig::default(),
             classifier: ClassifierConfig::default(),
+            logging: LoggingConfig::default(),
             telemetry: None,
             models,
         }

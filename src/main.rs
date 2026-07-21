@@ -144,8 +144,15 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         model_count = cfg.models.len(),
         image_generation_threshold = cfg.classifier.image_generation_threshold,
         trivial_max_words,
+        log_prompts = cfg.logging.log_prompts,
         "configuration loaded"
     );
+    if cfg.logging.log_prompts {
+        tracing::info!(
+            "[logging] log_prompts is enabled: every request's prompt text will be logged — \
+             treat this log stream as customer data"
+        );
+    }
     for m in &cfg.models {
         tracing::info!(
             model = %m.name,

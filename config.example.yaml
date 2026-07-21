@@ -33,6 +33,13 @@ server:
   # are larger.
   max_body_bytes: 33554432
 
+# Optional logging content controls: log_prompts = true emits an info-level
+# "completion request" event with each request's full prompt text — without
+# requiring debug verbosity. Default false: prompts never reach the logs.
+# See config.example.toml for the full commentary.
+#logging:
+#  log_prompts: false
+
 # Optional OpenTelemetry export (OTLP over HTTP/protobuf). Omit the whole
 # table to disable telemetry entirely. The endpoint carries NO credentials —
 # point it at a local collector sidecar (recommended; the collector owns

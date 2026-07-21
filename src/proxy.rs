@@ -408,9 +408,14 @@ async fn chat_completions_inner(state: AppState, raw: Bytes) -> Response {
         "routing request"
     );
 
-    // Debug-level companion carrying the full prompt text — see
+    // Config-gated companion carrying the full prompt text — see
     // [`log_completion_request`].
-    log_completion_request(&route, &backend.config.name, streaming);
+    log_completion_request(
+        &route,
+        &backend.config.name,
+        streaming,
+        state.config.logging.log_prompts,
+    );
 
     // 6. Forward to `{base_url}/chat/completions`. The total request timeout
     //    applies only to non-streaming requests; streams are bounded by the
@@ -575,16 +580,22 @@ impl RouteResolution {
     }
 }
 
-/// Debug-level request log: the ENTIRE current-turn prompt (untruncated) AND
-/// the compiled classification window — the pruned multi-turn text the
+/// Prompt-content request log: the ENTIRE current-turn prompt (untruncated)
+/// AND the compiled classification window — the pruned multi-turn text the
 /// complexity classifier actually consumed — alongside the model selection
-/// and routing metrics, so the router's behaviour can be watched end-to-end
-/// during an evaluation period. The info-level "routing request" event stays
-/// metadata-only; user content is emitted at debug ONLY, so operators opt in
-/// via the log filter. Both texts ride on [`RouteResolution`], produced once
-/// during route resolution — nothing here re-reads the request body.
-fn log_completion_request(route: &RouteResolution, model: &str, streaming: bool) {
-    tracing::debug!(
+/// and routing metrics. Emitted at **info** level, gated by the
+/// `[logging] log_prompts` config flag (default off) rather than a log
+/// level: whether user content may appear in logs is a deployment policy,
+/// decoupled from `RUST_LOG` verbosity — a deployment can log every prompt
+/// without debug noise, or run full debug diagnostics without ever logging
+/// a prompt. The unconditional "routing request" event stays metadata-only.
+/// Both texts ride on [`RouteResolution`], produced once during route
+/// resolution — nothing here re-reads the request body.
+fn log_completion_request(route: &RouteResolution, model: &str, streaming: bool, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    tracing::info!(
         model,
         modalities = ?route.required.to_kebab_vec(),
         complexity = ?route.classified,
@@ -1079,6 +1090,7 @@ mod tests {
         let cfg = crate::config::RouterConfig {
             server: Default::default(),
             classifier: Default::default(),
+            logging: Default::default(),
             telemetry: None,
             models: vec![keyless, keyed],
         };
@@ -1102,6 +1114,7 @@ mod tests {
         let cfg = crate::config::RouterConfig {
             server: Default::default(),
             classifier: Default::default(),
+            logging: Default::default(),
             telemetry: None,
             models: vec![keyed],
         };
@@ -1177,8 +1190,10 @@ mod tests {
     }
 
     #[test]
-    fn completion_request_logged_with_full_prompt_at_debug() {
-        let out = captured_log(tracing::Level::DEBUG, || {
+    fn completion_request_logged_with_full_prompt_when_enabled() {
+        // With `[logging] log_prompts = true`, the event fires at INFO — a
+        // deployment can log every prompt without enabling debug noise.
+        let out = captured_log(tracing::Level::INFO, || {
             log_completion_request(
                 &route_resolution(
                     Some(ModelTier::Frontier),
@@ -1186,6 +1201,7 @@ mod tests {
                     Some("earlier substantive turn\nsummarize the plot of Moby-Dick"),
                 ),
                 "backend-model",
+                true,
                 true,
             );
         });
@@ -1207,17 +1223,23 @@ mod tests {
     fn completion_request_log_survives_missing_user_message() {
         // No user turn: resolution carries an empty prompt and no window; the
         // event still fires.
-        let out = captured_log(tracing::Level::DEBUG, || {
-            log_completion_request(&route_resolution(None, "", None), "backend-model", false);
+        let out = captured_log(tracing::Level::INFO, || {
+            log_completion_request(
+                &route_resolution(None, "", None),
+                "backend-model",
+                false,
+                true,
+            );
         });
         assert!(out.contains("completion request"), "got: {out}");
     }
 
     #[test]
-    fn prompt_stays_out_of_logs_below_debug() {
-        // Privacy guard: at info and above the event (and with it, the user
-        // content) must not be emitted at all — debug is the opt-in.
-        let out = captured_log(tracing::Level::INFO, || {
+    fn prompt_stays_out_of_logs_when_disabled() {
+        // Privacy guard: with `log_prompts = false` (the default) the event
+        // (and with it, the user content) must not be emitted at ANY log
+        // level — the config flag is the only opt-in, not `RUST_LOG`.
+        let out = captured_log(tracing::Level::TRACE, || {
             log_completion_request(
                 &route_resolution(
                     Some(ModelTier::Fast),
@@ -1225,6 +1247,7 @@ mod tests {
                     Some("window-content-that-must-not-leak"),
                 ),
                 "backend-model",
+                false,
                 false,
             );
         });
@@ -1279,6 +1302,7 @@ mod tests {
         RouterConfig {
             server: Default::default(),
             classifier: Default::default(),
+            logging: Default::default(),
             telemetry: None,
             models,
         }
