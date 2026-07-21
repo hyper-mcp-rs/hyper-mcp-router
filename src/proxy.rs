@@ -410,12 +410,7 @@ async fn chat_completions_inner(state: AppState, raw: Bytes) -> Response {
 
     // Config-gated companion carrying the full prompt text — see
     // [`log_completion_request`].
-    log_completion_request(
-        &route,
-        &backend.config.name,
-        streaming,
-        state.config.logging.log_prompts,
-    );
+    log_completion_request(&route, &backend.config.name, streaming);
 
     // 6. Forward to `{base_url}/chat/completions`. The total request timeout
     //    applies only to non-streaming requests; streams are bounded by the
@@ -584,15 +579,16 @@ impl RouteResolution {
 /// AND the compiled classification window — the pruned multi-turn text the
 /// complexity classifier actually consumed — alongside the model selection
 /// and routing metrics. Emitted at **info** level, gated by the
-/// `[logging] log_prompts` config flag (default off) rather than a log
-/// level: whether user content may appear in logs is a deployment policy,
-/// decoupled from `RUST_LOG` verbosity — a deployment can log every prompt
-/// without debug noise, or run full debug diagnostics without ever logging
-/// a prompt. The unconditional "routing request" event stays metadata-only.
-/// Both texts ride on [`RouteResolution`], produced once during route
-/// resolution — nothing here re-reads the request body.
-fn log_completion_request(route: &RouteResolution, model: &str, streaming: bool, enabled: bool) {
-    if !enabled {
+/// process-global `[logging] log_prompts` policy (default off; see
+/// [`crate::logging::log_prompts_enabled`]) rather than a log level: whether
+/// user content may appear in logs is a deployment policy, decoupled from
+/// `RUST_LOG` verbosity — a deployment can log every prompt without debug
+/// noise, or run full debug diagnostics without ever logging a prompt. The
+/// unconditional "routing request" event stays metadata-only. Both texts
+/// ride on [`RouteResolution`], produced once during route resolution —
+/// nothing here re-reads the request body.
+fn log_completion_request(route: &RouteResolution, model: &str, streaming: bool) {
+    if !crate::logging::log_prompts_enabled() {
         return;
     }
     tracing::info!(
@@ -1190,9 +1186,44 @@ mod tests {
     }
 
     #[test]
-    fn completion_request_logged_with_full_prompt_when_enabled() {
-        // With `[logging] log_prompts = true`, the event fires at INFO — a
-        // deployment can log every prompt without enabling debug noise.
+    fn prompt_logging_follows_the_global_policy_flag() {
+        // The prompt-logging gate is a PROCESS GLOBAL
+        // (`logging::set_log_prompts`), so every assertion that touches it
+        // lives in this one test — parallel test threads must never race on
+        // it. Order within the test is deliberate: default → enabled →
+        // restored.
+
+        // 1. Default: off. The event (and with it, the user content) must
+        //    not be emitted at ANY log level — the config flag is the only
+        //    opt-in, not `RUST_LOG`.
+        assert!(
+            !crate::logging::log_prompts_enabled(),
+            "default must be off"
+        );
+        let out = captured_log(tracing::Level::TRACE, || {
+            log_completion_request(
+                &route_resolution(
+                    Some(ModelTier::Fast),
+                    "user-content-that-must-not-leak",
+                    Some("window-content-that-must-not-leak"),
+                ),
+                "backend-model",
+                false,
+            );
+        });
+        assert!(
+            !out.contains("user-content-that-must-not-leak"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("window-content-that-must-not-leak"),
+            "got: {out}"
+        );
+        assert!(!out.contains("completion request"), "got: {out}");
+
+        // 2. Enabled: the event fires at INFO — a deployment can log every
+        //    prompt without enabling debug noise.
+        crate::logging::set_log_prompts(true);
         let out = captured_log(tracing::Level::INFO, || {
             log_completion_request(
                 &route_resolution(
@@ -1201,7 +1232,6 @@ mod tests {
                     Some("earlier substantive turn\nsummarize the plot of Moby-Dick"),
                 ),
                 "backend-model",
-                true,
                 true,
             );
         });
@@ -1217,49 +1247,17 @@ mod tests {
         assert!(out.contains("backend-model"), "got: {out}");
         assert!(out.contains("Frontier"), "got: {out}");
         assert!(out.contains("estimated_tokens=34"), "got: {out}");
-    }
 
-    #[test]
-    fn completion_request_log_survives_missing_user_message() {
-        // No user turn: resolution carries an empty prompt and no window; the
-        // event still fires.
+        // 3. Still enabled: a resolution with no user turn (empty prompt, no
+        //    window) must not suppress the event.
         let out = captured_log(tracing::Level::INFO, || {
-            log_completion_request(
-                &route_resolution(None, "", None),
-                "backend-model",
-                false,
-                true,
-            );
+            log_completion_request(&route_resolution(None, "", None), "backend-model", false);
         });
         assert!(out.contains("completion request"), "got: {out}");
-    }
 
-    #[test]
-    fn prompt_stays_out_of_logs_when_disabled() {
-        // Privacy guard: with `log_prompts = false` (the default) the event
-        // (and with it, the user content) must not be emitted at ANY log
-        // level — the config flag is the only opt-in, not `RUST_LOG`.
-        let out = captured_log(tracing::Level::TRACE, || {
-            log_completion_request(
-                &route_resolution(
-                    Some(ModelTier::Fast),
-                    "user-content-that-must-not-leak",
-                    Some("window-content-that-must-not-leak"),
-                ),
-                "backend-model",
-                false,
-                false,
-            );
-        });
-        assert!(
-            !out.contains("user-content-that-must-not-leak"),
-            "got: {out}"
-        );
-        assert!(
-            !out.contains("window-content-that-must-not-leak"),
-            "got: {out}"
-        );
-        assert!(!out.contains("completion request"), "got: {out}");
+        // 4. Restore the default so the process global never leaks into
+        //    hypothetical future tests.
+        crate::logging::set_log_prompts(false);
     }
 
     // ── upstream-usage reporting: see `crate::usage::tests` ────────────

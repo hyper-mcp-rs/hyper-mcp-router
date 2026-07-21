@@ -79,6 +79,13 @@ pub struct LoggingConfig {
     /// enabling debug noise, or run full debug diagnostics without ever
     /// logging a prompt. Treat logs produced under this flag as customer
     /// data.
+    ///
+    /// Like the log level, this is execution-wide policy: `serve` installs it
+    /// ONCE at startup as a process global (`logging::set_log_prompts`), and
+    /// emit sites consult `logging::log_prompts_enabled()` rather than
+    /// threading this field through call signatures. Anything that bypasses
+    /// `serve` (embedders, integration tests building `AppState` directly)
+    /// gets the global's safe default: prompts are never logged.
     #[serde(default)]
     pub log_prompts: bool,
 }

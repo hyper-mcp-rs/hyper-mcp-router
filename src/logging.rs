@@ -8,6 +8,8 @@
 //! journal), or a container runtime, all of which do rotation and shipping
 //! better than we could.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
@@ -16,6 +18,27 @@ use tracing_subscriber::{EnvFilter, Layer, Registry};
 /// Runtime's very verbose per-session graph-transform logging quieted. A set
 /// `RUST_LOG` overrides this entirely.
 const DEFAULT_DIRECTIVES: &str = "info,ort=warn";
+
+/// Process-global prompt-logging policy (`[logging] log_prompts`): whether
+/// events carrying **user content** (the `"completion request"` event) may be
+/// emitted. Set once at startup from the config — like the log level itself,
+/// it is execution-wide policy, so it lives here as ambient state rather than
+/// being threaded through every prompt-adjacent call signature (some of
+/// which, e.g. engines, have no path to the config). Defaults to `false`:
+/// prompts never reach the logs unless the deployment opted in.
+static LOG_PROMPTS: AtomicBool = AtomicBool::new(false);
+
+/// Install the prompt-logging policy. Called once at startup, after config
+/// load; test-only toggling must be confined to a single test (parallel test
+/// threads share the process global).
+pub fn set_log_prompts(enabled: bool) {
+    LOG_PROMPTS.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether prompt-carrying log events may be emitted (see [`set_log_prompts`]).
+pub fn log_prompts_enabled() -> bool {
+    LOG_PROMPTS.load(Ordering::Relaxed)
+}
 
 /// Initialise structured JSON logging on stdout and install the panic hook.
 /// Call once at startup, before anything logs.

@@ -96,6 +96,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let (otel_layer, telemetry) = hyper_mcp_router::telemetry::init(cfg.telemetry.as_ref())
         .context("initialising telemetry")?;
     logging::init(otel_layer);
+    logging::set_log_prompts(cfg.logging.log_prompts);
     if let Some(t) = &cfg.telemetry {
         tracing::info!(
             otlp_endpoint = %t.otlp_endpoint,
