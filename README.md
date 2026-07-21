@@ -608,6 +608,81 @@ Because `completion request` events carry prompt text verbatim, treat
 `debug`-level logs as customer data: restrict access and retention
 accordingly, and return to the default level after the evaluation.
 
+## Telemetry (OpenTelemetry)
+
+Optional OTLP export of **traces and metrics**, off by default — without a
+`[telemetry]` table no exporters are built, no background threads start, and
+no sockets open. Enable it with:
+
+```toml
+[telemetry]
+otlp_endpoint = "http://localhost:4318"   # OTLP over HTTP/protobuf
+```
+
+The endpoint carries **no credentials** and is meant for a **local collector
+sidecar** (or an equally trusted network hop): on Cloud Run, ECS, or
+Kubernetes, run the platform's collector next to the router and let it
+authenticate onward with ambient identity (metadata-server ADC, task role) —
+the router never holds telemetry credentials. Direct export to endpoints
+requiring header auth or request signing is deliberately unsupported.
+Transport is OTLP/HTTP with protobuf only (every major backend and every
+collector accepts it; gRPC adds a second HTTP stack for no benefit at router
+volumes).
+
+Optional fields (see `config.example.toml`): `service_name`, per-signal
+`traces`/`metrics` switches, `sample_ratio`, `parent_based_sampling`, and
+`metrics_interval_secs`.
+
+### Traces
+
+Each request exports a span tree carrying the full routing decision as
+attributes — no prompt text, ever (spans hold sizes and outcomes, not
+content):
+
+- **`chat_completions`** (server span) — `model` (selection),
+  `complexity` (prompt categorization), `classifier_engine`, `modalities`,
+  `streaming`, `prompt_chars`, `window_chars`, `estimated_tokens`,
+  `upstream_status`, and — for buffered responses — the upstream's
+  authoritative `prompt_tokens` / `completion_tokens` / `total_tokens`.
+- **`classify`** → **`nli_inference`** (embedded) or **`embed`** (remote
+  engines) — isolates classification latency, per engine, including the
+  remote embed call itself.
+- **`upstream_request`** (client span) — the routed backend call;
+  time-to-response-headers for streams.
+
+Incoming W3C `traceparent` headers are honored (router spans join the
+caller's trace) and propagated to the routed backend, so backend telemetry
+joins the same trace. **Sampling note:** by default `sample_ratio` is applied
+independently of the caller's sampling decision, because platform ingress
+tracing (e.g. Cloud Run's ~0.1 req/s) would otherwise drop nearly every
+router span; set `parent_based_sampling = true` for the OTel-conventional
+behavior.
+
+Log *events* are never exported over OTLP — the OpenTelemetry layer is
+restricted to spans, so the debug-level prompt-carrying events above stay on
+stdout only, and the logging privacy guarantees hold with telemetry on.
+
+### Metrics
+
+All under the `hyper_mcp_router.` prefix:
+
+| Metric | Type | Attributes | Meaning |
+|---|---|---|---|
+| `requests` | counter | `model`, `complexity`, `streaming`, `status` | completed requests (`status` = upstream HTTP status, or `422` / `upstream_timeout` / `upstream_unavailable`) |
+| `request.duration` | histogram (s) | same | end-to-end wall time |
+| `classification.duration` | histogram (s) | `engine` | classifier inference time |
+| `classified` | counter | `complexity`, `engine` | prompt categorization outcomes |
+| `classification.skipped` | counter | `reason` | model-free decisions (`single_candidate`, `trivial_fast_path`, `no_user_text`) |
+| `prompt.chars`, `window.chars` | histograms | — | current-turn and classification-window sizes |
+| `tokens.estimated` | histogram | — | the router's context-fit estimate |
+| `tokens.prompt`, `tokens.completion` | counters | `model` | upstream-reported usage — compare against `tokens.estimated` to calibrate the chars/token heuristic |
+
+On platforms that throttle CPU between requests (Cloud Run with request-based
+billing), batches flush during subsequent requests; for spiky low-QPS
+deployments consider CPU-always-allocated or a shorter
+`metrics_interval_secs`. Exporter failures drop batches with a warning and
+never affect routing; providers flush on graceful shutdown.
+
 ## License
 
 Apache-2.0. See [LICENSE](./LICENSE).

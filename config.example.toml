@@ -29,6 +29,23 @@ stream_idle_timeout_secs = 300
 # image/audio/file payloads are large; raise this if yours are larger.
 max_body_bytes = 33554432
 
+# Optional OpenTelemetry export (OTLP over HTTP/protobuf). Omit the whole
+# table to disable telemetry entirely (no exporters, no background threads,
+# no sockets). The endpoint carries NO credentials — point it at a local
+# collector sidecar (the recommended topology on Cloud Run / ECS / K8s; the
+# collector owns vendor auth) or an equally trusted network hop.
+#[telemetry]
+#otlp_endpoint = "http://localhost:4318"  # root URL; /v1/traces, /v1/metrics appended
+#service_name = "hyper-mcp-router"        # resource attribute on all signals
+#traces = true                            # per-request spans (routing, classify, upstream)
+#metrics = true                           # counters/histograms (requests, tokens, sizes)
+#sample_ratio = 1.0                       # head sampling, applied independently of the
+#                                         # caller's decision — platform ingress tracing
+#                                         # (e.g. Cloud Run) samples aggressively and
+#                                         # would otherwise drop nearly all router spans
+#parent_based_sampling = false            # true = OTel-conventional parent-based sampling
+#metrics_interval_secs = 60               # metric export interval
+
 # Optional classifier tuning. All fields have sensible defaults. Classifier
 # behaviour is config-only — there are no CLI overrides, because each model
 # brings its own configuration (a [classifier.<model>] table); different

@@ -33,6 +33,10 @@ use crate::prompt::{
     looks_like_image_generation, truncate_prompt,
 };
 use crate::selection::{count_candidates, select_candidate};
+use crate::telemetry::{attr, Metrics};
+use crate::usage::report_upstream_usage;
+
+use tracing::Instrument;
 
 /// Shared, cloneable server state. The classifiers are trait objects on a
 /// capacity ladder ([`EngineRoster`]) — the proxy is engine-agnostic; each
@@ -49,6 +53,13 @@ pub struct AppState {
     /// resolved auth handle, exactly as they are paired in the config file.
     /// Built once at startup; the proxy routes over THIS, not raw config.
     pub models: Arc<[RoutedModel]>,
+    /// OpenTelemetry instruments, bound once at startup. No-op recorders
+    /// unless `[telemetry]` enabled the metrics signal (see
+    /// [`crate::telemetry::Metrics`]).
+    pub metrics: Arc<Metrics>,
+    /// Whether upstream `usage` objects should be parsed for metrics even
+    /// when debug logging is off — true iff `[telemetry]` metrics are on.
+    pub usage_metrics: bool,
 }
 
 /// A backend model as the proxy actually routes to it: the static
@@ -190,6 +201,7 @@ impl AppState {
         }
         let http = builder.build()?;
         let models: Arc<[RoutedModel]> = RoutedModel::resolve_all(&config)?.into();
+        let usage_metrics = config.telemetry.as_ref().is_some_and(|t| t.metrics);
 
         Ok(AppState {
             classifiers,
@@ -197,6 +209,8 @@ impl AppState {
             http,
             trivial_max_words,
             models,
+            metrics: Arc::new(Metrics::new()),
+            usage_metrics,
         })
     }
 
@@ -260,7 +274,44 @@ async fn list_models() -> Json<Value> {
 // Chat completions proxy
 // ───────────────────────────────────────────────────────────────────────────
 
-async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response {
+/// Span-wrapping entry point: opens the per-request `chat_completions` span
+/// (parented to the caller's `traceparent` when one arrives and telemetry is
+/// on) and runs the routing logic inside it. Every field is declared here as
+/// [`tracing::field::Empty`] and recorded as routing progresses, so the
+/// exported span carries the full decision — model selection, prompt
+/// categorization, sizes, and token usage — exactly once per request.
+async fn chat_completions(
+    State(state): State<AppState>,
+    request_headers: header::HeaderMap,
+    raw: Bytes,
+) -> Response {
+    use tracing::field::Empty;
+    let span = tracing::info_span!(
+        "chat_completions",
+        otel.kind = "server",
+        model = Empty,
+        complexity = Empty,
+        classifier_engine = Empty,
+        modalities = Empty,
+        streaming = Empty,
+        prompt_chars = Empty,
+        window_chars = Empty,
+        estimated_tokens = Empty,
+        upstream_status = Empty,
+        prompt_tokens = Empty,
+        completion_tokens = Empty,
+        total_tokens = Empty,
+    );
+    // Join the caller's trace. Errs harmlessly when no OTel layer is
+    // installed (telemetry off) — the span still scopes logging.
+    let _ = tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(
+        &span,
+        crate::telemetry::extract_context(&request_headers),
+    );
+    chat_completions_inner(state, raw).instrument(span).await
+}
+
+async fn chat_completions_inner(state: AppState, raw: Bytes) -> Response {
     let started = Instant::now();
 
     // 1. Parse; reject non-object bodies with 400.
@@ -281,6 +332,23 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
     //      choice) the complexity tier — see [`resolve_route`].
     let route = resolve_route(&state, &body).await;
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+
+    // Record the routing axes on the request span (sizes, categorization,
+    // engine) — exported when telemetry is on, and echoed by the fmt layer's
+    // span-close event either way.
+    let span = tracing::Span::current();
+    span.record("streaming", streaming);
+    span.record("prompt_chars", route.prompt_chars as u64);
+    span.record("window_chars", route.window_chars() as u64);
+    span.record("estimated_tokens", route.estimated_tokens);
+    span.record("classifier_engine", route.classifier_engine);
+    span.record(
+        "modalities",
+        format!("{:?}", route.required.to_kebab_vec()).as_str(),
+    );
+    if let Some(tier) = route.classified {
+        span.record("complexity", format!("{tier:?}").as_str());
+    }
 
     // The tier only ranks among >= 2 candidates; when skipped, any value selects
     // the sole (or zero) candidate.
@@ -303,9 +371,11 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
                 prompt_chars = route.prompt_chars,
                 "no backend covers the required modality set"
             );
+            record_request_metrics(&state.metrics, started, None, &route, streaming, "422");
             return unsupported_modality_error(&route.required);
         }
     };
+    span.record("model", backend.config.name.as_str());
 
     // Context fit is a strong preference, not a hard gate: when even the
     // largest covering window is (by estimate) too small, the request is
@@ -362,7 +432,23 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
         Ok(None) => {}
         Err(error_response) => return *error_response,
     }
-    let upstream = request.send().await;
+
+    // Client span for the upstream call; `traceparent` is injected from it so
+    // the backend's own telemetry joins this trace. For streaming responses
+    // the span covers time-to-response-headers (the body outlives it — the
+    // request span carries the stream).
+    let upstream_span = tracing::info_span!(
+        "upstream_request",
+        otel.kind = "client",
+        model = %backend.config.name,
+        http.response.status_code = tracing::field::Empty,
+    );
+    let mut trace_headers = header::HeaderMap::new();
+    crate::telemetry::inject_context(&upstream_span, &mut trace_headers);
+    if !trace_headers.is_empty() {
+        request = request.headers(trace_headers);
+    }
+    let upstream = request.send().instrument(upstream_span.clone()).await;
 
     let resp = match upstream {
         Ok(r) => r,
@@ -373,11 +459,21 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
                 (StatusCode::BAD_GATEWAY, "upstream_unavailable")
             };
             tracing::warn!(error = %e, status = code.as_u16(), model = %backend.config.name, "upstream request failed");
+            record_request_metrics(
+                &state.metrics,
+                started,
+                Some(&backend.config.name),
+                &route,
+                streaming,
+                kind,
+            );
             return upstream_error(code, kind);
         }
     };
 
     let status = resp.status();
+    upstream_span.record("http.response.status_code", status.as_u16());
+    span.record("upstream_status", status.as_u16());
     let latency_ms = started.elapsed().as_millis();
     tracing::info!(
         model = %backend.config.name,
@@ -386,13 +482,57 @@ async fn chat_completions(State(state): State<AppState>, raw: Bytes) -> Response
         streaming,
         "upstream responded"
     );
+    record_request_metrics(
+        &state.metrics,
+        started,
+        Some(&backend.config.name),
+        &route,
+        streaming,
+        status.as_str(),
+    );
 
     // 7. Stream SSE bytes on success; otherwise forward the full body.
     if streaming && status.is_success() {
         stream_passthrough(resp)
     } else {
-        buffered_passthrough(resp, &backend.config.name, route.estimated_tokens).await
+        let usage_metrics = state.usage_metrics.then_some(state.metrics.as_ref());
+        buffered_passthrough(
+            resp,
+            &backend.config.name,
+            route.estimated_tokens,
+            usage_metrics,
+        )
+        .await
     }
+}
+
+/// Record the per-request counter and duration histogram. `status` is the
+/// upstream HTTP status for forwarded requests, or a router outcome kind
+/// (`422`, `upstream_timeout`, `upstream_unavailable`). Pre-routing 400s are
+/// deliberately not counted — they never reached a routing decision.
+fn record_request_metrics(
+    metrics: &Metrics,
+    started: Instant,
+    model: Option<&str>,
+    route: &RouteResolution,
+    streaming: bool,
+    status: &str,
+) {
+    let attrs = [
+        attr("model", model.unwrap_or("none").to_string()),
+        attr(
+            "complexity",
+            route
+                .classified
+                .map_or_else(|| "none".to_string(), |t| format!("{t:?}")),
+        ),
+        attr("streaming", streaming),
+        attr("status", status.to_string()),
+    ];
+    metrics.requests.add(1, &attrs);
+    metrics
+        .request_duration
+        .record(started.elapsed().as_secs_f64(), &attrs);
 }
 
 /// One request's routing decision: the resolved modality set, the complexity
@@ -425,6 +565,14 @@ struct RouteResolution {
     /// length). Recorded even when classification is skipped — `classified:
     /// None` already says the engine did not run.
     classifier_engine: &'static str,
+}
+
+impl RouteResolution {
+    /// Size of the compiled classification window in chars (0 when nothing
+    /// substantive existed to classify).
+    fn window_chars(&self) -> usize {
+        self.window.as_deref().map_or(0, |w| w.chars().count())
+    }
 }
 
 /// Debug-level request log: the ENTIRE current-turn prompt (untruncated) AND
@@ -505,6 +653,15 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
         }
     }
 
+    // Size metrics for every request — the distribution of prompt/window/
+    // context sizes is a routing-behavior signal independent of outcome.
+    state
+        .metrics
+        .prompt_chars
+        .record(current_turn.chars().count() as u64, &[]);
+    state.metrics.window_chars.record(window_chars as u64, &[]);
+    state.metrics.estimated_tokens.record(estimated_tokens, &[]);
+
     let candidates = count_candidates(
         state.models.iter(),
         |routed| &routed.config,
@@ -516,8 +673,31 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
             candidates,
             "classification skipped: at most one candidate serves the request; nothing to rank"
         );
+        state
+            .metrics
+            .classification_skipped
+            .add(1, &[attr("reason", "single_candidate")]);
         None
     } else {
+        if window.is_none() {
+            // The model-free fast paths (see [`classify_without_model`]).
+            let reason = if has_nonempty_user_text(body) {
+                "trivial_fast_path"
+            } else {
+                "no_user_text"
+            };
+            state
+                .metrics
+                .classification_skipped
+                .add(1, &[attr("reason", reason)]);
+        }
+        let classify_started = Instant::now();
+        let classify_span = tracing::info_span!(
+            "classify",
+            engine = engine.name(),
+            window_chars,
+            complexity = tracing::field::Empty,
+        );
         let classification = classify_or_default(
             engine.as_ref(),
             body,
@@ -525,7 +705,27 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
             &current_turn,
             lexical_image,
         )
+        .instrument(classify_span.clone())
         .await;
+        classify_span.record(
+            "complexity",
+            format!("{:?}", classification.complexity).as_str(),
+        );
+        if window.is_some() {
+            // The engine genuinely ran: record inference timing and the
+            // categorization outcome (fast-path decisions are counted above).
+            state.metrics.classification_duration.record(
+                classify_started.elapsed().as_secs_f64(),
+                &[attr("engine", engine.name())],
+            );
+            state.metrics.classified.add(
+                1,
+                &[
+                    attr("complexity", format!("{:?}", classification.complexity)),
+                    attr("engine", engine.name()),
+                ],
+            );
+        }
         if classification.image_generation
             && !required.contains(Modality::ImageOutput)
             && !image_intent_dropped
@@ -711,12 +911,13 @@ fn stream_passthrough(resp: reqwest::Response) -> Response {
 
 /// Forward a non-streaming (or error) upstream response verbatim: same status,
 /// same body, preserved end-to-end headers. Successful responses additionally
-/// feed the debug-level usage log (see [`log_upstream_usage`]) — the body is
+/// feed the usage report (see [`report_upstream_usage`]) — the body is
 /// already fully buffered here, so the peek is free.
 async fn buffered_passthrough(
     resp: reqwest::Response,
     model: &str,
     estimated_tokens: u64,
+    usage_metrics: Option<&Metrics>,
 ) -> Response {
     let status = resp.status();
     let upstream_headers = resp.headers().clone();
@@ -724,7 +925,7 @@ async fn buffered_passthrough(
     match resp.bytes().await {
         Ok(bytes) => {
             if status.is_success() {
-                log_upstream_usage(model, estimated_tokens, &bytes);
+                report_upstream_usage(model, estimated_tokens, &bytes, usage_metrics);
             }
             let mut builder = Response::builder().status(status);
             if let Some(dst) = builder.headers_mut() {
@@ -742,35 +943,6 @@ async fn buffered_passthrough(
             upstream_error(StatusCode::BAD_GATEWAY, "upstream_body_error")
         }
     }
-}
-
-/// Debug-level estimated-vs-actual token accounting: the router's routing
-/// estimate (message chars at ~4/token PLUS the requested completion budget —
-/// see [`estimate_request_tokens`]) next to the upstream's authoritative
-/// `usage` object. Watching the two side by side over an evaluation period
-/// calibrates the context-fit heuristic. Non-JSON bodies and responses
-/// without a `usage` object (e.g. SSE chunks never reach here) are skipped
-/// silently; the `enabled!` guard avoids parsing the full response body when
-/// debug is off.
-fn log_upstream_usage(model: &str, estimated_tokens: u64, body: &[u8]) {
-    if !tracing::enabled!(tracing::Level::DEBUG) {
-        return;
-    }
-    let Ok(parsed) = serde_json::from_slice::<Value>(body) else {
-        return;
-    };
-    let Some(usage) = parsed.get("usage") else {
-        return;
-    };
-    let count = |key: &str| usage.get(key).and_then(Value::as_u64);
-    tracing::debug!(
-        model,
-        estimated_tokens,
-        prompt_tokens = count("prompt_tokens"),
-        completion_tokens = count("completion_tokens"),
-        total_tokens = count("total_tokens"),
-        "upstream token usage"
-    );
 }
 
 fn bad_request(message: &str) -> Response {
@@ -907,6 +1079,7 @@ mod tests {
         let cfg = crate::config::RouterConfig {
             server: Default::default(),
             classifier: Default::default(),
+            telemetry: None,
             models: vec![keyless, keyed],
         };
         let routed = RoutedModel::resolve_all(&cfg).expect("no ADC needed");
@@ -929,6 +1102,7 @@ mod tests {
         let cfg = crate::config::RouterConfig {
             server: Default::default(),
             classifier: Default::default(),
+            telemetry: None,
             models: vec![keyed],
         };
         // (`match` rather than `unwrap_err`: `RoutedModel` has no `Debug` —
@@ -1065,44 +1239,7 @@ mod tests {
         assert!(!out.contains("completion request"), "got: {out}");
     }
 
-    // ── debug upstream-usage logging ────────────────────────────
-    #[test]
-    fn upstream_usage_logged_estimated_vs_actual_at_debug() {
-        let body = json!({
-            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
-            "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
-        });
-        let bytes = serde_json::to_vec(&body).unwrap();
-        let out = captured_log(tracing::Level::DEBUG, || {
-            log_upstream_usage("backend-model", 200, &bytes);
-        });
-        assert!(out.contains("upstream token usage"), "got: {out}");
-        assert!(out.contains("estimated_tokens=200"), "got: {out}");
-        assert!(out.contains("prompt_tokens=120"), "got: {out}");
-        assert!(out.contains("completion_tokens=30"), "got: {out}");
-        assert!(out.contains("total_tokens=150"), "got: {out}");
-    }
-
-    #[test]
-    fn upstream_usage_skips_bodies_without_usage_or_non_json() {
-        // A well-formed body without `usage`, and a non-JSON body: neither
-        // may emit (or worse, error) — the log is best-effort only.
-        let no_usage = serde_json::to_vec(&json!({"choices": []})).unwrap();
-        let out = captured_log(tracing::Level::DEBUG, || {
-            log_upstream_usage("backend-model", 200, &no_usage);
-            log_upstream_usage("backend-model", 200, b"data: [DONE]\n\n");
-        });
-        assert!(out.is_empty(), "got: {out}");
-    }
-
-    #[test]
-    fn upstream_usage_not_parsed_below_debug() {
-        let body = serde_json::to_vec(&json!({"usage": {"total_tokens": 1}})).unwrap();
-        let out = captured_log(tracing::Level::INFO, || {
-            log_upstream_usage("backend-model", 200, &body);
-        });
-        assert!(out.is_empty(), "got: {out}");
-    }
+    // ── upstream-usage reporting: see `crate::usage::tests` ────────────
 
     // ── classification skip reasons ─────────────────────────────
     #[test]
@@ -1142,6 +1279,7 @@ mod tests {
         RouterConfig {
             server: Default::default(),
             classifier: Default::default(),
+            telemetry: None,
             models,
         }
     }

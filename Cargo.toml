@@ -30,8 +30,12 @@ directories = "6.0"
 # ADC (Application Default Credentials) for the vertex engine family: token
 # discovery, caching, and refresh behind its `TokenSource`.
 google-cloud-auth = "1.14"
+http = "1"
 keyring    = "4.1"
 ndarray    = "0.17"   # must match the ndarray version `ort` re-exports
+opentelemetry = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "internal-logs"] }
+opentelemetry_sdk = "0.32"
 ort        = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
 regex      = "1.13"
 reqwest    = { version = "0.13", features = ["stream", "json"] }
@@ -44,6 +48,7 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system"] 
 tokenizers = "0.23"
 tokio      = { version = "1.53", features = ["full"] }
 tracing    = "0.1"
+tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url        = "2.5"
 

@@ -65,19 +65,47 @@ fn validate(args: ValidateArgs) -> anyhow::Result<()> {
             m.modality_set().to_kebab_vec(),
         );
     }
+
+    match &cfg.telemetry {
+        Some(t) => println!(
+            "telemetry: OTLP/HTTP to {} (traces {}, metrics {}, sample_ratio {})",
+            t.otlp_endpoint,
+            if t.traces { "on" } else { "off" },
+            if t.metrics { "on" } else { "off" },
+            t.sample_ratio,
+        ),
+        None => println!("telemetry: off"),
+    }
     Ok(())
 }
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
-    // 1. Logging first, so every subsequent startup step (including failures)
-    //    is captured. Always stdout; the operator redirects with the shell.
-    logging::init();
-
-    // 2. Resolve, expand, parse, and validate config (fatal on any problem).
+    // 1. Resolve, expand, parse, and validate config (fatal on any problem).
+    //    Config comes before logging because the optional OpenTelemetry
+    //    span-export layer must be part of the one-shot subscriber install;
+    //    a config-load failure here is still reported — `main` returns the
+    //    error to stderr — just not as a structured log line.
     let config_path = config::resolve_config_path(args.config)?;
     let cfg = config::load(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     // (config::load runs field + startup coverage validation internally.)
+
+    // 2. Telemetry (optional; inert without a `[telemetry]` table), then
+    //    logging, so every subsequent startup step is captured. Always
+    //    stdout; the operator redirects with the shell.
+    let (otel_layer, telemetry) = hyper_mcp_router::telemetry::init(cfg.telemetry.as_ref())
+        .context("initialising telemetry")?;
+    logging::init(otel_layer);
+    if let Some(t) = &cfg.telemetry {
+        tracing::info!(
+            otlp_endpoint = %t.otlp_endpoint,
+            traces = t.traces,
+            metrics = t.metrics,
+            sample_ratio = t.sample_ratio,
+            parent_based_sampling = t.parent_based_sampling,
+            "telemetry enabled"
+        );
+    }
 
     // 3. Build the classifier engine(s) selected by `[classifier] model`
     //    (config-only; one, or several forming a capacity ladder). All
@@ -139,12 +167,15 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding to {addr}"))?;
     tracing::info!(%addr, "hyper-mcp-router listening");
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("server error")?;
+        .context("server error");
 
-    Ok(())
+    // Flush telemetry after the server drains — the final span/metric batches
+    // must reach the collector before the process exits.
+    telemetry.shutdown();
+    served
 }
 
 /// Resolve when the process receives a shutdown signal: Ctrl+C (SIGINT)

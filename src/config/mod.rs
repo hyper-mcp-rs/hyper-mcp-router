@@ -53,6 +53,11 @@ pub struct RouterConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub classifier: ClassifierConfig,
+    /// OpenTelemetry export — **optional**: absent means telemetry is fully
+    /// off (no exporters, no background tasks, no sockets). See
+    /// [`TelemetryConfig`].
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
     pub models: Vec<ModelConfig>,
 }
 
@@ -114,6 +119,77 @@ fn default_stream_idle_timeout() -> u64 {
 }
 fn default_max_body_bytes() -> usize {
     32 * 1024 * 1024
+}
+
+/// `[telemetry]` — OTLP trace/metric export over **HTTP/protobuf**. The
+/// endpoint carries **no credentials**: it is meant for a local collector
+/// sidecar (`http://localhost:4318`) or an equally trusted network hop; the
+/// collector owns vendor authentication (ADC on Cloud Run, task role on ECS).
+/// Header-based auth for direct-to-vendor export is deliberately out of scope
+/// for now.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// OTLP/HTTP base endpoint. Signal paths (`/v1/traces`, `/v1/metrics`)
+    /// are appended automatically — configure the root, not a signal URL.
+    #[serde(deserialize_with = "deserialize_http_url")]
+    pub otlp_endpoint: Url,
+    /// `service.name` resource attribute on every span and metric.
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    /// Export spans. `false` keeps metrics-only telemetry.
+    #[serde(default = "default_true")]
+    pub traces: bool,
+    /// Export metrics. `false` keeps trace-only telemetry.
+    #[serde(default = "default_true")]
+    pub metrics: bool,
+    /// Head-sampling ratio in `[0.0, 1.0]`, applied **independently of the
+    /// caller's sampling decision** by default — platform ingress tracing
+    /// (e.g. Cloud Run's ~0.1 req/s) would otherwise silently drop nearly
+    /// every router span. Trace IDs are still inherited, so sampled router
+    /// spans join the caller's trace whenever both are kept.
+    #[serde(default = "default_sample_ratio")]
+    pub sample_ratio: f64,
+    /// Respect the incoming `traceparent` sampled flag instead of sampling
+    /// independently (the OTel-conventional `ParentBased` sampler). Leave
+    /// `false` on platforms whose ingress samples aggressively.
+    #[serde(default)]
+    pub parent_based_sampling: bool,
+    /// Metric export interval, seconds.
+    #[serde(default = "default_metrics_interval")]
+    pub metrics_interval_secs: u64,
+}
+
+impl TelemetryConfig {
+    /// Field-level validation, called from [`RouterConfig::validate`].
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !(0.0..=1.0).contains(&self.sample_ratio) {
+            anyhow::bail!(
+                "[telemetry] sample_ratio must be within 0.0..=1.0, got {}",
+                self.sample_ratio
+            );
+        }
+        if !self.traces && !self.metrics {
+            anyhow::bail!("[telemetry] disables both traces and metrics; remove the table instead");
+        }
+        if self.metrics_interval_secs == 0 {
+            anyhow::bail!("[telemetry] metrics_interval_secs must be at least 1");
+        }
+        Ok(())
+    }
+}
+
+fn default_service_name() -> String {
+    APP_NAME.to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_sample_ratio() -> f64 {
+    1.0
+}
+fn default_metrics_interval() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -552,6 +628,9 @@ impl RouterConfig {
         if self.models.is_empty() {
             anyhow::bail!("no [[models]] configured");
         }
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.validate()?;
+        }
         if self.classifier.models.is_empty() {
             anyhow::bail!("[classifier] model lists no models; name at least one engine");
         }
@@ -626,6 +705,69 @@ mod tests {
             cfg.classifier.deberta_v3_xsmall_zeroshot.intra_op_threads,
             None
         );
+    }
+
+    // ── [telemetry] ──────────────────────────────────────────────
+    const MODELS_STANZA: &str = "[server]\nhost=\"0.0.0.0\"\nport=1\n[[models]]\nname=\"m\"\nbase_url=\"http://u\"\ntype=\"fast\"\nmodalities=[\"text\"]\ncontext_window=128000\n";
+
+    #[test]
+    fn telemetry_absent_means_off() {
+        let cfg = parse(MODELS_STANZA).unwrap();
+        assert!(cfg.telemetry.is_none());
+    }
+
+    #[test]
+    fn telemetry_parses_with_defaults() {
+        let toml = format!("{MODELS_STANZA}[telemetry]\notlp_endpoint=\"http://localhost:4318\"\n");
+        let cfg = parse(&toml).unwrap();
+        let t = cfg.telemetry.as_ref().expect("telemetry table parses");
+        assert_eq!(t.otlp_endpoint.as_str(), "http://localhost:4318/");
+        assert_eq!(t.service_name, "hyper-mcp-router");
+        assert!(t.traces);
+        assert!(t.metrics);
+        assert_eq!(t.sample_ratio, 1.0);
+        assert!(!t.parent_based_sampling);
+        assert_eq!(t.metrics_interval_secs, 60);
+        cfg.validate().expect("defaults validate");
+    }
+
+    #[test]
+    fn telemetry_endpoint_is_required_and_scheme_checked() {
+        // Missing endpoint: the table cannot silently mean "off".
+        let missing = format!("{MODELS_STANZA}[telemetry]\nservice_name=\"x\"\n");
+        assert!(parse(&missing).is_err());
+        // Non-HTTP scheme is a load error, not a runtime export failure.
+        let grpcish =
+            format!("{MODELS_STANZA}[telemetry]\notlp_endpoint=\"grpc://localhost:4317\"\n");
+        let err = parse(&grpcish).unwrap_err().to_string();
+        assert!(err.contains("http"), "got: {err}");
+    }
+
+    #[test]
+    fn telemetry_validation_rejects_bad_values() {
+        let base = format!("{MODELS_STANZA}[telemetry]\notlp_endpoint=\"http://localhost:4318\"\n");
+        // sample_ratio outside [0, 1]
+        let cfg = parse(&format!("{base}sample_ratio=1.5\n")).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("sample_ratio"), "got: {err}");
+        // both signals off: remove the table instead
+        let cfg = parse(&format!("{base}traces=false\nmetrics=false\n")).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("traces and metrics"), "got: {err}");
+        // zero interval
+        let cfg = parse(&format!("{base}metrics_interval_secs=0\n")).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("metrics_interval_secs"), "got: {err}");
+    }
+
+    #[test]
+    fn telemetry_rejects_unknown_fields() {
+        // No silent typos — and specifically, no `headers` table: credentialed
+        // endpoints are out of scope (local collectors only; see docs).
+        let toml = format!(
+            "{MODELS_STANZA}[telemetry]\notlp_endpoint=\"http://localhost:4318\"\n[telemetry.headers]\nx-api-key=\"k\"\n"
+        );
+        assert!(parse(&toml).is_err());
     }
 
     #[test]
@@ -1010,6 +1152,7 @@ port = 8080
         RouterConfig {
             server: ServerConfig::default(),
             classifier: ClassifierConfig::default(),
+            telemetry: None,
             models,
         }
     }

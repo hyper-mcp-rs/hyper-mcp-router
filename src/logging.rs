@@ -8,8 +8,9 @@
 //! journal), or a container runtime, all of which do rotation and shipping
 //! better than we could.
 
-use tracing_subscriber::fmt::format::FmtSpan;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 /// Default filter directives when `RUST_LOG` is unset: `info`, with ONNX
 /// Runtime's very verbose per-session graph-transform logging quieted. A set
@@ -18,19 +19,41 @@ const DEFAULT_DIRECTIVES: &str = "info,ort=warn";
 
 /// Initialise structured JSON logging on stdout and install the panic hook.
 /// Call once at startup, before anything logs.
-pub fn init() {
+///
+/// `otel_layer` is the optional OpenTelemetry span-export layer (see
+/// `crate::telemetry::init`). Two deliberate isolation rules:
+///
+/// - It is stacked **outside** the `RUST_LOG` filter: exported spans obey the
+///   OTel sampler alone, so quieting stdout logging never silently disables
+///   tracing, and vice versa.
+/// - It is restricted to **spans only** (`Metadata::is_span`). Log *events*
+///   are never exported over OTLP — `tracing-opentelemetry` would otherwise
+///   attach them to spans as span events, and the debug-level events carry
+///   prompt text. The "user content reaches logs only at debug, only on
+///   stdout" guarantee must hold with telemetry on.
+pub fn init(
+    otel_layer: Option<
+        tracing_opentelemetry::OpenTelemetryLayer<Registry, opentelemetry_sdk::trace::SdkTracer>,
+    >,
+) {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_DIRECTIVES));
 
-    tracing_subscriber::fmt()
+    let otel_layer = otel_layer.map(|layer| {
+        layer.with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+            metadata.is_span()
+        }))
+    });
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .json()
-        .with_env_filter(env_filter)
         .with_writer(std::io::stdout)
         .with_ansi(false)
         .with_target(true)
         .with_line_number(true)
-        .with_span_events(FmtSpan::CLOSE)
-        .init();
+        .with_filter(env_filter);
+
+    Registry::default().with(otel_layer).with(fmt_layer).init();
 
     install_panic_hook();
 }

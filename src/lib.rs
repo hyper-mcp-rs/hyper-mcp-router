@@ -24,6 +24,8 @@ pub mod planning;
 pub mod prompt;
 pub mod proxy;
 pub mod selection;
+pub mod telemetry;
+pub(crate) mod usage;
 
 #[cfg(test)]
 pub(crate) mod test_support;

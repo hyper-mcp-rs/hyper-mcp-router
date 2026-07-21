@@ -394,10 +394,19 @@ impl ClassifierEngine for DebertaV3XsmallZeroshot {
         let inner = Arc::clone(&self.inner);
         let complexity_premise = complexity_premise.to_owned();
         let image_premise = image_premise.to_owned();
+        // tracing span context is task-local and does NOT cross
+        // `spawn_blocking`; capture the caller's span and enter it in the
+        // closure so the inference span (and the score debug event) stay
+        // parented to the request.
+        let caller_span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
             // Hold the admission permit for the duration of the inference;
             // dropping it here (after the pass) reopens one slot.
             let _permit = permit;
+            let _caller = caller_span.enter();
+            let _inference_span =
+                tracing::info_span!("nli_inference", engine = "deberta-v3-xsmall-zeroshot")
+                    .entered();
             inner.classify_sync(&complexity_premise, &image_premise, lexical_image_match)
         })
         .await

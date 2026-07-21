@@ -33,6 +33,20 @@ server:
   # are larger.
   max_body_bytes: 33554432
 
+# Optional OpenTelemetry export (OTLP over HTTP/protobuf). Omit the whole
+# table to disable telemetry entirely. The endpoint carries NO credentials —
+# point it at a local collector sidecar (recommended; the collector owns
+# vendor auth) or an equally trusted network hop. See config.example.toml
+# for the full field commentary.
+#telemetry:
+#  otlp_endpoint: "http://localhost:4318"
+#  service_name: "hyper-mcp-router"
+#  traces: true
+#  metrics: true
+#  sample_ratio: 1.0
+#  parent_based_sampling: false
+#  metrics_interval_secs: 60
+
 # Optional classifier tuning. All fields have sensible defaults. Classifier
 # behaviour is config-only — there are no CLI overrides, because each model
 # brings its own configuration (a `classifier.<model>` table); different

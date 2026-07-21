@@ -330,7 +330,18 @@ impl<T: EmbedTexts> ClassifierEngine for RemoteEmbeddingEngine<T> {
         // duplicate billable embedding work and blur the failure signal — the
         // proxy already degrades a failed classification to the balanced
         // default, which is the intended behavior under upstream trouble.
-        let embeddings = self.transport.embed(&texts).await?;
+        // The span isolates the remote embed call's latency from the local
+        // cosine scoring around it.
+        let embed_span = tracing::info_span!(
+            "embed",
+            otel.kind = "client",
+            engine = self.spec.name,
+            texts = texts.len(),
+        );
+        let embeddings = {
+            use tracing::Instrument;
+            self.transport.embed(&texts).instrument(embed_span).await?
+        };
         let image_embedding = if image_text.is_empty() {
             None
         } else {
