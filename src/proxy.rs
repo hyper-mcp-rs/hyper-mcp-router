@@ -336,11 +336,14 @@ async fn chat_completions_inner(state: AppState, raw: Bytes) -> Response {
     // Record the routing axes on the request span (sizes, categorization,
     // engine) — exported when telemetry is on, and echoed by the fmt layer's
     // span-close event either way.
+    // Numeric fields are recorded as i64: `tracing-opentelemetry` maps i64
+    // to a real OTel integer attribute, while u64 falls through to the
+    // debug-format path and would export as a STRING.
     let span = tracing::Span::current();
     span.record("streaming", streaming);
-    span.record("prompt_chars", route.prompt_chars as u64);
-    span.record("window_chars", route.window_chars() as u64);
-    span.record("estimated_tokens", route.estimated_tokens);
+    span.record("prompt_chars", route.prompt_chars as i64);
+    span.record("window_chars", route.window_chars() as i64);
+    span.record("estimated_tokens", route.estimated_tokens as i64);
     span.record("classifier_engine", route.classifier_engine);
     span.record(
         "modalities",
@@ -472,8 +475,8 @@ async fn chat_completions_inner(state: AppState, raw: Bytes) -> Response {
     };
 
     let status = resp.status();
-    upstream_span.record("http.response.status_code", status.as_u16());
-    span.record("upstream_status", status.as_u16());
+    upstream_span.record("http.response.status_code", status.as_u16() as i64);
+    span.record("upstream_status", status.as_u16() as i64);
     let latency_ms = started.elapsed().as_millis();
     tracing::info!(
         model = %backend.config.name,
@@ -702,7 +705,9 @@ async fn resolve_route(state: &AppState, body: &Value) -> RouteResolution {
         let classify_span = tracing::info_span!(
             "classify",
             engine = engine.name(),
-            window_chars,
+            // i64 so the size exports as an OTel integer (see the request
+            // span's field recording).
+            window_chars = window_chars as i64,
             complexity = tracing::field::Empty,
         );
         let classification = classify_or_default(

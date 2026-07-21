@@ -66,15 +66,17 @@ pub(crate) fn report_upstream_usage(
             "upstream token usage"
         );
     }
+    // i64: `tracing-opentelemetry` maps i64 to a real OTel integer
+    // attribute, while u64 would export as a debug-formatted STRING.
     let span = tracing::Span::current();
     if let Some(prompt) = usage.prompt_tokens {
-        span.record("prompt_tokens", prompt);
+        span.record("prompt_tokens", prompt as i64);
     }
     if let Some(completion) = usage.completion_tokens {
-        span.record("completion_tokens", completion);
+        span.record("completion_tokens", completion as i64);
     }
     if let Some(total) = usage.total_tokens {
-        span.record("total_tokens", total);
+        span.record("total_tokens", total as i64);
     }
     if let Some(metrics) = usage_metrics {
         let attrs = [attr("model", model.to_string())];
