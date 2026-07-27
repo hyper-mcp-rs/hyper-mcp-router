@@ -23,6 +23,7 @@ pub mod modality;
 pub mod planning;
 pub mod prompt;
 pub mod proxy;
+pub(crate) mod respond;
 pub mod selection;
 pub mod telemetry;
 pub(crate) mod usage;

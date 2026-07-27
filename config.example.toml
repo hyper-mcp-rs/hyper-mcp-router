@@ -34,7 +34,10 @@ max_body_bytes = 33554432
 # lives here. With log_prompts = true, every request emits an info-level
 # "completion request" event carrying the full current-turn prompt and the
 # compiled classification window alongside the routing decision — without
-# requiring debug-level noise. Default false: prompts never reach the logs.
+# requiring debug-level noise — and upstream ERROR responses include the
+# upstream's error body (bounded) on the warn-level "upstream responded"
+# event, since upstream error messages echo request content back.
+# Default false: user content never reaches the logs.
 # Treat logs produced under this flag as customer data (access + retention).
 #[logging]
 #log_prompts = false

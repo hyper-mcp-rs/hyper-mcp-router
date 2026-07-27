@@ -35,8 +35,9 @@ server:
 
 # Optional logging content controls: log_prompts = true emits an info-level
 # "completion request" event with each request's full prompt text — without
-# requiring debug verbosity. Default false: prompts never reach the logs.
-# See config.example.toml for the full commentary.
+# requiring debug verbosity — and includes upstream error bodies on the
+# warn-level "upstream responded" event. Default false: user content never
+# reaches the logs. See config.example.toml for the full commentary.
 #logging:
 #  log_prompts: false
 

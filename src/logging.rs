@@ -20,8 +20,10 @@ use tracing_subscriber::{EnvFilter, Layer, Registry};
 const DEFAULT_DIRECTIVES: &str = "info,ort=warn";
 
 /// Process-global prompt-logging policy (`[logging] log_prompts`): whether
-/// events carrying **user content** (the `"completion request"` event) may be
-/// emitted. Set once at startup from the config — like the log level itself,
+/// log events may carry **user content** — the `"completion request"` event,
+/// and the upstream error body on the `"upstream responded"` warn event
+/// (upstream error messages echo request content back).
+/// Set once at startup from the config — like the log level itself,
 /// it is execution-wide policy, so it lives here as ambient state rather than
 /// being threaded through every prompt-adjacent call signature (some of
 /// which, e.g. engines, have no path to the config). Defaults to `false`:

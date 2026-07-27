@@ -150,8 +150,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     );
     if cfg.logging.log_prompts {
         tracing::info!(
-            "[logging] log_prompts is enabled: every request's prompt text will be logged — \
-             treat this log stream as customer data"
+            "[logging] log_prompts is enabled: every request's prompt text — and upstream \
+             error bodies, which echo request content — will be logged; treat this log \
+             stream as customer data"
         );
     }
     for m in &cfg.models {

@@ -587,10 +587,18 @@ metrics. Because the gate is config rather than `RUST_LOG`, a deployment can
 log every prompt without enabling debug noise — or run full debug
 diagnostics without ever logging a prompt.
 
-This is the **only** path by which user content reaches the logs. Treat logs
-produced under this flag as customer data: restrict access and retention
-accordingly. (Prompt text still never leaves the process over OTLP — see
-[Telemetry](#telemetry-opentelemetry).)
+The same flag gates upstream **error bodies**: when a backend rejects a
+request (a 400, say), the **warn-level `upstream responded`** event carries
+the upstream's response body (bounded to 2048 chars) — upstream error
+messages routinely echo request content back (invalid-parameter and
+context-length errors quote the offending input), so they are treated as
+user content and gated identically. With the flag off, the warn event still
+fires with metadata only.
+
+These are the **only** paths by which user content reaches the logs. Treat
+logs produced under this flag as customer data: restrict access and
+retention accordingly. (Prompt text still never leaves the process over
+OTLP — see [Telemetry](#telemetry-opentelemetry).)
 
 ### Debug logging
 
@@ -609,10 +617,13 @@ scores, no prompt content:
   vs. its strongest tier opponent, and the threshold), tagged with the
   engine name since several rungs of a ladder may score. Similarities only,
   never premise text.
-- **`upstream token usage`** — on buffered (non-streaming) success
-  responses, the router's routing estimate next to the upstream's
-  authoritative `usage` counts, calibrating the ~4 chars/token context-fit
-  heuristic. Best-effort: bodies without a `usage` object are skipped.
+- **`upstream token usage`** — on success responses, the router's routing
+  estimate next to the upstream's authoritative `usage` counts, calibrating
+  the ~4 chars/token context-fit heuristic. Buffered bodies always report;
+  streaming responses report at end-of-stream when the upstream emitted the
+  trailing `usage` chunk (OpenAI-compatible backends do so only if the
+  client sent `stream_options: {"include_usage": true}`). Best-effort:
+  bodies without a `usage` object are skipped.
 - **Classification skip reasons** — explicit events when classification did
   not run: at most one candidate could serve the request (nothing to rank),
   all user text was trivial filler (fast-path to the fast tier), or there

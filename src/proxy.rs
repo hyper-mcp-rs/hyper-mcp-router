@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
-    body::{Body, Bytes},
+    body::Bytes,
     extract::{DefaultBodyLimit, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json, Response},
@@ -32,9 +32,12 @@ use crate::prompt::{
     build_classification_window, estimate_request_tokens, extract_prompt, has_nonempty_user_text,
     looks_like_image_generation, truncate_prompt,
 };
+use crate::respond::{
+    bad_request, buffered_passthrough, log_upstream_response, stream_passthrough,
+    unsupported_modality_error, upstream_error,
+};
 use crate::selection::{count_candidates, select_candidate};
 use crate::telemetry::{attr, Metrics};
-use crate::usage::{report_upstream_usage, StreamUsageTap};
 
 use tracing::Instrument;
 
@@ -477,14 +480,7 @@ async fn chat_completions_inner(state: AppState, raw: Bytes) -> Response {
     let status = resp.status();
     upstream_span.record("http.response.status_code", status.as_u16() as i64);
     span.record("upstream_status", status.as_u16() as i64);
-    let latency_ms = started.elapsed().as_millis();
-    tracing::info!(
-        model = %backend.config.name,
-        upstream_status = status.as_u16(),
-        latency_ms = latency_ms as u64,
-        streaming,
-        "upstream responded"
-    );
+    let latency_ms = started.elapsed().as_millis() as u64;
     record_request_metrics(
         &state.metrics,
         started,
@@ -494,8 +490,14 @@ async fn chat_completions_inner(state: AppState, raw: Bytes) -> Response {
         status.as_str(),
     );
 
-    // 7. Stream SSE bytes on success; otherwise forward the full body.
+    // 7. Stream SSE bytes on success; otherwise forward the full body. The
+    //    "upstream responded" event (see [`log_upstream_response`]) is
+    //    emitted here for streams — headers are all we see before handing
+    //    off — and inside [`buffered_passthrough`] otherwise, where an error
+    //    status can carry the upstream's error body under the prompt-logging
+    //    gate.
     if streaming && status.is_success() {
+        log_upstream_response(&backend.config.name, status, latency_ms, streaming, None);
         stream_passthrough(
             resp,
             &backend.config.name,
@@ -509,6 +511,8 @@ async fn chat_completions_inner(state: AppState, raw: Bytes) -> Response {
             &backend.config.name,
             route.estimated_tokens,
             usage_metrics,
+            latency_ms,
+            streaming,
         )
         .await
     }
@@ -871,155 +875,8 @@ fn classify_without_model(body: &Value) -> Classification {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────
-// Response construction
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Whether an upstream response header may be forwarded to the client.
-/// Hop-by-hop headers (RFC 9110 §7.6.1) describe the upstream connection, not
-/// the payload; payload-framing headers (`content-length`,
-/// `transfer-encoding`) are recomputed by axum for the response we build.
-/// Everything else — `x-request-id`, rate-limit headers, `retry-after`, … —
-/// passes through so clients can implement backoff and tracing.
-fn is_end_to_end_header(name: &header::HeaderName) -> bool {
-    !matches!(
-        name.as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "content-length"
-    )
-}
-
-/// Copy every end-to-end header from `src` into `dst` (preserving repeats).
-fn copy_end_to_end_headers(src: &header::HeaderMap, dst: &mut header::HeaderMap) {
-    for (name, value) in src {
-        if is_end_to_end_header(name) {
-            dst.append(name.clone(), value.clone());
-        }
-    }
-}
-
-/// Pipe raw upstream SSE bytes straight to the client. No buffering or
-/// model-field rewriting; upstream end-to-end headers are preserved, with
-/// SSE defaults filled in only when the upstream omitted them.
-///
-/// When someone is listening for token usage (debug logging on, or the
-/// usage counters enabled), the bytes are forwarded through a
-/// [`StreamUsageTap`]: still byte-for-byte untouched, but a bounded tail is
-/// retained so the trailing `usage` chunk (sent by OpenAI-compatible
-/// backends when the client requests `stream_options.include_usage`) is
-/// reported at end-of-stream — the streaming counterpart of
-/// [`buffered_passthrough`]'s usage peek. With nobody listening the stream
-/// passes through untapped.
-fn stream_passthrough(
-    resp: reqwest::Response,
-    model: &str,
-    estimated_tokens: u64,
-    usage_metrics: Option<Arc<Metrics>>,
-) -> Response {
-    let status = resp.status();
-    let upstream_headers = resp.headers().clone();
-    let mut builder = Response::builder().status(status);
-    if let Some(dst) = builder.headers_mut() {
-        copy_end_to_end_headers(&upstream_headers, dst);
-    }
-    if !upstream_headers.contains_key(header::CONTENT_TYPE) {
-        builder = builder.header(header::CONTENT_TYPE, "text/event-stream");
-    }
-    if !upstream_headers.contains_key(header::CACHE_CONTROL) {
-        builder = builder.header(header::CACHE_CONTROL, "no-cache");
-    }
-    let body = if tracing::enabled!(tracing::Level::DEBUG) || usage_metrics.is_some() {
-        Body::from_stream(StreamUsageTap::new(
-            resp.bytes_stream(),
-            model,
-            estimated_tokens,
-            tracing::Span::current(),
-            usage_metrics,
-        ))
-    } else {
-        Body::from_stream(resp.bytes_stream())
-    };
-    builder.body(body).expect("valid streaming response")
-}
-
-/// Forward a non-streaming (or error) upstream response verbatim: same status,
-/// same body, preserved end-to-end headers. Successful responses additionally
-/// feed the usage report (see [`report_upstream_usage`]) — the body is
-/// already fully buffered here, so the peek is free.
-async fn buffered_passthrough(
-    resp: reqwest::Response,
-    model: &str,
-    estimated_tokens: u64,
-    usage_metrics: Option<&Metrics>,
-) -> Response {
-    let status = resp.status();
-    let upstream_headers = resp.headers().clone();
-
-    match resp.bytes().await {
-        Ok(bytes) => {
-            if status.is_success() {
-                report_upstream_usage(model, estimated_tokens, &bytes, usage_metrics);
-            }
-            let mut builder = Response::builder().status(status);
-            if let Some(dst) = builder.headers_mut() {
-                copy_end_to_end_headers(&upstream_headers, dst);
-            }
-            if !upstream_headers.contains_key(header::CONTENT_TYPE) {
-                builder = builder.header(header::CONTENT_TYPE, "application/json");
-            }
-            builder
-                .body(Body::from(bytes))
-                .expect("valid buffered response")
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to read upstream response body");
-            upstream_error(StatusCode::BAD_GATEWAY, "upstream_body_error")
-        }
-    }
-}
-
-fn bad_request(message: &str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({ "error": { "message": message, "type": "invalid_request_error" } })),
-    )
-        .into_response()
-}
-
-/// 422 with a minimal JSON body naming the unsatisfiable modality set. (422
-/// Unprocessable Content, not 415: the request *media type* is fine — it is
-/// the required capability combination no configured backend can serve.)
-fn unsupported_modality_error(required: &ModalitySet) -> Response {
-    let mods = required.to_kebab_vec();
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        Json(json!({
-            "error": {
-                "message": format!("no configured model supports the required modality set: {mods:?}"),
-                "type": "unsupported_modality",
-                "modalities": mods,
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn upstream_error(code: StatusCode, kind: &str) -> Response {
-    (
-        code,
-        Json(json!({
-            "error": { "message": "upstream request failed", "type": kind }
-        })),
-    )
-        .into_response()
-}
+// (Response construction — passthroughs, error responses, and the
+// "upstream responded" event — lives in `crate::respond`.)
 
 #[cfg(test)]
 mod tests {
@@ -1174,31 +1031,9 @@ mod tests {
         ));
     }
 
-    // ── header passthrough ───────────────────────────────────────────
-    #[test]
-    fn end_to_end_headers_forwarded_hop_by_hop_dropped() {
-        let mut src = header::HeaderMap::new();
-        src.insert("x-request-id", "abc-123".parse().unwrap());
-        src.insert("x-ratelimit-remaining-tokens", "99".parse().unwrap());
-        src.insert(header::RETRY_AFTER, "5".parse().unwrap());
-        src.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        src.insert(header::CONNECTION, "keep-alive".parse().unwrap());
-        src.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
-        src.insert(header::CONTENT_LENGTH, "42".parse().unwrap());
+    // ── header passthrough, response construction: see `crate::respond` ─
 
-        let mut dst = header::HeaderMap::new();
-        copy_end_to_end_headers(&src, &mut dst);
-
-        assert_eq!(dst.get("x-request-id").unwrap(), "abc-123");
-        assert_eq!(dst.get("x-ratelimit-remaining-tokens").unwrap(), "99");
-        assert_eq!(dst.get(header::RETRY_AFTER).unwrap(), "5");
-        assert_eq!(dst.get(header::CONTENT_TYPE).unwrap(), "application/json");
-        assert!(dst.get(header::CONNECTION).is_none());
-        assert!(dst.get(header::TRANSFER_ENCODING).is_none());
-        assert!(dst.get(header::CONTENT_LENGTH).is_none());
-    }
-
-    // ── debug completion-request logging ──────────────────────
+    // ── debug completion-request logging ──────────────────────────
     use crate::test_support::captured_log;
 
     fn route_resolution(
@@ -1223,8 +1058,10 @@ mod tests {
         // The prompt-logging gate is a PROCESS GLOBAL
         // (`logging::set_log_prompts`), so every assertion that touches it
         // lives in this one test — parallel test threads must never race on
-        // it. Order within the test is deliberate: default → enabled →
-        // restored.
+        // it. It covers BOTH content-gated surfaces: the "completion
+        // request" event and the error body on the "upstream responded"
+        // warn event. Order within the test is deliberate: default →
+        // enabled → restored.
 
         // 1. Default: off. The event (and with it, the user content) must
         //    not be emitted at ANY log level — the config flag is the only
@@ -1253,6 +1090,24 @@ mod tests {
             "got: {out}"
         );
         assert!(!out.contains("completion request"), "got: {out}");
+
+        // 1b. Default off: an upstream error body is user content too
+        //     (upstream error messages echo request content back) — the
+        //     warn event still fires, but metadata-only.
+        let out = captured_log(tracing::Level::TRACE, || {
+            log_upstream_response(
+                "backend-model",
+                StatusCode::BAD_REQUEST,
+                12,
+                false,
+                Some(br#"{"error":{"message":"echoed-user-content-must-not-leak"}}"#),
+            );
+        });
+        assert!(out.contains("upstream responded"), "got: {out}");
+        assert!(
+            !out.contains("echoed-user-content-must-not-leak"),
+            "got: {out}"
+        );
 
         // 2. Enabled: the event fires at INFO — a deployment can log every
         //    prompt without enabling debug noise.
@@ -1287,6 +1142,35 @@ mod tests {
             log_completion_request(&route_resolution(None, "", None), "backend-model", false);
         });
         assert!(out.contains("completion request"), "got: {out}");
+
+        // 3b. Still enabled: the upstream error body rides on the warn
+        //     "upstream responded" event, verbatim.
+        let out = captured_log(tracing::Level::WARN, || {
+            log_upstream_response(
+                "backend-model",
+                StatusCode::BAD_REQUEST,
+                12,
+                false,
+                Some(br#"{"error":{"message":"Invalid 'messages[0]': echoed prompt text"}}"#),
+            );
+        });
+        assert!(out.contains("upstream responded"), "got: {out}");
+        assert!(out.contains("echoed prompt text"), "got: {out}");
+
+        // 3c. ...but bounded: a pathological body (an intermediary's HTML
+        //     error page) is truncated, never dumped whole.
+        let huge = "x".repeat(crate::respond::ERROR_BODY_LOG_MAX_CHARS * 2);
+        let out = captured_log(tracing::Level::WARN, || {
+            log_upstream_response(
+                "backend-model",
+                StatusCode::BAD_GATEWAY,
+                12,
+                false,
+                Some(huge.as_bytes()),
+            );
+        });
+        assert!(out.contains("[truncated]"), "got: {out}");
+        assert!(!out.contains(&huge), "got: {out}");
 
         // 4. Restore the default so the process global never leaks into
         //    hypothetical future tests.
