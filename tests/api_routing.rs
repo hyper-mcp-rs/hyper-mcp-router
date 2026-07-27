@@ -111,6 +111,7 @@ async fn mock_chat(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let has_tools = forwarded.get("tools").is_some();
     calls.lock().unwrap().push(Recorded {
         body: forwarded,
         authorization,
@@ -126,11 +127,32 @@ async fn mock_chat(
             ))
             .unwrap()
     } else {
-        let resp = json!({
-            "id": "mock-cmpl",
-            "object": "chat.completion",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
-        });
+        // A `tools` request gets a realistic tool-call turn whose entries
+        // carry a vendor extension (Gemini 3's `extra_content` thought
+        // signature) — response-fidelity tests assert it reaches the client
+        // verbatim. Everything else gets a plain text completion.
+        let resp = if has_tools {
+            json!({
+                "id": "mock-cmpl",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+                        "extra_content": {"google": {"thought_signature": "c2lnbmF0dXJlLWJ5dGVz"}},
+                    }],
+                }}],
+            })
+        } else {
+            json!({
+                "id": "mock-cmpl",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            })
+        };
         Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
@@ -816,6 +838,85 @@ async fn tool_role_continuation_routes_to_tool_capable_backend() {
     let resp = h.chat(&body).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     assert_eq!(h.last_call()["model"], "agent");
+}
+
+/// A tool-loop continuation must forward vendor extensions on `tool_calls`
+/// byte-for-byte — specifically Gemini 3's `extra_content` carrying
+/// `google.thought_signature`. Gemini 3 REQUIRES the signature it attached
+/// to a tool call to be echoed back on the assistant message when the client
+/// responds with the tool result; anything on the path that drops it turns
+/// every tool loop into an upstream 400 (Gemini 2.5 merely tolerated the
+/// omission). The router's passthrough contract is that `model` is the ONLY
+/// field it rewrites — this test pins that contract on exactly the transcript
+/// shape a tool-call response produces.
+#[tokio::test]
+async fn tool_call_continuation_preserves_extra_content_thought_signatures() {
+    let h = Harness::start().await;
+    let body = json!({
+        "model": ADVERTISED_MODEL,
+        "messages": [
+            {"role": "user", "content": "What is the weather in Paris?"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+                "extra_content": {"google": {"thought_signature": "c2lnbmF0dXJlLWJ5dGVz"}},
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp_c\": 21}"},
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }],
+    });
+
+    let resp = h.chat(&body).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let forwarded = h.last_call();
+    // The signature itself, verbatim — the field Gemini 3 400s without.
+    assert_eq!(
+        forwarded["messages"][1]["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
+        "c2lnbmF0dXJlLWJ5dGVz",
+        "thought signature must reach the upstream untouched; got: {forwarded:#}"
+    );
+    // And the whole request, deep-equal except the rewritten model: any
+    // dropped or mutated field ANYWHERE in the transcript fails here.
+    let mut expected = body.clone();
+    expected["model"] = forwarded["model"].clone();
+    assert_eq!(
+        forwarded, expected,
+        "`model` must be the only field the router rewrites"
+    );
+}
+
+/// The response direction of the same contract: when the upstream's
+/// completion carries `extra_content` on its `tool_calls` (the turn in which
+/// Gemini 3 hands out the thought signature), the client must receive it
+/// verbatim — otherwise the client never HAS the signature to echo back and
+/// the next turn of the loop 400s regardless of request-side fidelity.
+#[tokio::test]
+async fn tool_call_response_extra_content_reaches_the_client() {
+    let h = Harness::start().await;
+    let body = json!({
+        "model": ADVERTISED_MODEL,
+        "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+        "tools": [{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }],
+    });
+
+    let resp = h.chat(&body).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let got: Value = resp.json().await.expect("client response json");
+    let tool_call = &got["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(tool_call["id"], "call_1", "got: {got:#}");
+    assert_eq!(
+        tool_call["extra_content"]["google"]["thought_signature"], "c2lnbmF0dXJlLWJ5dGVz",
+        "the upstream's thought signature must reach the client untouched; got: {got:#}"
+    );
 }
 
 /// A large multimodal body (over axum's 2 MB default limit, under the router's
