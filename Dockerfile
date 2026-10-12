@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.28
 #
 # Multi-stage build producing the SMALLEST possible image: a `scratch`
 # container holding a fully statically linked (musl) executable plus CA
