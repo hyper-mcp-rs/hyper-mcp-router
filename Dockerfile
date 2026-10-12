@@ -29,7 +29,7 @@
 #   * Both stages use the same base image so ONNX Runtime's static archives
 #     and the final link see identical musl/gcc versions.
 
-ARG RUST_IMAGE=rust:1.97-alpine
+ARG RUST_IMAGE=rust:1.99-alpine
 
 # ───────────────────────────────────────────────────────────────────────────
 # Stage 1: ONNX Runtime, compiled from source as static musl libraries.
