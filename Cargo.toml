@@ -36,10 +36,10 @@ google-cloud-auth = "1.14"
 http = "1"
 keyring    = "4.1"
 ndarray    = "0.17"   # must match the ndarray version `ort` re-exports
-opentelemetry = "0.32"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "internal-logs"] }
-opentelemetry_sdk = "0.32"
-ort        = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
+opentelemetry = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "internal-logs"] }
+opentelemetry_sdk = "0.33"
+ort        = { version = "=2.0.0-rc.15", features = ["download-binaries"] }
 regex      = "1.13"
 reqwest    = { version = "0.13", features = ["stream", "json"] }
 # Redacting wrapper for resolved credentials: `Debug` never prints the value
@@ -47,11 +47,11 @@ reqwest    = { version = "0.13", features = ["stream", "json"] }
 secrecy    = "0.10"
 serde      = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40.0", default-features = false, features = ["system"] }
 tokenizers = "0.23"
 tokio      = { version = "1.53", features = ["full"] }
 tracing    = "0.1"
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url        = "2.5"
 
@@ -60,7 +60,7 @@ sha2 = "0.11"
 ureq = "3.3"
 
 [dev-dependencies]
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace", "metrics"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace", "metrics"] }
 prost = "0.14"
 
 [package.metadata.release]
